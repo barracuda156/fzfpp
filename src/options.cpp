@@ -13,22 +13,18 @@ Options parse_options(int argc, char* argv[]) {
     bool no_multi_flag = false;
     std::vector<std::string> arg_storage;
 
-    // First pass: store all arguments, detecting +i and +m
-    arg_storage.push_back(argv[0]);  // Keep program name
+    arg_storage.push_back(argv[0]);
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "+i") {
             case_sensitive_flag = true;
-            // Don't add to arg_storage
         } else if (arg == "+m") {
             no_multi_flag = true;
-            // Don't add to arg_storage
         } else {
             arg_storage.push_back(arg);
         }
     }
 
-    // Second pass: build argv array after all strings are stored
     std::vector<char*> new_argv;
     new_argv.reserve(arg_storage.size());
     for (auto& s : arg_storage) {
@@ -38,11 +34,9 @@ Options parse_options(int argc, char* argv[]) {
 
     CLI::App app{"fzf++ - Command-line fuzzy finder (C++ implementation)"};
 
-    // Version and help
     bool version = false;
     app.add_flag("-v,--version", version, "Show version");
 
-    // Search options
     std::string case_str;
     app.add_option("--case", case_str, "Case sensitivity (smart/ignore/respect)")
         ->check(CLI::IsMember({"smart", "ignore", "respect"}));
@@ -61,7 +55,6 @@ Options parse_options(int argc, char* argv[]) {
     app.add_flag("-x,--extended", opts.extended,
                  "Enable extended search mode (default: true)");
 
-    // Display options
     app.add_flag("--ansi", opts.ansi,
                  "Enable processing of ANSI color codes");
 
@@ -93,16 +86,31 @@ Options parse_options(int argc, char* argv[]) {
 
     app.add_flag("--border", opts.border, "Draw border around interface");
 
+
     app.add_flag("--wrap", opts.wrap, "Enable line wrapping");
 
     app.add_flag("--no-mouse", opts.no_mouse, "Disable mouse");
 
     app.add_flag("--no-unicode", opts.no_unicode, "Disable unicode");
 
+
     std::string margin_str;
     app.add_option("--margin", margin_str, "Margins (top,right,bottom,left)");
 
-    // Interaction options
+    std::string info_str;
+    app.add_option("--info", info_str, "Info display mode (default/inline/hidden)");
+
+    std::vector<std::string> color_specs;
+    app.add_option("--color", color_specs, "Color scheme")
+        ->allow_extra_args();
+
+    app.add_option("--border-label", opts.border_label, "Border label text");
+    app.add_option("--marker", opts.marker, "Multi-select marker");
+    app.add_option("--pointer", opts.pointer, "Pointer to current line");
+    app.add_option("--separator", opts.separator, "Separator character");
+    app.add_option("--scrollbar", opts.scrollbar, "Scrollbar character");
+    app.add_option("--tabstop", opts.tabstop, "Tab stop width");
+
     app.add_flag("-m,--multi", opts.multi, "Enable multi-select mode");
 
     app.add_flag("--no-multi", [&opts](int64_t) {
@@ -111,15 +119,12 @@ Options parse_options(int argc, char* argv[]) {
 
     app.add_flag("--cycle", opts.cycle, "Enable cyclic scrolling");
 
-    // Initial query
     app.add_option("-q,--query", opts.query, "Initial query string");
 
-    // Filter mode
     std::string filter_query;
     app.add_option("-f,--filter", filter_query,
                    "Filter mode (non-interactive, print matches)");
 
-    // Selector mode
     app.add_flag("-1,--select-1", opts.select_1,
                  "Auto-select if only one match");
 
@@ -129,34 +134,32 @@ Options parse_options(int argc, char* argv[]) {
     app.add_flag("--print-query", opts.print_query,
                  "Print query before results");
 
-    // Sorting
     app.add_flag("--no-sort", [&opts](int64_t) {
         opts.sort = false;
     }, "Disable sorting");
 
-    // Delimiter
     app.add_option("-d,--delimiter", opts.delimiter,
                    "Field delimiter (regex)");
 
-    // Field selection
     std::string with_nth_str;
     app.add_option("--with-nth", with_nth_str,
                    "Display only specified fields (comma-separated, 1-based)");
 
-    // Key bindings
     std::vector<std::string> bind_specs;
     app.add_option("--bind", bind_specs,
                    "Custom key bindings (key:action)")
         ->allow_extra_args();
 
+    std::string expect_str;
+    app.add_option("--expect", expect_str,
+                   "Comma-separated list of keys that trigger exit with key name");
+
     app.add_option("--with-shell", opts.with_shell,
                    "Shell to use for execute actions");
 
-    // Read options
     app.add_flag("--read0", opts.read_zero,
                  "Read null-delimited input");
 
-    // Preview
     app.add_option("--preview", opts.preview_command,
                    "Preview command");
 
@@ -192,20 +195,18 @@ Options parse_options(int argc, char* argv[]) {
         }
     }
 
-    // Handle version
+
     if (version) {
-        std::cout << "fzf++ version 0.1.0 (C++20 implementation)" << std::endl;
+        std::cout << "fzf++ version 0.1.1 (C++20 implementation)" << std::endl;
         std::cout << "Compatible with fzf" << std::endl;
         std::exit(0);
     }
 
-    // Handle filter mode
     if (!filter_query.empty()) {
         opts.filter = true;
         opts.query = filter_query;
     }
 
-    // Parse --margin
     if (!margin_str.empty()) {
         std::stringstream ss(margin_str);
         std::string value;
@@ -225,7 +226,6 @@ Options parse_options(int argc, char* argv[]) {
         }
     }
 
-    // Process +i/-i flags (override case_str if present)
     if (case_insensitive_flag) {
         opts.case_mode = CaseMode::Ignore;
     }
@@ -233,12 +233,10 @@ Options parse_options(int argc, char* argv[]) {
         opts.case_mode = CaseMode::Respect;
     }
 
-    // Process +m flag (override --multi if present)
     if (no_multi_flag) {
         opts.multi = false;
     }
 
-    // Process case mode
     if (!case_str.empty()) {
         if (case_str == "smart") {
             opts.case_mode = CaseMode::Smart;
@@ -249,28 +247,22 @@ Options parse_options(int argc, char* argv[]) {
         }
     }
 
-    // Process layout
     if (!layout_str.empty()) {
         if (layout_str == "default") {
             opts.layout = LayoutType::Default;
         } else if (layout_str == "reverse") {
             opts.layout = LayoutType::Reverse;
         } else if (layout_str == "reverse-list") {
-            // ReverseList not yet implemented - map to Reverse for now
-            std::cerr << "Warning: --layout=reverse-list not yet implemented, using --layout=reverse" << std::endl;
             opts.layout = LayoutType::Reverse;
         }
     }
 
-    // Process height (handle percentage notation like "40%")
     if (!height_str.empty()) {
         if (height_str.back() == '%') {
-            // Percentage value
             std::string num_str = height_str.substr(0, height_str.size() - 1);
             try {
                 opts.height = std::stoi(num_str);
                 opts.height_is_percent = true;
-                // Validate percentage range
                 if (opts.height < 0 || opts.height > 100) {
                     std::cerr << "Warning: height percentage should be 0-100, got " << opts.height << "%" << std::endl;
                     opts.height = std::clamp(opts.height, 0, 100);
@@ -281,7 +273,6 @@ Options parse_options(int argc, char* argv[]) {
                 opts.height_is_percent = false;
             }
         } else {
-            // Absolute line count
             try {
                 opts.height = std::stoi(height_str);
                 opts.height_is_percent = false;
@@ -294,6 +285,53 @@ Options parse_options(int argc, char* argv[]) {
                 opts.height = 0;
                 opts.height_is_percent = false;
             }
+        }
+    }
+
+    if (!info_str.empty()) {
+        if (info_str == "hidden") {
+            opts.info_hidden = true;
+        }
+    }
+
+    // Parse --expect (comma-separated keys)
+    if (!expect_str.empty()) {
+        std::stringstream ss(expect_str);
+        std::string key;
+        while (std::getline(ss, key, ',')) {
+            opts.expect_keys.push_back(key);
+        }
+    }
+
+    // Process --preview-window
+    if (!opts.preview_window.empty()) {
+        std::stringstream ss(opts.preview_window);
+        std::string part;
+        while (std::getline(ss, part, ',')) {
+            if (part == "left" || part == "right" || part == "up" || part == "down") {
+                opts.preview_position = part;
+            }
+            else if (!part.empty() && part.back() == '%') {
+                std::string num_str = part.substr(0, part.size() - 1);
+                try {
+                    opts.preview_size_percent = std::stoi(num_str);
+                    opts.preview_size_percent = std::clamp(opts.preview_size_percent, 0, 100);
+                } catch (...) {
+                    std::cerr << "Invalid preview size: " << part << std::endl;
+                }
+            }
+            else if (part == "wrap") {
+                opts.preview_wrap = true;
+            }
+        }
+    }
+
+    for (const auto& spec : color_specs) {
+        size_t colon = spec.find(':');
+        if (colon != std::string::npos) {
+            std::string key = spec.substr(0, colon);
+            std::string value = spec.substr(colon + 1);
+            opts.colors[key] = value;
         }
     }
 

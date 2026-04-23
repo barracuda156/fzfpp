@@ -34,6 +34,9 @@ public:
     // Run filter mode (non-interactive)
     std::vector<std::string> run_filter(const std::string& query);
 
+    // Get matched expect key (empty if none matched)
+    std::string get_matched_expect_key() const { return matched_expect_key_; }
+
 private:
     // Perform search in background
     void perform_search();
@@ -66,6 +69,9 @@ private:
     // Bind action execution
     bool execute_bind_action(const std::string& action);
 
+    // Expect key matching
+    bool check_expect_key(const ftxui::Event& event, std::string& matched_key);
+
     // Preview support
     std::string substitute_placeholders(const std::string& cmd, size_t index);
 
@@ -86,6 +92,7 @@ private:
     std::set<size_t> selected_;   // Selected item indices
     bool running_;
     bool accepted_;               // True if user accepted, false if aborted
+    std::string matched_expect_key_;  // Stores matched expect key
 
     // Threading
     mutable std::mutex results_mutex_;

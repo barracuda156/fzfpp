@@ -35,7 +35,7 @@ struct Options {
     bool no_mouse = false;
     bool no_unicode = false;   // Disable unicode characters
 
-    // Margins (clifm compatibility, doesn't really work atm)
+    // Margins (clifm compatibility)
     int margin_top = 0;
     int margin_right = 0;
     int margin_bottom = 0;
@@ -61,7 +61,7 @@ struct Options {
     // Sorting
     bool sort = true;
 
-    // Preview (future enhancement)
+    // Preview
     std::string preview_command;
     std::string preview_window;  // Preview window options (clifm compatibility)
 
@@ -77,6 +77,21 @@ struct Options {
     // Key bindings
     std::map<std::string, std::string> bindings;  // key -> action
     std::string with_shell;  // Shell to use for execute actions (e.g., "bash -c")
+
+    // yt-x compatibility options
+    bool info_hidden = false;
+    std::vector<std::string> expect_keys;
+    std::string preview_position = "right";
+    int preview_size_percent = 50;
+    bool preview_wrap = false;
+    std::map<std::string, std::string> colors;
+    std::string border_style;
+    std::string border_label;
+    std::string marker = ">";
+    std::string pointer = ">";
+    std::string separator = "-";
+    std::string scrollbar = "|";
+    int tabstop = 8;
 };
 
 // Parse command-line arguments

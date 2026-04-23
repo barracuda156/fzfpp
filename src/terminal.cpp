@@ -25,6 +25,7 @@ Terminal::Terminal(const Options& opts, Reader& reader)
       scroll_offset_(0),
       running_(false),
       accepted_(false),
+      matched_expect_key_(""),
       search_pending_(false),
       search_running_(false),
       visible_lines_(10),  // Default, will be updated
@@ -40,10 +41,6 @@ Terminal::Terminal(const Options& opts, Reader& reader)
       preview_cancel_(false),
       preview_target_cursor_(SIZE_MAX)
 {
-    // Validate layout type - ReverseList not yet implemented
-    if (opts_.layout == LayoutType::ReverseList) {
-        std::cerr << "Warning: ReverseList layout not implemented, behavior may be undefined" << std::endl;
-    }
 }
 
 Terminal::~Terminal() {
@@ -234,11 +231,142 @@ void Terminal::accept_selection() {
     running_ = false;
 }
 
-bool Terminal::execute_bind_action(const std::string& action) {
-    // Handle execute() actions FIRST (before checking for +, since execute commands may contain +)
-    if (action.find("execute(") == 0) {
+bool Terminal::check_expect_key(const ftxui::Event& event, std::string& matched_key) {
+    if (opts_.expect_keys.empty()) {
+        return false;
+    }
 
-        // Find the matching closing parenthesis by counting nesting level
+    std::string input = event.input();
+
+    // Check for special FTXUI events first
+    for (const auto& expect : opts_.expect_keys) {
+        // Return/Enter key
+        if (expect == "enter" && event == Event::Return) {
+            matched_key = "enter";
+            return true;
+        }
+
+        // Escape key
+        if (expect == "esc" && event == Event::Escape) {
+            matched_key = "esc";
+            return true;
+        }
+
+        // Tab key
+        if (expect == "tab" && event == Event::Tab) {
+            matched_key = "tab";
+            return true;
+        }
+
+        // Arrow keys (FTXUI events)
+        if (expect == "up" && event == Event::ArrowUp) {
+            matched_key = "up";
+            return true;
+        }
+        if (expect == "down" && event == Event::ArrowDown) {
+            matched_key = "down";
+            return true;
+        }
+        if (expect == "left" && event == Event::ArrowLeft) {
+            matched_key = "left";
+            return true;
+        }
+        if (expect == "right" && event == Event::ArrowRight) {
+            matched_key = "right";
+            return true;
+        }
+
+        // Page Up/Down
+        if (expect == "page-up" && event == Event::PageUp) {
+            matched_key = "page-up";
+            return true;
+        }
+        if (expect == "page-down" && event == Event::PageDown) {
+            matched_key = "page-down";
+            return true;
+        }
+
+        // Home/End
+        if (expect == "home" && event == Event::Home) {
+            matched_key = "home";
+            return true;
+        }
+        if (expect == "end" && event == Event::End) {
+            matched_key = "end";
+            return true;
+        }
+    }
+
+    // Map of ANSI sequences to key names for shift+arrow and other special keys
+    // Try multiple variants as different terminals may use different sequences
+    std::map<std::string, std::string> key_map = {
+        // Standard xterm sequences for shift+arrows
+        {"\x1b[1;2D", "shift-left"},
+        {"\x1b[1;2C", "shift-right"},
+        {"\x1b[1;2A", "shift-up"},
+        {"\x1b[1;2B", "shift-down"},
+        // Alternative sequences (some terminals)
+        {"\x1b[2D", "shift-left"},
+        {"\x1b[2C", "shift-right"},
+        {"\x1b[2A", "shift-up"},
+        {"\x1b[2B", "shift-down"},
+        // Ctrl+arrows
+        {"\x1b[1;5D", "ctrl-left"},
+        {"\x1b[1;5C", "ctrl-right"},
+        {"\x1b[1;5A", "ctrl-up"},
+        {"\x1b[1;5B", "ctrl-down"},
+        // Alt+arrows
+        {"\x1b[1;3D", "alt-left"},
+        {"\x1b[1;3C", "alt-right"},
+        {"\x1b[1;3A", "alt-up"},
+        {"\x1b[1;3B", "alt-down"},
+    };
+
+    for (const auto& expect : opts_.expect_keys) {
+        // Check against ANSI sequences
+        for (const auto& [seq, name] : key_map) {
+            if (expect == name && input == seq) {
+                matched_key = name;
+                return true;
+            }
+        }
+
+        // Check for single character keys (like 'a', 'b', etc.)
+        if (expect.length() == 1 && input == expect) {
+            matched_key = expect;
+            return true;
+        }
+
+        // Check for ctrl+letter (ctrl-a, ctrl-b, etc.)
+        if (expect.find("ctrl-") == 0 && expect.length() == 6) {
+            char letter = expect[5];
+            if (letter >= 'a' && letter <= 'z') {
+                char ctrl_char = letter - 'a' + 1;  // ctrl-a = 0x01, ctrl-b = 0x02, etc.
+                if (input.length() == 1 && input[0] == ctrl_char) {
+                    matched_key = expect;
+                    return true;
+                }
+            }
+        }
+
+        // Check for alt+letter
+        if (expect.find("alt-") == 0 && expect.length() == 5) {
+            char letter = expect[4];
+            std::string alt_seq = "\x1b";
+            alt_seq += letter;
+            if (input == alt_seq) {
+                matched_key = expect;
+                return true;
+                }
+        }
+    }
+
+    return false;
+}
+
+bool Terminal::execute_bind_action(const std::string& action) {
+    if (action.find("execute(") == 0) {
+        // Find matching closing parenthesis by counting nesting level
         size_t start = 7;  // Position after "execute"
         int depth = 0;
         size_t end = std::string::npos;
@@ -301,23 +429,17 @@ bool Terminal::execute_bind_action(const std::string& action) {
         return true;
     }
 
-    // Handle composite actions (action1+action2+...) for non-execute actions
     size_t plus_pos = action.find('+');
     if (plus_pos != std::string::npos) {
-        // Split by + and execute each action
         std::string first = action.substr(0, plus_pos);
         std::string rest = action.substr(plus_pos + 1);
 
-        // Execute first action
         execute_bind_action(first);
-
-        // Execute remaining actions
         execute_bind_action(rest);
 
         return true;
     }
 
-    // Handle individual actions
     if (action == "select-all") {
         select_all();
         return true;
@@ -358,7 +480,6 @@ bool Terminal::execute_bind_action(const std::string& action) {
         return true;
     }
 
-    // Jump navigation
     if (action == "top" || action == "first") {
         std::lock_guard<std::mutex> lock(results_mutex_);
         cursor_pos_ = 0;
@@ -370,7 +491,6 @@ bool Terminal::execute_bind_action(const std::string& action) {
         std::lock_guard<std::mutex> lock(results_mutex_);
         if (!current_results_.empty()) {
             cursor_pos_ = current_results_.size() - 1;
-            // Adjust scroll to show last item
             if (cursor_pos_ >= visible_lines_) {
                 scroll_offset_ = cursor_pos_ - visible_lines_ + 1;
             }
@@ -378,7 +498,6 @@ bool Terminal::execute_bind_action(const std::string& action) {
         return true;
     }
 
-    // Toggle actions
     if (action == "toggle-wrap") {
         wrap_lines_ = !wrap_lines_;
         return true;
@@ -389,7 +508,6 @@ bool Terminal::execute_bind_action(const std::string& action) {
         return true;
     }
 
-    // Accept/Abort actions
     if (action == "accept") {
         accept_selection();
         running_ = false;
@@ -397,14 +515,12 @@ bool Terminal::execute_bind_action(const std::string& action) {
     }
 
     if (action == "abort") {
-        // Clear selections and exit without accepting
         selected_.clear();
         accepted_ = false;
         running_ = false;
         return true;
     }
 
-    // Preview scrolling actions
     if (action == "preview-up") {
         if (preview_scroll_offset_ > 0) {
             preview_scroll_offset_--;
@@ -413,14 +529,11 @@ bool Terminal::execute_bind_action(const std::string& action) {
     }
 
     if (action == "preview-down") {
-        // Will check bounds in rendering (when we know preview_total_lines_)
         preview_scroll_offset_++;
         return true;
     }
 
     if (action == "preview-page-up") {
-        // Scroll up by approximately one page (will be refined in rendering)
-        // Use visible_lines_ as approximation for page size
         if (preview_scroll_offset_ >= visible_lines_) {
             preview_scroll_offset_ -= visible_lines_;
         } else {
@@ -430,14 +543,39 @@ bool Terminal::execute_bind_action(const std::string& action) {
     }
 
     if (action == "preview-page-down") {
-        // Scroll down by approximately one page
         preview_scroll_offset_ += visible_lines_;
         return true;
     }
 
-    // Unknown action
+    if (action == "ignore") {
+        return true;
+    }
+
+    if (action == "clear-query") {
+        current_query_.clear();
+        update_results(current_query_);
+        return true;
+    }
+
+    if (action.find("become(") == 0) {
+        return true;  // Stub: process replacement not implemented
+    }
+
+    if (action.find("reload(") == 0) {
+        return true;  // Stub: dynamic reload not implemented
+    }
+
+    if (action.find("change-preview(") == 0) {
+        return true;  // Stub: change-preview not implemented
+    }
+
+    if (action.find("change-prompt(") == 0) {
+        return true;  // Stub: change-prompt not implemented
+    }
+
     return false;
 }
+
 
 void Terminal::get_terminal_size(int& rows, int& cols) const {
     struct winsize w;
@@ -465,25 +603,30 @@ void Terminal::calculate_preview_position(int& top, int& left, int& lines, int& 
         return;
     }
 
-    // Split-screen layout: results on left, preview on right
-    int results_width = term_cols / 2;
-    int preview_width = term_cols - results_width - 1; // -1 for separator
+    // Split-screen layout with configurable preview position and size
+    int preview_width = (term_cols * opts_.preview_size_percent) / 100;
+    int results_width = term_cols - preview_width - 1; // -1 for separator
 
     // Calculate vertical layout:
-    // Row 0: Info line (1 row)
+    // Row 0: Info line (1 row, if not hidden)
     // Row 1: Header (if present, 1 row)
     // Row 2: Separator (1 row)
     // Row 3+: Content area
     // Bottom: Separator (1 row) + Input (1 row)
 
+    int info_rows = opts_.info_hidden ? 0 : 1;
     int header_rows = opts_.header.empty() ? 0 : 1;
-    int top_ui_rows = 1 + header_rows + 1; // info + header + separator
+    int top_ui_rows = info_rows + header_rows + 1; // info + header + separator
     int bottom_ui_rows = 2; // separator + input
     int content_rows = term_rows - top_ui_rows - bottom_ui_rows;
 
     // Preview starts after top UI elements
     top = top_ui_rows;
-    left = results_width + 1; // After results + separator
+    if (opts_.preview_position == "left") {
+        left = 0; // Preview starts at left edge
+    } else {
+        left = results_width + 1; // After results + separator
+    }
     lines = content_rows;
     cols = preview_width;
 }
@@ -829,21 +972,49 @@ bool Terminal::handle_mouse_event(Event event) {
 
         int results_start_y;
         if (opts_.layout == LayoutType::Reverse) {
-            // Reverse layout: results at top after input/info/header
-            results_start_y = 1;  // Input line
-            results_start_y += 1;  // Separator
-            results_start_y += 1;  // Info line
-            if (!opts_.header.empty()) {
-                results_start_y += 1;  // Header
+            // Reverse layout: header/info at top, results below, input at bottom
+            results_start_y = 0;
+
+            // Add header/info based on header_first setting
+            if (opts_.header_first) {
+                if (!opts_.header.empty()) {
+                    results_start_y += 1;  // Header line
+                }
+                if (!opts_.info_hidden) {
+                    results_start_y += 1;  // Info line
+                }
+            } else {
+                if (!opts_.info_hidden) {
+                    results_start_y += 1;  // Info line
+                }
+                if (!opts_.header.empty()) {
+                    results_start_y += 1;  // Header line
+                }
             }
-            results_start_y += 1;  // Separator
+
+            results_start_y += 1;  // Separator after header/info
         } else {
-            // Default layout: results at bottom
-            results_start_y = 1;  // Info line
-            if (!opts_.header.empty()) {
-                results_start_y += 1;  // Header
+            // Default layout: same order as reverse, just affects result ordering
+            results_start_y = 0;
+
+            // Add header/info based on header_first setting
+            if (opts_.header_first) {
+                if (!opts_.header.empty()) {
+                    results_start_y += 1;  // Header line
+                }
+                if (!opts_.info_hidden) {
+                    results_start_y += 1;  // Info line
+                }
+            } else {
+                if (!opts_.info_hidden) {
+                    results_start_y += 1;  // Info line
+                }
+                if (!opts_.header.empty()) {
+                    results_start_y += 1;  // Header line
+                }
             }
-            results_start_y += 1;  // Separator
+
+            results_start_y += 1;  // Separator after header/info
         }
 
         // Account for border offset (border adds 1 row at top)
@@ -929,9 +1100,10 @@ std::vector<std::string> Terminal::run() {
         get_terminal_size(term_rows, term_cols);
 
         // Calculate available space for results
-        // UI layout: info(1) + header(0-1) + separator(1) + content + separator(1) + input(1)
+        // UI layout: info(0-1) + header(0-1) + separator(1) + content + separator(1) + input(1)
+        int info_rows = opts_.info_hidden ? 0 : 1;
         int header_rows = opts_.header.empty() ? 0 : 1;
-        int ui_overhead = 1 + header_rows + 1 + 1 + 1;  // info + header + sep + sep + input
+        int ui_overhead = info_rows + header_rows + 1 + 1 + 1;  // info + header + sep + sep + input
         visible_lines_ = term_rows - ui_overhead;
 
         // Ensure at least 5 lines visible
@@ -950,6 +1122,16 @@ std::vector<std::string> Terminal::run() {
     // Create a component that handles ALL events before passing to Input
     auto component = CatchEvent(input, [&, exit](Event event) {
         // Handle critical events FIRST, before Input sees them
+
+        // Check for expect keys
+        std::string matched_key;
+        if (check_expect_key(event, matched_key)) {
+            matched_expect_key_ = matched_key;
+            accept_selection();
+            running_ = false;
+            exit();
+            return true;
+        }
 
         if (event == Event::Return) {
             // Check for custom enter binding
@@ -984,12 +1166,44 @@ std::vector<std::string> Terminal::run() {
         }
 
         if (event == Event::ArrowUp) {
-            move_cursor_up();
+            // Check for custom up binding
+            auto bind_it = opts_.bindings.find("up");
+            if (bind_it != opts_.bindings.end()) {
+                execute_bind_action(bind_it->second);
+            } else {
+                move_cursor_up();
+            }
             return true;
         }
 
         if (event == Event::ArrowDown) {
-            move_cursor_down();
+            // Check for custom down binding
+            auto bind_it = opts_.bindings.find("down");
+            if (bind_it != opts_.bindings.end()) {
+                execute_bind_action(bind_it->second);
+            } else {
+                move_cursor_down();
+            }
+            return true;
+        }
+
+        if (event == Event::ArrowLeft) {
+            // Check for custom left binding
+            auto bind_it = opts_.bindings.find("left");
+            if (bind_it != opts_.bindings.end()) {
+                execute_bind_action(bind_it->second);
+            }
+            // No default behavior for left arrow
+            return true;
+        }
+
+        if (event == Event::ArrowRight) {
+            // Check for custom right binding
+            auto bind_it = opts_.bindings.find("right");
+            if (bind_it != opts_.bindings.end()) {
+                execute_bind_action(bind_it->second);
+            }
+            // No default behavior for right arrow
             return true;
         }
 
@@ -1126,12 +1340,10 @@ std::vector<std::string> Terminal::run() {
                     if (!display.empty()) {
                         item_text = display;
                     } else {
-                        // Debug: show that fields exist but display is empty
-                        item_text = "[empty field]";
+                        item_text = result.item->display_text();
                     }
                 } else {
-                    // Debug: fields not parsed
-                    item_text = "[no fields: " + result.item->text() + "]";
+                    item_text = result.item->display_text();
                 }
             } else {
                 // Use display_text (ANSI codes already stripped during parsing)
@@ -1306,10 +1518,14 @@ std::vector<std::string> Terminal::run() {
             if (has_header) {
                 layout_elements.push_back(header_element);
             }
-            layout_elements.push_back(text(info) | hcenter);
+            if (!opts_.info_hidden) {
+                layout_elements.push_back(text(info) | hcenter);
+            }
         } else {
             // Default mode: info before header
-            layout_elements.push_back(text(info) | hcenter);
+            if (!opts_.info_hidden) {
+                layout_elements.push_back(text(info) | hcenter);
+            }
             if (has_header) {
                 layout_elements.push_back(header_element);
             }
@@ -1448,15 +1664,25 @@ std::vector<std::string> Terminal::run() {
 
             auto preview_box = vbox(preview_elements) | frame;
 
-            // Horizontal split: give results box more space (60% vs 40%)
-            // Use size() to give explicit widths instead of flex
-            layout_elements.push_back(
-                hbox({
-                    results_box | size(WIDTH, GREATER_THAN, 40),
-                    separator(),
-                    preview_box | flex
-                }) | flex
-            );
+            // Horizontal split with configurable position
+            if (opts_.preview_position == "left") {
+                layout_elements.push_back(
+                    hbox({
+                        preview_box | flex,
+                        separator(),
+                        results_box | size(WIDTH, GREATER_THAN, 40)
+                    }) | flex
+                );
+            } else {
+                // Default: preview on right
+                layout_elements.push_back(
+                    hbox({
+                        results_box | size(WIDTH, GREATER_THAN, 40),
+                        separator(),
+                        preview_box | flex
+                    }) | flex
+                );
+            }
         } else {
             // No preview, just results
             layout_elements.push_back(results_box | flex);
@@ -1509,11 +1735,9 @@ std::vector<std::string> Terminal::run() {
             for (size_t idx : selected_) {
                 if (idx < items.size()) {
                     std::string text = items[idx]->text();
-                    // Strip ANSI codes from output only if --ansi flag not set
-                    // (clifm needs stripping, por-cli may need them preserved)
-                    if (!opts_.ansi) {
-                        text = strip_ansi_codes(text);
-                    }
+                    // Always strip ANSI codes from output
+                    // The --ansi flag controls parsing for display, not output
+                    text = strip_ansi_codes(text);
                     result.push_back(text);
                 }
             }
@@ -1522,11 +1746,9 @@ std::vector<std::string> Terminal::run() {
             std::lock_guard<std::mutex> lock(results_mutex_);
             if (!current_results_.empty() && cursor_pos_ < current_results_.size()) {
                 std::string text = current_results_[cursor_pos_].item->text();
-                // Strip ANSI codes from output only if --ansi flag not set
-                // (clifm needs stripping, por-cli may need them preserved)
-                if (!opts_.ansi) {
-                    text = strip_ansi_codes(text);
-                }
+                // Always strip ANSI codes from output
+                // The --ansi flag controls parsing for display, not output
+                text = strip_ansi_codes(text);
                 result.push_back(text);
             }
         }
