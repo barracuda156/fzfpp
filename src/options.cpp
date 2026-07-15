@@ -2,20 +2,73 @@
 #include <CLI/CLI.hpp>
 #include <iostream>
 #include <sstream>
+#include <cstdlib>
 
 namespace fzf {
+
+// Split a string into shell-like words, honoring single quotes, double quotes,
+// and backslash escaping. Used to parse $FZF_DEFAULT_OPTS the way fzf does.
+static std::vector<std::string> shell_split(const std::string& s) {
+    std::vector<std::string> out;
+    std::string cur;
+    bool in_word = false;
+    enum { NONE, SINGLE, DOUBLE } q = NONE;
+
+    for (size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
+        if (q == SINGLE) {
+            if (c == '\'') q = NONE;
+            else cur += c;
+            in_word = true;
+        } else if (q == DOUBLE) {
+            if (c == '"') {
+                q = NONE;
+            } else if (c == '\\' && i + 1 < s.size() &&
+                       (s[i+1] == '"' || s[i+1] == '\\' || s[i+1] == '$' || s[i+1] == '`')) {
+                cur += s[++i];
+            } else {
+                cur += c;
+            }
+            in_word = true;
+        } else if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v') {
+            if (in_word) { out.push_back(cur); cur.clear(); in_word = false; }
+        } else if (c == '\'') {
+            q = SINGLE; in_word = true;
+        } else if (c == '"') {
+            q = DOUBLE; in_word = true;
+        } else if (c == '\\' && i + 1 < s.size()) {
+            cur += s[++i]; in_word = true;
+        } else {
+            cur += c; in_word = true;
+        }
+    }
+    if (in_word) out.push_back(cur);
+    return out;
+}
 
 Options parse_options(int argc, char* argv[]) {
     Options opts;
 
-    // Preprocess argv to handle +i and +m (CLI11 doesn't support + prefix)
+    // Build the effective argument list: $FZF_DEFAULT_OPTS first (so real
+    // command-line args override it), then argv. Handle +i and +m here too
+    // (CLI11 doesn't support the + prefix), from either source.
     bool case_sensitive_flag = false;
     bool no_multi_flag = false;
     std::vector<std::string> arg_storage;
 
     arg_storage.push_back(argv[0]);
+
+    std::vector<std::string> raw_args;
+    if (const char* default_opts = std::getenv("FZF_DEFAULT_OPTS")) {
+        for (auto& tok : shell_split(default_opts)) {
+            raw_args.push_back(std::move(tok));
+        }
+    }
     for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
+        raw_args.push_back(argv[i]);
+    }
+
+    for (const auto& arg : raw_args) {
         if (arg == "+i") {
             case_sensitive_flag = true;
         } else if (arg == "+m") {
@@ -33,6 +86,13 @@ Options parse_options(int argc, char* argv[]) {
     int new_argc = static_cast<int>(new_argv.size());
 
     CLI::App app{"fzf++ - Command-line fuzzy finder (C++ implementation)"};
+
+    // fzf accepts many flags this port does not implement; app configs such as
+    // $FZF_DEFAULT_OPTS routinely pass them. Collect unrecognized flags (and any
+    // stray values) instead of aborting, so those invocations still run. Values
+    // in the --flag=value form are self-contained; a lone value after an unknown
+    // flag is simply dropped, which is harmless as there is no positional arg.
+    app.allow_extras();
 
     bool version = false;
     app.add_flag("-v,--version", version, "Show version");
