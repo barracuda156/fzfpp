@@ -71,8 +71,12 @@ struct Options {
     // Delimiter for field splitting
     std::string delimiter;
 
-    // Field selection for display
-    std::vector<int> with_nth;  // Fields to display (1-based, empty = all)
+    // Field selection for display (--with-nth) and output (--accept-nth).
+    // Each range uses fzf's nth semantics: 1-based, negative counts from the
+    // end (-1 = last field), and open-ended ranges (2.. / ..3) are supported.
+    // Empty vector = use the whole line.
+    std::vector<FieldRange> with_nth;    // Fields shown in the list
+    std::vector<FieldRange> accept_nth;  // Fields printed on accept
 
     // Key bindings
     std::map<std::string, std::string> bindings;  // key -> action

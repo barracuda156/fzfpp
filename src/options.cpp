@@ -46,6 +46,67 @@ static std::vector<std::string> shell_split(const std::string& s) {
     return out;
 }
 
+// Parse an fzf nth-spec (the value of --with-nth / --accept-nth) into ranges.
+// The spec is a comma-separated list of terms, each of which is one of:
+//   N        a single field (1-based; negative counts from the end, -1 = last)
+//   N..M     an inclusive range
+//   N..      from field N through the last field
+//   ..M      from the first field through field M
+//   ..       every field
+// Invalid terms are skipped with a warning, matching the tolerant spirit of the
+// rest of option parsing.
+static std::vector<FieldRange> parse_nth_spec(const std::string& spec) {
+    std::vector<FieldRange> ranges;
+    std::stringstream ss(spec);
+    std::string term;
+
+    auto to_int = [](const std::string& s, int& out) -> bool {
+        if (s.empty()) return false;
+        try {
+            size_t consumed = 0;
+            int v = std::stoi(s, &consumed);
+            if (consumed != s.size() || v == 0) return false;  // fzf fields are 1-based
+            out = v;
+            return true;
+        } catch (...) {
+            return false;
+        }
+    };
+
+    while (std::getline(ss, term, ',')) {
+        // trim surrounding whitespace
+        size_t a = term.find_first_not_of(" \t");
+        size_t b = term.find_last_not_of(" \t");
+        if (a == std::string::npos) continue;
+        term = term.substr(a, b - a + 1);
+
+        FieldRange r;
+        size_t dots = term.find("..");
+        if (dots == std::string::npos) {
+            int v;
+            if (!to_int(term, v)) {
+                std::cerr << "Invalid field spec: " << term << std::endl;
+                continue;
+            }
+            r.begin = r.end = v;
+        } else {
+            std::string lhs = term.substr(0, dots);
+            std::string rhs = term.substr(dots + 2);
+            bool ok = true;
+            if (lhs.empty()) { r.open_begin = true; }
+            else ok = to_int(lhs, r.begin);
+            if (rhs.empty()) { r.open_end = true; }
+            else if (ok) ok = to_int(rhs, r.end);
+            if (!ok) {
+                std::cerr << "Invalid field range: " << term << std::endl;
+                continue;
+            }
+        }
+        ranges.push_back(r);
+    }
+    return ranges;
+}
+
 Options parse_options(int argc, char* argv[]) {
     Options opts;
 
@@ -203,7 +264,11 @@ Options parse_options(int argc, char* argv[]) {
 
     std::string with_nth_str;
     app.add_option("--with-nth", with_nth_str,
-                   "Display only specified fields (comma-separated, 1-based)");
+                   "Display only specified fields (e.g. 2,3 or 2.. or -1)");
+
+    std::string accept_nth_str;
+    app.add_option("--accept-nth", accept_nth_str,
+                   "Print only specified fields on accept (e.g. 2.. or -1)");
 
     std::vector<std::string> bind_specs;
     app.add_option("--bind", bind_specs,
@@ -232,17 +297,12 @@ Options parse_options(int argc, char* argv[]) {
         std::exit(app.exit(e));
     }
 
-    // Parse --with-nth
+    // Parse --with-nth / --accept-nth field specs (supports ranges like 2..)
     if (!with_nth_str.empty()) {
-        std::stringstream ss(with_nth_str);
-        std::string field;
-        while (std::getline(ss, field, ',')) {
-            try {
-                opts.with_nth.push_back(std::stoi(field));
-            } catch (...) {
-                std::cerr << "Invalid field number: " << field << std::endl;
-            }
-        }
+        opts.with_nth = parse_nth_spec(with_nth_str);
+    }
+    if (!accept_nth_str.empty()) {
+        opts.accept_nth = parse_nth_spec(accept_nth_str);
     }
 
     // Parse --bind specifications

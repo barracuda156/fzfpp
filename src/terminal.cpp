@@ -1315,7 +1315,8 @@ std::vector<std::string> Terminal::run() {
             std::string item_text;
             if (!opts_.with_nth.empty()) {
                 if (result.item->has_fields()) {
-                    std::string display = result.item->get_display_fields(opts_.with_nth);
+                    std::string display =
+                        result.item->get_fields_by_ranges(opts_.with_nth, opts_.delimiter);
                     if (!display.empty()) {
                         item_text = display;
                     } else {
@@ -1707,28 +1708,32 @@ std::vector<std::string> Terminal::run() {
     // Collect selected items
     std::vector<std::string> result;
 
+    // Apply --accept-nth (print only selected fields) and strip ANSI codes.
+    // The --ansi flag controls parsing for display, not output.
+    auto output_text = [this](const std::shared_ptr<Item>& item) -> std::string {
+        std::string text;
+        if (!opts_.accept_nth.empty() && item->has_fields()) {
+            text = item->get_fields_by_ranges(opts_.accept_nth, opts_.delimiter);
+        } else {
+            text = item->text();
+        }
+        return strip_ansi_codes(text);
+    };
+
     if (accepted_) {
         if (opts_.multi && !selected_.empty()) {
             // Return all selected items (Tab-selected)
             auto items = reader_.get_items();
             for (size_t idx : selected_) {
                 if (idx < items.size()) {
-                    std::string text = items[idx]->text();
-                    // Always strip ANSI codes from output
-                    // The --ansi flag controls parsing for display, not output
-                    text = strip_ansi_codes(text);
-                    result.push_back(text);
+                    result.push_back(output_text(items[idx]));
                 }
             }
         } else {
             // Return current cursor item (single-select or multi without Tab selections)
             std::lock_guard<std::mutex> lock(results_mutex_);
             if (!current_results_.empty() && cursor_pos_ < current_results_.size()) {
-                std::string text = current_results_[cursor_pos_].item->text();
-                // Always strip ANSI codes from output
-                // The --ansi flag controls parsing for display, not output
-                text = strip_ansi_codes(text);
-                result.push_back(text);
+                result.push_back(output_text(current_results_[cursor_pos_].item));
             }
         }
     }
@@ -1744,10 +1749,15 @@ std::vector<std::string> Terminal::run_filter(const std::string& query) {
     auto items = reader_.get_items();
     auto results = matcher_.match_items(items, query);
 
-    // Return matched items
+    // Return matched items, honoring --accept-nth
     std::vector<std::string> output;
     for (const auto& result : results) {
-        output.push_back(result.item->text());
+        if (!opts_.accept_nth.empty() && result.item->has_fields()) {
+            output.push_back(
+                result.item->get_fields_by_ranges(opts_.accept_nth, opts_.delimiter));
+        } else {
+            output.push_back(result.item->text());
+        }
     }
 
     return output;

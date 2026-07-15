@@ -11,6 +11,18 @@ namespace fzf {
 // UTF-32 code point representation for efficient matching
 using CodePoint = char32_t;
 
+// A field range for --with-nth / --accept-nth, using fzf's "nth" semantics.
+// Indices are 1-based; a negative index counts from the end (-1 = last field).
+// `begin`/`end` are inclusive. `open_begin` means "..N" (from the first field)
+// and `open_end` means "N.." (through the last field). A single field N is
+// represented as begin == end == N with both flags false.
+struct FieldRange {
+    int begin = 1;
+    int end = 1;
+    bool open_begin = false;  // "..end"  -> from the first field
+    bool open_end = false;    // "begin.." -> through the last field
+};
+
 // ANSI color offset information
 struct AnsiOffset {
     uint32_t offset;  // Byte offset in original string
@@ -78,18 +90,47 @@ public:
         return fields_[idx];
     }
 
-    // Get display text based on field selection
-    std::string get_display_fields(const std::vector<int>& field_nums) const {
-        if (!fields_parsed_ || field_nums.empty()) {
+    // Resolve a single FieldRange to concrete 1-based [lo, hi] field numbers,
+    // clamped to the fields that actually exist. Negative indices count from
+    // the end (-1 = last field). Returns false if the range selects nothing.
+    bool resolve_range(const FieldRange& r, int& lo, int& hi) const {
+        int n = static_cast<int>(fields_.size());
+        if (n == 0) return false;
+
+        auto norm = [n](int idx) -> int {
+            return idx < 0 ? n + idx + 1 : idx;  // -1 -> n, -2 -> n-1, ...
+        };
+
+        lo = r.open_begin ? 1 : norm(r.begin);
+        hi = r.open_end   ? n : norm(r.end);
+        if (lo < 1) lo = 1;
+        if (hi > n) hi = n;
+        return lo <= hi;
+    }
+
+    // Join the fields selected by `ranges` back into a string, using the
+    // original `delimiter` between fields inside a contiguous range and a
+    // single space between separate ranges (matching fzf's observable output).
+    // Falls back to the whole line when ranges are empty or nothing is parsed.
+    std::string get_fields_by_ranges(const std::vector<FieldRange>& ranges,
+                                     const std::string& delimiter) const {
+        if (!fields_parsed_ || ranges.empty()) {
             return original_text_;
         }
 
         std::string result;
-        for (size_t i = 0; i < field_nums.size(); ++i) {
-            if (i > 0) result += " ";
-            result += get_field(field_nums[i]);
+        bool wrote_range = false;
+        for (const auto& r : ranges) {
+            int lo, hi;
+            if (!resolve_range(r, lo, hi)) continue;
+            if (wrote_range) result += ' ';
+            for (int f = lo; f <= hi; ++f) {
+                if (f > lo) result += delimiter;
+                result += get_field(f);
+            }
+            wrote_range = true;
         }
-        return result;
+        return wrote_range ? result : original_text_;
     }
 
     // Check if fields have been parsed
