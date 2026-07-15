@@ -83,6 +83,7 @@ private:
 
     // UI state
     std::string current_query_;
+    std::string current_prompt_;  // Live prompt; starts at opts_.prompt, changed by change-prompt
     std::vector<MatchResult> current_results_;
     size_t cursor_pos_;           // Current cursor position
     size_t scroll_offset_;        // Scroll offset for results

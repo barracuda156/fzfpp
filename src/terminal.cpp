@@ -39,6 +39,7 @@ Terminal::Terminal(const Options& opts, Reader& reader)
       preview_cancel_(false),
       preview_target_cursor_(SIZE_MAX)
 {
+    current_prompt_ = opts_.prompt;
 }
 
 Terminal::~Terminal() {
@@ -408,6 +409,33 @@ bool Terminal::execute_bind_action(const std::string& action) {
         return true;
     }
 
+    if (action.find("change-prompt(") == 0) {
+        // Match the closing paren by nesting depth so a prompt string may itself
+        // contain parentheses; parsed here (before the naive '+' split below) so
+        // a '+' inside the new prompt is not mistaken for a composite separator.
+        size_t start = action.find('(');
+        int depth = 0;
+        size_t end = std::string::npos;
+        for (size_t i = start; i < action.length(); ++i) {
+            if (action[i] == '(') {
+                depth++;
+            } else if (action[i] == ')') {
+                if (--depth == 0) { end = i; break; }
+            }
+        }
+        if (end == std::string::npos) {
+            return false;
+        }
+
+        current_prompt_ = action.substr(start + 1, end - start - 1);
+
+        // Honor a composite action chained after change-prompt(...)+...
+        if (end + 1 < action.length() && action[end + 1] == '+') {
+            execute_bind_action(action.substr(end + 2));
+        }
+        return true;
+    }
+
     size_t plus_pos = action.find('+');
     if (plus_pos != std::string::npos) {
         std::string first = action.substr(0, plus_pos);
@@ -546,10 +574,6 @@ bool Terminal::execute_bind_action(const std::string& action) {
 
     if (action.find("change-preview(") == 0) {
         return true;  // Stub: change-preview not implemented
-    }
-
-    if (action.find("change-prompt(") == 0) {
-        return true;  // Stub: change-prompt not implemented
     }
 
     return false;
@@ -1669,7 +1693,7 @@ std::vector<std::string> Terminal::run() {
         }
 
         layout_elements.push_back(separator());
-        layout_elements.push_back(hbox({text(opts_.prompt), component->Render()}));
+        layout_elements.push_back(hbox({text(current_prompt_), component->Render()}));
 
         auto layout = vbox(layout_elements);
 
