@@ -20,7 +20,7 @@ using namespace ftxui;
 Terminal::Terminal(const Options& opts, Reader& reader)
     : opts_(opts),
       reader_(reader),
-      matcher_(opts.case_mode, opts.algo),
+      matcher_(opts.case_mode, opts.algo, !opts.fuzzy),
       cursor_pos_(0),
       scroll_offset_(0),
       running_(false),

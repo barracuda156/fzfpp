@@ -316,6 +316,82 @@ MatchResult Matcher::fuzzy_match_v2(
     return MatchResult(item, max_score, std::move(positions));
 }
 
+// Exact substring matching (--exact / -e). The whole pattern must appear as a
+// contiguous run in the text; among all such occurrences we keep the one with
+// the highest score. Scoring mirrors the fuzzy path so exact and fuzzy results
+// remain comparable: SCORE_MATCH per character, the position bonus on the first
+// matched character (doubled at text start / boundaries via bonus_for), and the
+// consecutive bonus on every following character of the run.
+MatchResult Matcher::exact_match(
+    const std::shared_ptr<Item>& item,
+    const std::vector<CodePoint>& pattern)
+{
+    const auto& text = item->code_points();
+    size_t pattern_len = pattern.size();
+    size_t text_len = text.size();
+
+    if (pattern_len == 0) {
+        return MatchResult(item, 0);
+    }
+    if (text_len == 0 || pattern_len > text_len) {
+        return MatchResult();  // No match
+    }
+
+    // Precompute per-position boundary bonuses, exactly as the fuzzy path does.
+    std::vector<int32_t> bonus(text_len);
+    CharClass prev_class = CharClass::CharWhite;
+    for (size_t i = 0; i < text_len; ++i) {
+        CharClass curr_class = char_class_of(text[i]);
+        bonus[i] = bonus_for(prev_class, curr_class);
+        prev_class = curr_class;
+    }
+
+    int32_t best_score = -1;
+    size_t best_start = 0;
+
+    // Slide the pattern across every candidate start position.
+    for (size_t start = 0; start + pattern_len <= text_len; ++start) {
+        bool matched = true;
+        for (size_t k = 0; k < pattern_len; ++k) {
+            if (!char_equal(text[start + k], pattern[k])) {
+                matched = false;
+                break;
+            }
+        }
+        if (!matched) {
+            continue;
+        }
+
+        int32_t first_bonus = bonus[start];
+        if (start == 0) {
+            first_bonus *= BONUS_FIRST_CHAR_MULTIPLIER;
+        }
+        // First char: match + boundary bonus. Remaining chars: match +
+        // consecutive bonus (the run is contiguous by construction).
+        int32_t score = SCORE_MATCH + first_bonus;
+        score += static_cast<int32_t>(pattern_len - 1) *
+                 (SCORE_MATCH + BONUS_CONSECUTIVE);
+
+        if (score > best_score) {
+            best_score = score;
+            best_start = start;
+        }
+    }
+
+    if (best_score < 0) {
+        return MatchResult();  // No match
+    }
+
+    std::vector<MatchPos> positions;
+    positions.reserve(pattern_len);
+    for (size_t k = 0; k < pattern_len; ++k) {
+        positions.push_back({static_cast<uint32_t>(best_start + k),
+                             static_cast<uint32_t>(best_start + k + 1)});
+    }
+
+    return MatchResult(item, best_score, std::move(positions));
+}
+
 // Main match function
 MatchResult Matcher::match(const std::shared_ptr<Item>& item,
                            const std::string& pattern)
@@ -325,6 +401,10 @@ MatchResult Matcher::match(const std::shared_ptr<Item>& item,
     }
 
     auto pattern_cp = prepare_pattern(pattern);
+
+    if (exact_) {
+        return exact_match(item, pattern_cp);
+    }
 
     if (algo_ == AlgoType::FuzzyV2) {
         return fuzzy_match_v2(item, pattern_cp);

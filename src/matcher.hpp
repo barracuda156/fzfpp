@@ -36,8 +36,9 @@ enum class CharClass {
 class Matcher {
 public:
     Matcher(CaseMode case_mode = CaseMode::Smart,
-            AlgoType algo = AlgoType::FuzzyV2)
-        : case_mode_(case_mode), algo_(algo) {}
+            AlgoType algo = AlgoType::FuzzyV2,
+            bool exact = false)
+        : case_mode_(case_mode), algo_(algo), exact_(exact) {}
 
     // Match a single item against a pattern
     MatchResult match(const std::shared_ptr<Item>& item, const std::string& pattern);
@@ -53,6 +54,9 @@ public:
     // Set algorithm
     void set_algo(AlgoType algo) { algo_ = algo; }
 
+    // Enable exact (substring) matching instead of fuzzy (--exact / -e)
+    void set_exact(bool exact) { exact_ = exact; }
+
 private:
     // Convert pattern to code points
     std::vector<CodePoint> prepare_pattern(const std::string& pattern);
@@ -64,6 +68,13 @@ private:
 
     // Fuzzy match V2 (Smith-Waterman algorithm - optimal)
     MatchResult fuzzy_match_v2(
+        const std::shared_ptr<Item>& item,
+        const std::vector<CodePoint>& pattern);
+
+    // Exact match: the whole pattern must appear as a contiguous substring
+    // (--exact / -e). Highlights the matched run and scores it like fzf's
+    // exact-match path (bonuses applied, best-scoring occurrence chosen).
+    MatchResult exact_match(
         const std::shared_ptr<Item>& item,
         const std::vector<CodePoint>& pattern);
 
@@ -84,6 +95,7 @@ private:
 
     CaseMode case_mode_;
     AlgoType algo_;
+    bool exact_;                   // Exact (substring) matching instead of fuzzy
     mutable bool case_sensitive_;  // Computed per-pattern for smart case
 };
 
