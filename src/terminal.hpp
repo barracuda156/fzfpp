@@ -38,9 +38,6 @@ public:
     std::string get_matched_expect_key() const { return matched_expect_key_; }
 
 private:
-    // Perform search in background
-    void perform_search();
-
     // Update search results
     void update_results(const std::string& query);
 
@@ -96,9 +93,6 @@ private:
 
     // Threading
     mutable std::mutex results_mutex_;
-    std::atomic<bool> search_pending_;
-    std::atomic<bool> search_running_;
-    std::thread search_thread_;
 
     // Display parameters
     size_t visible_lines_;        // Number of visible result lines

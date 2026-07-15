@@ -26,8 +26,6 @@ Terminal::Terminal(const Options& opts, Reader& reader)
       running_(false),
       accepted_(false),
       matched_expect_key_(""),
-      search_pending_(false),
-      search_running_(false),
       visible_lines_(10),  // Default, will be updated
       wrap_lines_(opts.wrap),  // Initialize from options
       preview_visible_(true),  // Preview visible by default (if preview_command set)
@@ -50,10 +48,6 @@ Terminal::~Terminal() {
 
     if (preview_thread_.joinable()) {
         preview_thread_.join();
-    }
-
-    if (search_thread_.joinable()) {
-        search_thread_.join();
     }
 }
 
@@ -95,24 +89,6 @@ void Terminal::update_results(const std::string& query) {
     if (!opts_.preview_command.empty()) {
         populate_prefetch_queue();
     }
-}
-
-void Terminal::perform_search() {
-    search_running_.store(true, std::memory_order_release);
-
-    while (search_pending_.load(std::memory_order_acquire)) {
-        search_pending_.store(false, std::memory_order_release);
-
-        std::string query_copy;
-        {
-            std::lock_guard<std::mutex> lock(results_mutex_);
-            query_copy = current_query_;
-        }
-
-        update_results(query_copy);
-    }
-
-    search_running_.store(false, std::memory_order_release);
 }
 
 std::vector<MatchResult> Terminal::get_visible_results() const {
@@ -167,6 +143,9 @@ void Terminal::move_cursor_page_up() {
 }
 
 void Terminal::move_cursor_page_down() {
+    if (current_results_.empty()) {
+        return;
+    }
     cursor_pos_ = std::min(cursor_pos_ + visible_lines_,
                           current_results_.size() - 1);
     if (cursor_pos_ >= scroll_offset_ + visible_lines_) {

@@ -1,7 +1,7 @@
 #include "matcher.hpp"
 #include <utf8.h>
 #include <algorithm>
-#include <climits>
+#include <limits>
 
 namespace fzf {
 
@@ -34,27 +34,23 @@ std::vector<CodePoint> Matcher::prepare_pattern(const std::string& pattern) {
     return result;
 }
 
-// Check if pattern is all lowercase
 bool Matcher::is_lowercase_pattern(const std::vector<CodePoint>& pattern) const {
     for (CodePoint c : pattern) {
         if (c >= 'A' && c <= 'Z') {
             return false;
         }
-        // For Unicode, could add more sophisticated checks
     }
     return true;
 }
 
-// Normalize character (to lowercase)
 CodePoint Matcher::normalize_char(CodePoint c) const {
+    // ASCII-only lowercasing; full Unicode case folding would need ICU.
     if (c >= 'A' && c <= 'Z') {
         return c + ('a' - 'A');
     }
-    // For full Unicode support, would use ICU or similar
     return c;
 }
 
-// Character equality check
 bool Matcher::char_equal(CodePoint a, CodePoint b) const {
     if (case_sensitive_) {
         return a == b;
@@ -77,34 +73,27 @@ CharClass Matcher::char_class_of(CodePoint c) const {
         if ((c >= '0' && c <= '9')) {
             return CharClass::CharNumber;
         }
-        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
-            return CharClass::CharLetter;
-        }
         return CharClass::CharNonWord;
     }
 
-    // Unicode: simplified classification
-    // Full implementation would use Unicode properties
+    // Non-ASCII code points are treated as generic letters.
     return CharClass::CharLetter;
 }
 
 // Calculate bonus for character position
 int32_t Matcher::bonus_for(CharClass prev, CharClass curr) const {
-    if (prev == CharClass::CharWhite && curr != CharClass::CharWhite) {
-        // Whitespace boundary
-        return BONUS_BOUNDARY_WHITE;
-    }
-    if ((prev == CharClass::CharNonWord && curr != CharClass::CharNonWord) ||
-        (prev != CharClass::CharNonWord && curr == CharClass::CharNonWord)) {
-        // Word boundary with delimiter
-        return BONUS_BOUNDARY_DELIMITER;
+    if (curr != CharClass::CharNonWord && curr != CharClass::CharWhite) {
+        if (prev == CharClass::CharWhite) {
+            return BONUS_BOUNDARY_WHITE;
+        }
+        if (prev == CharClass::CharNonWord) {
+            return BONUS_BOUNDARY;
+        }
     }
     if (prev == CharClass::CharLower && curr == CharClass::CharUpper) {
-        // camelCase
         return BONUS_CAMEL123;
     }
     if (prev != CharClass::CharNumber && curr == CharClass::CharNumber) {
-        // Number after letter
         return BONUS_CAMEL123;
     }
     return 0;
@@ -136,7 +125,10 @@ MatchResult Matcher::fuzzy_match_v1(
         prev_class = curr_class;
     }
 
-    // Greedy left-to-right matching
+    // Greedy left-to-right matching: take the first occurrence of each pattern
+    // character. Because character presence is monotonic, this always finds a
+    // match when one exists (unlike a best-bonus lookahead, which can pick a
+    // later position and strand the remaining pattern characters).
     std::vector<MatchPos> positions;
     positions.reserve(pattern_len);
 
@@ -145,51 +137,14 @@ MatchResult Matcher::fuzzy_match_v1(
     int32_t prev_match_pos = -1;
 
     for (size_t pat_idx = 0; pat_idx < pattern_len; ++pat_idx) {
-        // Find next occurrence of pattern character
         bool found = false;
-        int32_t best_pos = -1;
-        int32_t best_bonus = 0;
+        size_t match_pos = 0;
 
-        // Look ahead a few positions to find best bonus position (limited lookahead)
-        const size_t lookahead = 10;
-        size_t search_end = std::min(text_idx + lookahead, text_len);
-
-        for (size_t j = text_idx; j < search_end; ++j) {
+        for (size_t j = text_idx; j < text_len; ++j) {
             if (char_equal(text[j], pattern[pat_idx])) {
-                int32_t current_bonus = bonus[j];
-
-                // Prefer consecutive matches
-                if (prev_match_pos >= 0 && static_cast<int32_t>(j) == prev_match_pos + 1) {
-                    current_bonus += BONUS_CONSECUTIVE;
-                }
-
-                // First character bonus
-                if (j == 0) {
-                    current_bonus += BONUS_FIRST_CHAR_MULTIPLIER * 2;
-                }
-
-                if (!found || current_bonus > best_bonus) {
-                    found = true;
-                    best_pos = static_cast<int32_t>(j);
-                    best_bonus = current_bonus;
-
-                    // If we found a good boundary match, take it immediately
-                    if (current_bonus >= BONUS_BOUNDARY_WHITE) {
-                        break;
-                    }
-                }
-            }
-        }
-
-        // If not found in lookahead, scan the rest
-        if (!found) {
-            for (size_t j = search_end; j < text_len; ++j) {
-                if (char_equal(text[j], pattern[pat_idx])) {
-                    found = true;
-                    best_pos = static_cast<int32_t>(j);
-                    best_bonus = bonus[j];
-                    break;
-                }
+                found = true;
+                match_pos = j;
+                break;
             }
         }
 
@@ -197,16 +152,21 @@ MatchResult Matcher::fuzzy_match_v1(
             return MatchResult();  // No match
         }
 
-        // Record the match
-        positions.push_back({static_cast<uint32_t>(best_pos),
-                            static_cast<uint32_t>(best_pos + 1)});
+        int32_t char_bonus = bonus[match_pos];
+        if (prev_match_pos >= 0 && static_cast<int32_t>(match_pos) == prev_match_pos + 1) {
+            char_bonus += BONUS_CONSECUTIVE;
+        }
+        if (match_pos == 0) {
+            char_bonus *= BONUS_FIRST_CHAR_MULTIPLIER;
+        }
 
-        // Calculate score
-        score += SCORE_MATCH + best_bonus;
+        positions.push_back({static_cast<uint32_t>(match_pos),
+                            static_cast<uint32_t>(match_pos + 1)});
 
-        // Move past this match
-        text_idx = static_cast<size_t>(best_pos) + 1;
-        prev_match_pos = best_pos;
+        score += SCORE_MATCH + char_bonus;
+
+        text_idx = match_pos + 1;
+        prev_match_pos = static_cast<int32_t>(match_pos);
     }
 
     return MatchResult(item, score, std::move(positions));
@@ -255,90 +215,100 @@ MatchResult Matcher::fuzzy_match_v2(
         prev_class = curr_class;
     }
 
-    // DP matrices: H (score) and E (gap)
-    // Using 2 rows for space efficiency (current and previous)
-    std::vector<int32_t> H0(text_len + 1, 0);
-    std::vector<int32_t> H1(text_len + 1, 0);
-    std::vector<int32_t> E0(text_len + 1, 0);
-    std::vector<int32_t> E1(text_len + 1, 0);
-
-    // Backtracking: store best position per pattern character
-    std::vector<std::vector<int32_t>> best_pos(pattern_len);
-    for (size_t i = 0; i < pattern_len; ++i) {
-        best_pos[i].resize(text_len + 1, -1);
-    }
+    // For each pattern character i and text column j we track:
+    //   M[i][j]    : best score for aligning pattern[0..i] with pattern[i]
+    //                matched exactly at text[j] (0 if pattern[i] != text[j]).
+    //   run[i][j]  : length of the consecutive match run ending at that cell.
+    //   from[i][j] : the column of pattern[i-1]'s match on the best path into
+    //                this cell (-1 for i == 0). Recorded so backtracking is
+    //                exact even across gaps.
+    // A match at column j may follow the previous pattern char either
+    // immediately (diagonal, j-1) or after a gap. To support gaps we keep, per
+    // row, the best "prefix" cell seen so far in row i-1 with the accumulated
+    // gap penalty folded in as we sweep columns left to right.
+    std::vector<std::vector<int32_t>> M(pattern_len, std::vector<int32_t>(text_len, 0));
+    std::vector<std::vector<int32_t>> run(pattern_len, std::vector<int32_t>(text_len, 0));
+    std::vector<std::vector<int32_t>> from(pattern_len, std::vector<int32_t>(text_len, -1));
 
     int32_t max_score = 0;
-    int32_t max_score_pos = 0;
+    size_t max_score_row = 0;
+    size_t max_score_pos = 0;
 
-    // Fill DP table
     for (size_t i = 0; i < pattern_len; ++i) {
         CodePoint pattern_char = pattern[i];
-        int32_t gap_score = (i == pattern_len - 1) ? SCORE_GAP_EXTENSION : SCORE_GAP_START;
+        int32_t gap_penalty = (i == pattern_len - 1) ? SCORE_GAP_EXTENSION
+                                                     : SCORE_GAP_START;
 
-        std::fill(H1.begin(), H1.end(), 0);
-        std::fill(E1.begin(), E1.end(), 0);
+        // Best score/column for completing pattern[0..i-1] to the left of the
+        // current column, gap penalty included. Sourced from the previous row.
+        int32_t prefix_best = 0;
+        int32_t prefix_col = -1;
 
         for (size_t j = 0; j < text_len; ++j) {
-            // Calculate match score
-            int32_t match_score = 0;
             if (char_equal(pattern_char, text[j])) {
-                match_score = SCORE_MATCH + bonus[j];
-
-                // Consecutive bonus
-                if (i > 0 && best_pos[i-1][j] == static_cast<int32_t>(j) - 1) {
-                    match_score += BONUS_CONSECUTIVE;
-                }
-
-                // First character bonus
-                if (j == 0) {
-                    match_score *= BONUS_FIRST_CHAR_MULTIPLIER;
-                }
-
-                match_score += H0[j];
-            }
-
-            // Calculate gap score
-            E1[j+1] = std::max(E0[j+1] + gap_score, H0[j+1] + SCORE_GAP_START);
-
-            // Take maximum
-            H1[j+1] = std::max({0, match_score, E1[j+1]});
-
-            // Track best position for backtracking
-            if (H1[j+1] > 0) {
-                if (match_score >= E1[j+1]) {
-                    best_pos[i][j+1] = j;
+                if (i == 0) {
+                    M[i][j] = SCORE_MATCH + bonus[j] * BONUS_FIRST_CHAR_MULTIPLIER;
+                    run[i][j] = 1;
+                    from[i][j] = -1;
                 } else {
-                    best_pos[i][j+1] = best_pos[i][j];
+                    int32_t best = 0;
+                    // Consecutive with the previous pattern char (diagonal).
+                    if (j > 0 && run[i-1][j-1] > 0) {
+                        int32_t s = M[i-1][j-1] + SCORE_MATCH +
+                                    std::max(bonus[j], BONUS_CONSECUTIVE);
+                        if (s > best) {
+                            best = s;
+                            M[i][j] = s;
+                            run[i][j] = run[i-1][j-1] + 1;
+                            from[i][j] = static_cast<int32_t>(j) - 1;
+                        }
+                    }
+                    // After a gap from an earlier match of the previous char.
+                    if (prefix_col >= 0) {
+                        int32_t s = prefix_best + SCORE_MATCH + bonus[j];
+                        if (s > best) {
+                            best = s;
+                            M[i][j] = s;
+                            run[i][j] = 1;
+                            from[i][j] = prefix_col;
+                        }
+                    }
                 }
             }
 
-            // Update max score
-            if (i == pattern_len - 1 && H1[j+1] > max_score) {
-                max_score = H1[j+1];
-                max_score_pos = j + 1;
+            // Advance the prefix (best completion of pattern[0..i-1]) to the
+            // next column, folding in one gap step, then admit this column's own
+            // completed match as a future prefix source.
+            if (prefix_col >= 0) {
+                prefix_best += gap_penalty;
+            }
+            if (i > 0 && run[i-1][j] > 0 &&
+                (prefix_col < 0 || M[i-1][j] > prefix_best)) {
+                prefix_best = M[i-1][j];
+                prefix_col = static_cast<int32_t>(j);
+            }
+
+            if (i == pattern_len - 1 && run[i][j] > 0 && M[i][j] > max_score) {
+                max_score = M[i][j];
+                max_score_row = i;
+                max_score_pos = j;
             }
         }
-
-        // Swap rows
-        std::swap(H0, H1);
-        std::swap(E0, E1);
     }
 
     if (max_score <= 0) {
         return MatchResult();  // No good match
     }
 
-    // Backtrack to find matched positions
+    // Backtrack along the recorded predecessor columns.
     std::vector<MatchPos> positions;
-    int32_t pos = max_score_pos;
-    for (int32_t i = pattern_len - 1; i >= 0 && pos > 0; --i) {
-        int32_t match_pos = best_pos[i][pos];
-        if (match_pos >= 0) {
-            positions.push_back({static_cast<uint32_t>(match_pos),
-                               static_cast<uint32_t>(match_pos + 1)});
-            pos = match_pos;
-        }
+    long i = static_cast<long>(max_score_row);
+    long j = static_cast<long>(max_score_pos);
+    while (i >= 0 && j >= 0) {
+        positions.push_back({static_cast<uint32_t>(j),
+                             static_cast<uint32_t>(j + 1)});
+        j = from[i][j];
+        --i;
     }
 
     std::reverse(positions.begin(), positions.end());
@@ -374,9 +344,12 @@ std::vector<MatchResult> Matcher::match_items(
     std::vector<MatchResult> results;
     results.reserve(items.size());
 
+    // An empty pattern matches every item (score 0), like fzf.
+    bool empty_pattern = pattern.empty();
+
     for (const auto& item : items) {
         auto result = match(item, pattern);
-        if (result.item && result.score > 0) {
+        if (result.item && (empty_pattern || result.score > 0)) {
             results.push_back(std::move(result));
         }
     }
