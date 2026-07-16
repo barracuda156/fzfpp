@@ -1477,25 +1477,22 @@ void Terminal::repaint(bool preview_dirty) {
             (void)w;
         }
 
-        // Apply scroll offset by dropping leading lines. Each visible line is
-        // then written positioned at the pane's own row/column and sanitized
-        // (see write_preview_lines): SGR color and sixel/kitty-graphics
-        // sequences pass through unmodified, but cursor-positioning and
-        // screen-erase escapes are stripped so an external preview script
-        // can't home the cursor to (0,0) and wipe the results list.
-        std::vector<std::string> all_lines = split_lines(preview_text);
-        preview_total_lines_ = all_lines.size();
+        // Stream the whole preview blob into the pane (see
+        // write_preview_content): text lines are positioned per-row, sanitized
+        // and clipped, but a graphics blob — iTerm OSC 1337 image, kitty APC,
+        // sixel — whose payload spans multiple newlines is passed through
+        // contiguous and unaltered, so it never gets cut mid-sequence (which
+        // made iTerm pop its "terminal has initiated display of a file" dialog
+        // and leak the base64 tail). The leading ESC[H ESC[J from scripts like
+        // ytsurf's is still stripped so it can't wipe the results list.
+        size_t total = 0;
+        write_preview_content(STDOUT_FILENO, preview_top, preview_left,
+                              preview_text, preview_scroll_offset_,
+                              preview_lines, preview_cols, total);
+        preview_total_lines_ = total;
         if (preview_total_lines_ > 0 && preview_scroll_offset_ >= preview_total_lines_) {
             preview_scroll_offset_ = preview_total_lines_ - 1;
         }
-
-        std::vector<std::string> visible_lines;
-        for (size_t li = preview_scroll_offset_; li < all_lines.size(); ++li) {
-            visible_lines.push_back(all_lines[li]);
-        }
-
-        write_preview_lines(STDOUT_FILENO, preview_top, preview_left,
-                            visible_lines, preview_lines, preview_cols);
     }
 }
 

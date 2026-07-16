@@ -272,45 +272,106 @@ std::string sanitize_preview_line(const std::string& line) {
 }
 
 namespace {
-// A line that carries a DCS/APC/OSC/PM/SOS string sequence (sixel, kitty
-// graphics, terminal queries) can't be measured or truncated by visible
-// column — its payload bytes aren't display columns and cutting mid-payload
-// would corrupt it. Detect these and pass such lines through unclipped.
-bool has_string_sequence(const std::string& s) {
-    for (size_t i = 0; i + 1 < s.size(); ++i) {
-        if (static_cast<unsigned char>(s[i]) == 0x1b) {
-            char n = s[i + 1];
-            if (n == ']' || n == 'P' || n == '_' || n == '^' || n == 'X') {
-                return true;
-            }
+
+// Length of a string-terminated escape sequence (OSC/DCS/APC/PM/SOS) starting
+// at `content[start]` (which must be ESC). Returns the count of bytes through
+// the terminator (BEL, 8-bit ST 0x9c, or 7-bit ST "ESC \"); if unterminated,
+// returns the remaining length. The payload may legitimately contain newlines
+// (iTerm OSC 1337 images, kitty APC, sixel) — those are data, not line breaks.
+size_t string_seq_len(const std::string& content, size_t start) {
+    size_t j = start + 2;  // skip ESC + introducer
+    const size_t n = content.size();
+    while (j < n) {
+        unsigned char b = static_cast<unsigned char>(content[j]);
+        if (b == 0x07 || b == 0x9c) return j - start + 1;  // BEL / 8-bit ST
+        if (b == '\x1b' && j + 1 < n &&
+            static_cast<unsigned char>(content[j + 1]) == '\\') {
+            return j - start + 2;  // 7-bit ST: ESC \.
         }
+        j++;
     }
-    return false;
+    return n - start;  // unterminated
 }
+
+bool is_string_introducer(char c) {
+    return c == ']' || c == 'P' || c == '_' || c == '^' || c == 'X';
+}
+
+// Truncate an already-sanitized text line (SGR only, no cursor/erase escapes,
+// no string sequences) to `max_cols` visible columns.
+std::string clip_text_line(const std::string& line, int max_cols) {
+    if (max_cols <= 0) return line;
+    if (visible_width(line) <= static_cast<size_t>(max_cols)) return line;
+    return truncate_ansi_text(line, static_cast<size_t>(max_cols));
+}
+
 } // namespace
 
-void write_preview_lines(int fd, int top, int left,
-                         const std::vector<std::string>& lines,
-                         int max_lines, int max_cols) {
+void write_preview_content(int fd, int top, int left,
+                           const std::string& raw_content,
+                           size_t scroll, int max_lines, int max_cols,
+                           size_t& out_total_lines) {
+    // First pass: split into "logical lines" for scroll/line-count bookkeeping,
+    // but treat a string sequence (image blob) as belonging to the line it
+    // starts on so an embedded newline never inflates the line count or gets
+    // treated as a row break. Each element is the raw bytes of one screen row's
+    // worth of content (text + any SGR + at most the image blob that begins on
+    // it). We DON'T sanitize here — sanitation happens per-row below.
+    std::vector<std::string> rows;
+    {
+        std::string cur;
+        size_t i = 0;
+        const size_t n = raw_content.size();
+        while (i < n) {
+            char c = raw_content[i];
+            if (c == '\x1b' && i + 1 < n &&
+                is_string_introducer(raw_content[i + 1])) {
+                size_t len = string_seq_len(raw_content, i);
+                cur.append(raw_content, i, len);  // whole blob, newlines and all
+                i += len;
+                continue;
+            }
+            if (c == '\n') {
+                rows.push_back(cur);
+                cur.clear();
+                i++;
+                continue;
+            }
+            cur.push_back(c);
+            i++;
+        }
+        if (!cur.empty()) rows.push_back(cur);
+    }
+
+    out_total_lines = rows.size();
+    if (!rows.empty() && scroll >= rows.size()) scroll = rows.size() - 1;
+
     std::string out;
     out += "\x1b" "7";  // DECSC save cursor
 
     int drawn = 0;
-    for (const auto& line : lines) {
-        if (drawn >= max_lines) break;
-        // Position this line at the pane's left column on its own row —
-        // never rely on CR/LF, which would return to column 0 and let the
-        // line bleed into the results pane.
+    for (size_t r = scroll; r < rows.size() && drawn < max_lines; ++r, ++drawn) {
+        // Position at this pane row's left column — never a bare CR/LF, which
+        // would return to physical column 0 and bleed into the results pane.
         out += "\x1b[" + std::to_string(top + drawn + 1) + ";" +
                std::to_string(left + 1) + "H";
 
-        std::string clean = sanitize_preview_line(line);
-        if (max_cols > 0 && !has_string_sequence(clean) &&
-            visible_width(clean) > static_cast<size_t>(max_cols)) {
-            clean = truncate_ansi_text(clean, static_cast<size_t>(max_cols));
+        const std::string& row = rows[r];
+        // A row carrying a string sequence (image blob) is emitted verbatim
+        // and un-truncated: its bytes must reach the terminal contiguous, and
+        // its "width" isn't column-measurable. Otherwise sanitize + clip.
+        bool has_blob = false;
+        for (size_t k = 0; k + 1 < row.size(); ++k) {
+            if (row[k] == '\x1b' && is_string_introducer(row[k + 1])) {
+                has_blob = true;
+                break;
+            }
         }
-        out += clean;
-        drawn++;
+        if (has_blob) {
+            out += row;
+        } else {
+            out += clip_text_line(sanitize_preview_line(row), max_cols);
+        }
     }
 
     out += "\x1b" "8";  // DECRC restore cursor

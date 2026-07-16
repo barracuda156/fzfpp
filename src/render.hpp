@@ -95,29 +95,34 @@ private:
 // as content the chrome repaint must never clear or overwrite.
 void write_raw_passthrough(int fd, int row, int col, const std::string& raw_bytes);
 
-// Write a preview command's captured output into the pane rooted at (top,
-// left), one line per screen row, each explicitly positioned at column
-// `left` (so a line never spills into the results pane the way a bare "\r\n"
-// — which returns to column 0 — would). At most `max_lines` are drawn.
+// Write a preview command's captured output (the WHOLE multi-line blob, not
+// pre-split) into the pane rooted at (top, left). `raw_content` is the bytes
+// exactly as the preview command produced them, starting at the visible line
+// `scroll` (0-based, for preview-up/down); at most `max_lines` rows and
+// `max_cols` columns of ordinary text are drawn.
 //
-// Each line is passed through sanitize_preview_line() first: SGR color and
-// sixel/kitty-graphics sequences are preserved verbatim, but cursor-
-// positioning and screen/line-erase control sequences are stripped. External
-// preview tools (e.g. ytsurf's script, which begins with ESC[H ESC[J to clear
-// the screen) would otherwise home the cursor to (0,0) and erase the whole
-// terminal — wiping the results list — because those escapes are absolute,
-// not pane-relative.
-//
-// A sanitized line wider than `max_cols` visible columns is truncated so it
-// can't reach the terminal's right edge and auto-wrap onto the next row
-// (which would push every following preview line down and eventually scroll
-// the whole screen, destroying the layout). Lines carrying a DCS/APC/OSC
-// string sequence (sixel / kitty graphics) are left unclipped: their payload
-// isn't column-measurable and the preview tool already sizes such output to
-// the pane. The whole write is wrapped in cursor save/restore.
-void write_preview_lines(int fd, int top, int left,
-                         const std::vector<std::string>& lines,
-                         int max_lines, int max_cols);
+// This is a stream processor, not a per-line writer, because graphics
+// protocols — iTerm2 inline images (OSC 1337), kitty graphics (APC G), sixel
+// (DCS q) — embed newlines INSIDE a single escape sequence whose payload must
+// reach the terminal contiguous and unaltered. Splitting on '\n' and
+// repositioning each line (as an earlier version did) cut such a blob in half:
+// iTerm saw an OSC 1337 File= with no terminator and popped its "terminal has
+// initiated display of a file … Allow it?" dialog, then leaked the base64
+// tail as garbage. So:
+//   - Outside any string sequence: a real '\n' advances to the next pane row
+//     (absolute cursor move to `left`), never a bare CR/LF that would return
+//     to column 0 and bleed into the results list; CSI cursor-position/erase
+//     escapes are dropped (so ytsurf's leading ESC[H ESC[J can't home to (0,0)
+//     and wipe the whole terminal); SGR color is kept; text is truncated to
+//     `max_cols` so an overlong line can't auto-wrap and scroll the layout.
+//   - Inside an OSC/DCS/APC/PM/SOS sequence: every byte — including embedded
+//     newlines and the terminator — passes through verbatim, un-repositioned
+//     and un-truncated, so the image blob stays intact.
+// The whole write is wrapped in cursor save/restore.
+void write_preview_content(int fd, int top, int left,
+                           const std::string& raw_content,
+                           size_t scroll, int max_lines, int max_cols,
+                           size_t& out_total_lines);
 
 // Strip from a single preview line the ANSI/escape control sequences that
 // would move the cursor out of, or erase content beyond, the preview pane
