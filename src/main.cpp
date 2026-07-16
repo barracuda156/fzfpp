@@ -23,6 +23,34 @@ int main(int argc, char* argv[]) {
 
         bool stdin_is_tty = isatty(STDIN_FILENO);
 
+        // Non-interactive filter mode (--filter/-f) reads stdin, prints matches to
+        // stdout, and exits. It never touches /dev/tty, so it must run BEFORE the
+        // tty redirection below — otherwise `cmd | fzf -f query` in a headless
+        // context (cron, CI, subprocess with no controlling terminal) aborts with
+        // "Failed to open /dev/tty". Real fzf's --filter is the scripting path and
+        // works without a tty; this mirrors that.
+        if (opts.filter) {
+            if (stdin_is_tty) {
+                std::cerr << "fzf: no input provided (try: command | fzf)" << std::endl;
+                return 1;
+            }
+
+            reader.start_async_fd(dup(STDIN_FILENO));
+
+            fzf::Terminal terminal(opts, reader);
+            auto results = terminal.run_filter(opts.query);
+
+            if (opts.print_query) {
+                std::cout << opts.query << std::endl;
+            }
+
+            for (const auto& result : results) {
+                std::cout << result << std::endl;
+            }
+
+            return results.empty() ? 1 : 0;
+        }
+
         if (stdin_is_tty) {
             std::cerr << "fzf: no input provided (try: command | fzf)" << std::endl;
             return 1;
@@ -50,21 +78,6 @@ int main(int argc, char* argv[]) {
         close(tty_fd);
 
         reader.start_async_fd(pipe_fd);
-
-        if (opts.filter) {
-            fzf::Terminal terminal(opts, reader);
-            auto results = terminal.run_filter(opts.query);
-
-            if (opts.print_query) {
-                std::cout << opts.query << std::endl;
-            }
-
-            for (const auto& result : results) {
-                std::cout << result << std::endl;
-            }
-
-            return results.empty() ? 1 : 0;
-        }
 
         const size_t initial_items_target = 25;
         const int max_wait_ms = 500;
