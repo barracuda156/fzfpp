@@ -152,6 +152,12 @@ target_link_libraries(keyparser_test PRIVATE utf8cpp)
 enable_testing()
 add_test(NAME keyparser_test COMMAND keyparser_test)
 
+# Standalone visual smoke test for src/render.hpp — prints a fake frame to
+# the real terminal for manual eyeballing (no automated pixel comparison).
+add_executable(render_smoketest tools/render_smoketest.cpp src/render.cpp src/tty.cpp)
+target_include_directories(render_smoketest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(render_smoketest PRIVATE utf8cpp)
+
 # Install target
 install(TARGETS fzf DESTINATION bin)
 
