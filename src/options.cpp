@@ -205,7 +205,20 @@ Options parse_options(int argc, char* argv[]) {
         opts.header_first = false;
     }, "Print header after prompt line (default)");
 
-    app.add_flag("--border", opts.border, "Draw border around interface");
+    // fzf's --border takes an OPTIONAL style value: bare `--border` enables a
+    // (rounded) border, `--border=STYLE` selects a style. Declaring it as a plain
+    // flag made CLI11 try to convert the "=rounded" value to bool and abort
+    // ("Could not convert: --border = true,rounded"), which broke yt-x and viu.
+    app.add_option_function<std::vector<std::string>>(
+        "--border",
+        [&opts](const std::vector<std::string>& vals) {
+            opts.border = true;
+            if (!vals.empty() && !vals.back().empty()) {
+                opts.border_style = vals.back();
+            }
+        },
+        "Draw border around interface (optional style, e.g. rounded/sharp/none)")
+        ->expected(0, 1);
 
 
     app.add_flag("--wrap", opts.wrap, "Enable line wrapping");
