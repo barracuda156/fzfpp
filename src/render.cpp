@@ -9,6 +9,72 @@ namespace fzf {
 
 namespace {
 
+// Display-column width of a single Unicode codepoint, à la wcwidth(3). fzf++
+// consumers show CJK/Hangul titles (each 2 columns), Nerd Font glyphs in the
+// Private Use Area (2 columns in the fonts these TUIs assume), and combining
+// marks (0). Counting every codepoint as 1 column — as the old code did — made
+// a wide-char row's true width exceed the results pane, so it auto-wrapped at
+// the terminal's right edge and pushed every row below it down (the "jumping"),
+// and made per-row padding too short to erase the previous frame (stale text /
+// superimposed lists). This table covers the ranges those consumers actually
+// hit; it is deliberately compact, not a full Unicode width database.
+int codepoint_width(char32_t cp) {
+    if (cp == 0) return 0;
+    // C0/C1 controls: not printable, treat as zero so they don't shift columns.
+    if (cp < 0x20 || (cp >= 0x7f && cp < 0xa0)) return 0;
+
+    // Zero-width: combining marks, ZWJ/ZWNJ, variation selectors, BOM.
+    if ((cp >= 0x0300 && cp <= 0x036f) ||   // combining diacritical marks
+        (cp >= 0x200b && cp <= 0x200f) ||   // ZWSP..RLM
+        (cp >= 0xfe00 && cp <= 0xfe0f) ||   // variation selectors
+        cp == 0xfeff) {                     // BOM / ZWNBSP
+        return 0;
+    }
+
+    // Wide (2-column) ranges.
+    if ((cp >= 0x1100 && cp <= 0x115f) ||   // Hangul Jamo
+        (cp >= 0x2e80 && cp <= 0x303e) ||   // CJK radicals, Kangxi, symbols
+        (cp >= 0x3041 && cp <= 0x33ff) ||   // Hiragana..CJK compat
+        (cp >= 0x3400 && cp <= 0x4dbf) ||   // CJK Ext A
+        (cp >= 0x4e00 && cp <= 0x9fff) ||   // CJK Unified
+        (cp >= 0xa000 && cp <= 0xa4cf) ||   // Yi
+        (cp >= 0xac00 && cp <= 0xd7a3) ||   // Hangul syllables
+        (cp >= 0xf900 && cp <= 0xfaff) ||   // CJK compat ideographs
+        (cp >= 0xfe30 && cp <= 0xfe4f) ||   // CJK compat forms
+        (cp >= 0xff00 && cp <= 0xff60) ||   // fullwidth forms
+        (cp >= 0xffe0 && cp <= 0xffe6) ||   // fullwidth signs
+        (cp >= 0x1f300 && cp <= 0x1faff) || // emoji & pictographs
+        (cp >= 0x20000 && cp <= 0x3fffd)) { // CJK Ext B+ (SIP)
+        return 2;
+    }
+
+    // Nerd Font glyphs live in the Private Use Area; the fonts these TUIs
+    // assume render them double-width. Treat PUA as wide.
+    if ((cp >= 0xe000 && cp <= 0xf8ff) ||       // BMP PUA
+        (cp >= 0xf0000 && cp <= 0xffffd) ||     // Plane 15 PUA
+        (cp >= 0x100000 && cp <= 0x10fffd)) {   // Plane 16 PUA
+        return 2;
+    }
+
+    return 1;
+}
+
+// Display-column width of a UTF-8 string (no ANSI stripping; caller strips SGR
+// first if needed). Falls back to byte count on malformed UTF-8.
+size_t utf8_display_width(const std::string& s) {
+    size_t w = 0;
+    try {
+        auto it = s.begin();
+        while (it != s.end()) {
+            char32_t cp = utf8::next(it, s.end());
+            w += static_cast<size_t>(codepoint_width(cp));
+        }
+    } catch (...) {
+        return s.size();
+    }
+    return w;
+}
+
 const char* sgr_fg_code(Color c) {
     switch (c) {
         case Color::Black: return "30";
@@ -77,6 +143,11 @@ void FrameRenderer::draw_row(int row, int col, const Row& spans, int max_cols) {
 
     move_to(row, col);
 
+    // `written` counts DISPLAY COLUMNS, not codepoints. A CJK/Hangul title or
+    // a Nerd Font glyph is two columns wide; counting it as one (the old bug)
+    // let a row's true width exceed `budget`, so it auto-wrapped at the screen
+    // edge and shoved every row below it down, and left the padding too short
+    // to erase the previous, longer frame.
     int written = 0;
     for (const auto& span : spans) {
         if (written >= budget) {
@@ -92,21 +163,27 @@ void FrameRenderer::draw_row(int row, int col, const Row& spans, int max_cols) {
             }
         }
 
-        int available = budget - written;
-        size_t take = std::min(cps.size(), static_cast<size_t>(available));
-        if (take == 0) {
+        // Take as many codepoints as fit in the remaining column budget,
+        // measuring each by its display width. A wide char that would straddle
+        // the last remaining column is dropped (and the column left blank via
+        // padding below) rather than emitted half-off the pane.
+        std::u32string seg_cps;
+        for (char32_t cp : cps) {
+            int cw = codepoint_width(cp);
+            if (written + cw > budget) break;
+            seg_cps.push_back(cp);
+            written += cw;
+        }
+        if (seg_cps.empty()) {
             continue;
         }
 
         std::string seg_utf8;
-        utf8::utf32to8(cps.begin(), cps.begin() + static_cast<long>(take),
-                        std::back_inserter(seg_utf8));
+        utf8::utf32to8(seg_cps.begin(), seg_cps.end(), std::back_inserter(seg_utf8));
 
         append_style(span.style);
         buffer_ += seg_utf8;
         append_reset();
-
-        written += static_cast<int>(take);
     }
 
     // Pad with spaces to the end of the row's budget so a shorter frame
@@ -412,12 +489,9 @@ void write_preview_content(int fd, int top, int left,
 }
 
 size_t visible_width(const std::string& utf8_text) {
-    std::string stripped = strip_ansi_codes(utf8_text);
-    try {
-        return utf8::distance(stripped.begin(), stripped.end());
-    } catch (...) {
-        return stripped.size();
-    }
+    // Display columns, not codepoints: a CJK/Hangul char or Nerd Font glyph is
+    // two columns. Used for prompt-cursor placement and overflow/clip checks.
+    return utf8_display_width(strip_ansi_codes(utf8_text));
 }
 
 std::string truncate_ansi_text(const std::string& text, size_t max_cols) {
@@ -450,9 +524,23 @@ std::string truncate_ansi_text(const std::string& text, size_t max_cols) {
 
         size_t char_len = utf8_char_length(text[i]);
         char_len = std::min(char_len, text.size() - i);
+        // Advance the visible-column counter by the char's DISPLAY width, and
+        // stop if a wide char would exceed max_cols (don't emit a char that
+        // straddles the boundary).
+        int cw = 1;
+        try {
+            auto it = text.begin() + static_cast<long>(i);
+            char32_t cp = utf8::next(it, text.end());
+            cw = codepoint_width(cp);
+        } catch (...) {
+            cw = 1;
+        }
+        if (visible_count + static_cast<size_t>(cw) > max_cols) {
+            break;
+        }
         result.append(text, i, char_len);
         i += char_len;
-        visible_count++;
+        visible_count += static_cast<size_t>(cw);
     }
 
     if (any_sgr) {
