@@ -1477,24 +1477,25 @@ void Terminal::repaint(bool preview_dirty) {
             (void)w;
         }
 
-        // Apply scroll offset by dropping leading lines, then clip to the
-        // pane's line budget. Raw passthrough: no color re-parsing, no width
-        // clipping beyond whole-line truncation, so sixel/kitty-graphics/SGR
-        // sequences in preview output reach the terminal unmodified.
-        std::vector<std::string> lines = split_lines(preview_text);
-        preview_total_lines_ = lines.size();
+        // Apply scroll offset by dropping leading lines. Each visible line is
+        // then written positioned at the pane's own row/column and sanitized
+        // (see write_preview_lines): SGR color and sixel/kitty-graphics
+        // sequences pass through unmodified, but cursor-positioning and
+        // screen-erase escapes are stripped so an external preview script
+        // can't home the cursor to (0,0) and wipe the results list.
+        std::vector<std::string> all_lines = split_lines(preview_text);
+        preview_total_lines_ = all_lines.size();
         if (preview_total_lines_ > 0 && preview_scroll_offset_ >= preview_total_lines_) {
             preview_scroll_offset_ = preview_total_lines_ - 1;
         }
 
-        std::string visible_preview;
-        size_t shown = 0;
-        for (size_t li = preview_scroll_offset_; li < lines.size() && shown < static_cast<size_t>(preview_lines); ++li, ++shown) {
-            if (shown > 0) visible_preview += "\r\n";
-            visible_preview += lines[li];
+        std::vector<std::string> visible_lines;
+        for (size_t li = preview_scroll_offset_; li < all_lines.size(); ++li) {
+            visible_lines.push_back(all_lines[li]);
         }
 
-        write_raw_passthrough(STDOUT_FILENO, preview_top, preview_left, visible_preview);
+        write_preview_lines(STDOUT_FILENO, preview_top, preview_left,
+                            visible_lines, preview_lines, preview_cols);
     }
 }
 

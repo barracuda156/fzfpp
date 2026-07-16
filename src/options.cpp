@@ -167,6 +167,16 @@ Options parse_options(int argc, char* argv[]) {
     // flag is simply dropped, which is harmless as there is no positional arg.
     app.allow_extras();
 
+    // fzf's semantics are "last occurrence wins" for scalar options: an option
+    // set in $FZF_DEFAULT_OPTS and again on the command line (or twice on the
+    // command line) is not an error — the later value overrides. yt-x relies on
+    // this, setting --prompt in FZF_DEFAULT_OPTS and again per-invocation, and
+    // repeating --border in its default opts. CLI11 otherwise caps an option's
+    // total value count across all occurrences and aborts ("--prompt: At most 1
+    // required but received 2"). Default every option to TakeLast; the few that
+    // genuinely accumulate (--bind, --color) opt back into TakeAll below.
+    app.option_defaults()->multi_option_policy(CLI::MultiOptionPolicy::TakeLast);
+
     bool version = false;
     app.add_flag("-v,--version", version, "Show version");
 
@@ -259,7 +269,8 @@ Options parse_options(int argc, char* argv[]) {
 
     std::vector<std::string> color_specs;
     app.add_option("--color", color_specs, "Color scheme")
-        ->allow_extra_args();
+        ->allow_extra_args()
+        ->multi_option_policy(CLI::MultiOptionPolicy::TakeAll);
 
     app.add_option("--border-label", opts.border_label, "Border label text");
     app.add_option("--marker", opts.marker, "Multi-select marker");
@@ -309,7 +320,8 @@ Options parse_options(int argc, char* argv[]) {
     std::vector<std::string> bind_specs;
     app.add_option("--bind", bind_specs,
                    "Custom key bindings (key:action)")
-        ->allow_extra_args();
+        ->allow_extra_args()
+        ->multi_option_policy(CLI::MultiOptionPolicy::TakeAll);
 
     std::string expect_str;
     app.add_option("--expect", expect_str,
@@ -375,6 +387,15 @@ Options parse_options(int argc, char* argv[]) {
         }
     }
 
+    // fzf binds ctrl-c/ctrl-g/ctrl-q (and esc) to abort by default. Under raw
+    // mode ^C no longer raises SIGINT, so without an explicit binding the
+    // event loop just repaints and the app looks frozen — real consumers
+    // (ytsurf) hit this. Seed the defaults only where the user hasn't already
+    // bound the key, so an explicit `--bind ctrl-c:...` still wins. (esc is
+    // handled directly in the event loop, so it isn't seeded here.)
+    for (const char* key : {"ctrl-c", "ctrl-g", "ctrl-q"}) {
+        opts.bindings.emplace(key, "abort");
+    }
 
     if (version) {
         std::cout << "fzf++ version 0.1.1 (C++20 implementation)" << std::endl;

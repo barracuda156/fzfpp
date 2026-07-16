@@ -178,6 +178,145 @@ void write_raw_passthrough(int fd, int row, int col, const std::string& raw_byte
     write_all(fd, out);
 }
 
+std::string sanitize_preview_line(const std::string& line) {
+    std::string out;
+    out.reserve(line.size());
+
+    size_t i = 0;
+    const size_t n = line.size();
+    while (i < n) {
+        unsigned char c = static_cast<unsigned char>(line[i]);
+
+        if (c == '\x1b' && i + 1 < n) {
+            unsigned char next = static_cast<unsigned char>(line[i + 1]);
+
+            if (next == '[') {
+                // CSI: ESC [ <params/intermediates> <final 0x40-0x7E>.
+                size_t j = i + 2;
+                while (j < n) {
+                    unsigned char b = static_cast<unsigned char>(line[j]);
+                    if (b >= 0x40 && b <= 0x7E) break;  // final byte
+                    j++;
+                }
+                if (j < n) {
+                    unsigned char fin = static_cast<unsigned char>(line[j]);
+                    // Keep only SGR (color/attributes); it cannot move the
+                    // cursor or erase. Everything else — cursor positioning
+                    // (H f d G A-F), erase display/line (J K), save/restore
+                    // (s u), scroll (S T) — is dropped so it can't reach
+                    // outside the pane.
+                    if (fin == 'm') {
+                        out.append(line, i, j - i + 1);
+                    }
+                    i = j + 1;
+                    continue;
+                }
+                // Unterminated CSI: drop the rest of the line.
+                break;
+            }
+
+            if (next == ']' || next == 'P' || next == '_' ||
+                next == '^' || next == 'X') {
+                // String-terminated sequence: OSC / DCS / APC / PM / SOS.
+                // These carry sixel and kitty-graphics payloads (the whole
+                // point of the direct-terminal backend), so pass the entire
+                // sequence — including its data bytes — through verbatim, up
+                // to ST (ESC \ or 0x9c) or BEL. Data bytes are not scanned
+                // for escapes, so an 'H'/'J' inside a sixel payload is safe.
+                size_t j = i + 2;
+                while (j < n) {
+                    unsigned char b = static_cast<unsigned char>(line[j]);
+                    if (b == 0x07 || b == 0x9c) {  // BEL or 8-bit ST
+                        j++;
+                        break;
+                    }
+                    if (b == '\x1b' && j + 1 < n &&
+                        static_cast<unsigned char>(line[j + 1]) == '\\') {
+                        j += 2;  // 7-bit ST: ESC \.
+                        break;
+                    }
+                    j++;
+                }
+                out.append(line, i, j - i);
+                i = j;
+                continue;
+            }
+
+            // Standalone two-byte escapes: RIS (ESC c), index/next-line
+            // (ESC D/E/M), keypad modes, ESC H (home in some terminals), etc.
+            // None are needed inside a preview and several move the cursor or
+            // reset the terminal — drop the escape and its single trailing
+            // byte.
+            i += 2;
+            continue;
+        }
+
+        if (c == '\x1b') {
+            // Lone trailing ESC with nothing after it.
+            break;
+        }
+
+        // Bare carriage return / backspace would reset the column and let
+        // subsequent bytes overwrite the results pane; drop them. Tabs are
+        // kept (they only advance rightward within the line).
+        if (c == '\r' || c == '\b') {
+            i++;
+            continue;
+        }
+
+        out.push_back(line[i]);
+        i++;
+    }
+
+    return out;
+}
+
+namespace {
+// A line that carries a DCS/APC/OSC/PM/SOS string sequence (sixel, kitty
+// graphics, terminal queries) can't be measured or truncated by visible
+// column — its payload bytes aren't display columns and cutting mid-payload
+// would corrupt it. Detect these and pass such lines through unclipped.
+bool has_string_sequence(const std::string& s) {
+    for (size_t i = 0; i + 1 < s.size(); ++i) {
+        if (static_cast<unsigned char>(s[i]) == 0x1b) {
+            char n = s[i + 1];
+            if (n == ']' || n == 'P' || n == '_' || n == '^' || n == 'X') {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+} // namespace
+
+void write_preview_lines(int fd, int top, int left,
+                         const std::vector<std::string>& lines,
+                         int max_lines, int max_cols) {
+    std::string out;
+    out += "\x1b" "7";  // DECSC save cursor
+
+    int drawn = 0;
+    for (const auto& line : lines) {
+        if (drawn >= max_lines) break;
+        // Position this line at the pane's left column on its own row —
+        // never rely on CR/LF, which would return to column 0 and let the
+        // line bleed into the results pane.
+        out += "\x1b[" + std::to_string(top + drawn + 1) + ";" +
+               std::to_string(left + 1) + "H";
+
+        std::string clean = sanitize_preview_line(line);
+        if (max_cols > 0 && !has_string_sequence(clean) &&
+            visible_width(clean) > static_cast<size_t>(max_cols)) {
+            clean = truncate_ansi_text(clean, static_cast<size_t>(max_cols));
+        }
+        out += clean;
+        drawn++;
+    }
+
+    out += "\x1b" "8";  // DECRC restore cursor
+    write_all(fd, out);
+}
+
 size_t visible_width(const std::string& utf8_text) {
     std::string stripped = strip_ansi_codes(utf8_text);
     try {

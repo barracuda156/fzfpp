@@ -95,6 +95,37 @@ private:
 // as content the chrome repaint must never clear or overwrite.
 void write_raw_passthrough(int fd, int row, int col, const std::string& raw_bytes);
 
+// Write a preview command's captured output into the pane rooted at (top,
+// left), one line per screen row, each explicitly positioned at column
+// `left` (so a line never spills into the results pane the way a bare "\r\n"
+// — which returns to column 0 — would). At most `max_lines` are drawn.
+//
+// Each line is passed through sanitize_preview_line() first: SGR color and
+// sixel/kitty-graphics sequences are preserved verbatim, but cursor-
+// positioning and screen/line-erase control sequences are stripped. External
+// preview tools (e.g. ytsurf's script, which begins with ESC[H ESC[J to clear
+// the screen) would otherwise home the cursor to (0,0) and erase the whole
+// terminal — wiping the results list — because those escapes are absolute,
+// not pane-relative.
+//
+// A sanitized line wider than `max_cols` visible columns is truncated so it
+// can't reach the terminal's right edge and auto-wrap onto the next row
+// (which would push every following preview line down and eventually scroll
+// the whole screen, destroying the layout). Lines carrying a DCS/APC/OSC
+// string sequence (sixel / kitty graphics) are left unclipped: their payload
+// isn't column-measurable and the preview tool already sizes such output to
+// the pane. The whole write is wrapped in cursor save/restore.
+void write_preview_lines(int fd, int top, int left,
+                         const std::vector<std::string>& lines,
+                         int max_lines, int max_cols);
+
+// Strip from a single preview line the ANSI/escape control sequences that
+// would move the cursor out of, or erase content beyond, the preview pane
+// (CSI cursor-position/erase, standalone RIS/index escapes, bare CR/BS),
+// while preserving SGR color runs and passing DCS/APC/OSC/PM/SOS string
+// sequences (sixel, kitty graphics) through untouched. Exposed for testing.
+std::string sanitize_preview_line(const std::string& line);
+
 // Visible column width of a UTF-8 string with ANSI SGR codes stripped for
 // measurement purposes (1 column per codepoint — no wide-char/grapheme
 // clustering, matching this codebase's existing behavior). Used to truncate
