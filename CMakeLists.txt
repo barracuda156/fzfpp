@@ -138,6 +138,11 @@ elseif(UNIX)
     target_link_libraries(fzf PRIVATE rt)
 endif()
 
+# Standalone smoke-test binary for src/tty.hpp (raw mode, resize, self-pipe).
+# Not installed, not part of the fzf target's dependency graph.
+add_executable(tty_smoketest tools/tty_smoketest.cpp src/tty.cpp)
+target_include_directories(tty_smoketest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
 # Install target
 install(TARGETS fzf DESTINATION bin)
 
