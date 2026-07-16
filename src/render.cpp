@@ -275,21 +275,35 @@ namespace {
 
 // Length of a string-terminated escape sequence (OSC/DCS/APC/PM/SOS) starting
 // at `content[start]` (which must be ESC). Returns the count of bytes through
-// the terminator (BEL, 8-bit ST 0x9c, or 7-bit ST "ESC \"); if unterminated,
-// returns the remaining length. The payload may legitimately contain newlines
-// (iTerm OSC 1337 images, kitty APC, sixel) — those are data, not line breaks.
-size_t string_seq_len(const std::string& content, size_t start) {
+// the terminator (BEL, 8-bit ST 0x9c, or 7-bit ST "ESC \"). Sets `*terminated`
+// to whether a terminator was actually seen; if not (the sequence runs to the
+// end of `content`), returns the remaining length and `*terminated = false`.
+// The payload may legitimately contain newlines (iTerm OSC 1337 images, kitty
+// APC, sixel) — those are data, not line breaks.
+//
+// The terminated flag matters because the preview is captured in streaming
+// chunks: a partial read can end in the MIDDLE of a multi-kilobyte image blob.
+// Emitting that partial (unterminated) sequence to the real terminal is what
+// makes iTerm2 pop its "Allow Terminal-Initiated Display?" dialog and makes
+// sixel terminals (mlterm) spew the raw payload as garbage. The caller holds
+// an unterminated trailing blob back until a later repaint carries its ST/BEL.
+size_t string_seq_len(const std::string& content, size_t start, bool* terminated) {
     size_t j = start + 2;  // skip ESC + introducer
     const size_t n = content.size();
     while (j < n) {
         unsigned char b = static_cast<unsigned char>(content[j]);
-        if (b == 0x07 || b == 0x9c) return j - start + 1;  // BEL / 8-bit ST
+        if (b == 0x07 || b == 0x9c) {  // BEL / 8-bit ST
+            if (terminated) *terminated = true;
+            return j - start + 1;
+        }
         if (b == '\x1b' && j + 1 < n &&
             static_cast<unsigned char>(content[j + 1]) == '\\') {
+            if (terminated) *terminated = true;
             return j - start + 2;  // 7-bit ST: ESC \.
         }
         j++;
     }
+    if (terminated) *terminated = false;
     return n - start;  // unterminated
 }
 
@@ -326,10 +340,29 @@ void write_preview_content(int fd, int top, int left,
             char c = raw_content[i];
             if (c == '\x1b' && i + 1 < n &&
                 is_string_introducer(raw_content[i + 1])) {
-                size_t len = string_seq_len(raw_content, i);
+                bool terminated = true;
+                size_t len = string_seq_len(raw_content, i, &terminated);
+                if (!terminated) {
+                    // A string sequence with no terminator can only be a blob
+                    // truncated by a mid-stream chunk read (see string_seq_len).
+                    // Painting it now would send an incomplete OSC/DCS/APC to
+                    // the terminal — iTerm2's "Allow Display?" dialog, sixel
+                    // garbage in mlterm. Drop everything from here to end of
+                    // buffer; the next repaint (with more bytes, or the final
+                    // complete capture) will carry the terminator and paint it
+                    // whole. Anything already in `cur` stays as its own row.
+                    break;
+                }
                 cur.append(raw_content, i, len);  // whole blob, newlines and all
                 i += len;
                 continue;
+            }
+            if (c == '\x1b' && i + 1 == n) {
+                // Lone ESC as the last byte: a chunk boundary landed mid-escape
+                // (before we even know the introducer). Drop it so it can't
+                // swallow the first byte of the next repaint; the next capture
+                // carries the full sequence.
+                break;
             }
             if (c == '\n') {
                 rows.push_back(cur);
