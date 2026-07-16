@@ -156,6 +156,17 @@ private:
     size_t preview_scroll_offset_;  // Current scroll position in preview (line number at top)
     size_t preview_total_lines_;    // Total lines in current preview content
 
+    // Guard against redundant preview repaints. The streaming preview worker
+    // wakes a repaint after EVERY chunk it reads; without this, a preview that
+    // contains a graphics blob (sixel / iTerm2 image / kitty) would re-emit the
+    // whole blob to the terminal on every chunk and on every unrelated frame,
+    // flooding a sixel terminal (mlterm) with repeated image data that reads as
+    // streaming garbage. We only re-write the preview pane when the content or
+    // scroll position actually changed since the last paint.
+    std::string last_painted_preview_;
+    size_t last_painted_scroll_ = SIZE_MAX;
+    bool last_painted_valid_ = false;
+
     // Async preview rendering
     std::thread preview_thread_;
     std::atomic<bool> preview_pending_;

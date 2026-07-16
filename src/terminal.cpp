@@ -563,6 +563,9 @@ bool Terminal::execute_bind_action(const std::string& action) {
 
     if (action == "toggle-preview") {
         preview_visible_ = !preview_visible_;
+        // The pane is cleared/overwritten while hidden, so the cached "already
+        // painted this" state is stale on re-show — force a full repaint.
+        last_painted_valid_ = false;
         return true;
     }
 
@@ -1066,8 +1069,14 @@ void Terminal::preview_worker() {
                                         size_t bytes_read;
 
                                         // Stream output, but check for priority requests frequently
-                                        while (!preview_pending_.load() &&
-                                               (bytes_read = fread(buffer.data(), 1, buffer.size(), pipe)) > 0) {
+                                        bool interrupted = false;
+                                        while (true) {
+                                            if (preview_pending_.load()) {
+                                                interrupted = true;
+                                                break;
+                                            }
+                                            bytes_read = fread(buffer.data(), 1, buffer.size(), pipe);
+                                            if (bytes_read == 0) break;  // clean EOF
                                             accumulated_output.append(buffer.data(), bytes_read);
                                             // Small yield to allow priority requests to interrupt
                                             std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -1075,8 +1084,16 @@ void Terminal::preview_worker() {
 
                                         pclose(pipe);
 
-                                        // Cache result if we weren't interrupted by priority request
-                                        if (!preview_pending_.load() && !accumulated_output.empty()) {
+                                        // Only cache a COMPLETE capture. If we broke out because a
+                                        // priority request arrived, accumulated_output is truncated —
+                                        // possibly mid-image-sequence (sixel/iTerm2/kitty). Caching that
+                                        // partial blob means the next scroll to this item serves a
+                                        // truncated escape sequence to the terminal, which renders as
+                                        // garbage. The old code re-checked preview_pending_ here, but
+                                        // that flag can flip back to false once the foreground handler
+                                        // consumes it, letting a truncated blob through. Track the exit
+                                        // reason explicitly instead.
+                                        if (!interrupted && !accumulated_output.empty()) {
                                             cache_preview(item_to_prefetch, accumulated_output);
                                         }
                                     }
@@ -1468,30 +1485,52 @@ void Terminal::repaint(bool preview_dirty) {
             preview_text = preview_content_;
         }
 
-        // Clear the preview region first so a smaller/shorter new preview
-        // doesn't leave stale content from a larger previous one.
-        {
-            FrameRenderer clear_frame(term_rows, term_cols);
-            clear_frame.clear_region(preview_top, preview_left, preview_lines, preview_cols);
-            ssize_t w = write(STDOUT_FILENO, clear_frame.bytes().data(), clear_frame.bytes().size());
-            (void)w;
-        }
+        // Skip the write entirely when neither the content nor the scroll
+        // position changed since we last painted this pane. The streaming
+        // preview worker wakes a repaint after every chunk it reads, and many
+        // unrelated events (keystrokes, item-count updates) also set
+        // preview_dirty; without this guard a preview containing a graphics
+        // blob (sixel / iTerm2 image / kitty) would re-emit the ENTIRE blob to
+        // the terminal on every one of those frames, flooding a sixel terminal
+        // (mlterm) with repeated image data that reads as streaming garbage,
+        // and making iTerm2 re-decode the image dozens of times a second. The
+        // main chrome frame never draws into the preview columns (draw_row pads
+        // only to its own budget), so leaving the pane untouched is safe.
+        // A resize clears last_painted_valid_ (see the SIGWINCH branch) so the
+        // pane is always fully repainted when geometry changes.
+        if (last_painted_valid_ && preview_text == last_painted_preview_ &&
+            preview_scroll_offset_ == last_painted_scroll_) {
+            // Nothing to do — recompute the line count for scroll bookkeeping
+            // without touching the terminal.
+        } else {
+            // Clear the preview region first so a smaller/shorter new preview
+            // doesn't leave stale content from a larger previous one.
+            {
+                FrameRenderer clear_frame(term_rows, term_cols);
+                clear_frame.clear_region(preview_top, preview_left, preview_lines, preview_cols);
+                ssize_t w = write(STDOUT_FILENO, clear_frame.bytes().data(), clear_frame.bytes().size());
+                (void)w;
+            }
 
-        // Stream the whole preview blob into the pane (see
-        // write_preview_content): text lines are positioned per-row, sanitized
-        // and clipped, but a graphics blob — iTerm OSC 1337 image, kitty APC,
-        // sixel — whose payload spans multiple newlines is passed through
-        // contiguous and unaltered, so it never gets cut mid-sequence (which
-        // made iTerm pop its "terminal has initiated display of a file" dialog
-        // and leak the base64 tail). The leading ESC[H ESC[J from scripts like
-        // ytsurf's is still stripped so it can't wipe the results list.
-        size_t total = 0;
-        write_preview_content(STDOUT_FILENO, preview_top, preview_left,
-                              preview_text, preview_scroll_offset_,
-                              preview_lines, preview_cols, total);
-        preview_total_lines_ = total;
-        if (preview_total_lines_ > 0 && preview_scroll_offset_ >= preview_total_lines_) {
-            preview_scroll_offset_ = preview_total_lines_ - 1;
+            // Stream the whole preview blob into the pane (see
+            // write_preview_content): text lines are positioned per-row,
+            // sanitized and clipped, but a graphics blob — iTerm OSC 1337
+            // image, kitty APC, sixel — is passed through contiguous and
+            // unaltered, and an in-flight UNTERMINATED blob (a chunk read cut
+            // mid-image) is held back so an incomplete escape never reaches the
+            // terminal. The leading ESC[H ESC[J from scripts like ytsurf's is
+            // still stripped so it can't wipe the results list.
+            size_t total = 0;
+            write_preview_content(STDOUT_FILENO, preview_top, preview_left,
+                                  preview_text, preview_scroll_offset_,
+                                  preview_lines, preview_cols, total);
+            preview_total_lines_ = total;
+            if (preview_total_lines_ > 0 && preview_scroll_offset_ >= preview_total_lines_) {
+                preview_scroll_offset_ = preview_total_lines_ - 1;
+            }
+            last_painted_preview_ = preview_text;
+            last_painted_scroll_ = preview_scroll_offset_;
+            last_painted_valid_ = true;
         }
     }
 }
@@ -1752,6 +1791,7 @@ std::vector<std::string> Terminal::run() {
             recompute_visible_lines();
             needs_repaint = true;
             preview_dirty = true;  // stale image geometry; force re-render
+            last_painted_valid_ = false;  // geometry changed; force full repaint
             if (!opts_.preview_command.empty() && !current_results_.empty()) {
                 last_preview_cursor_ = SIZE_MAX;  // force preview re-invocation
             }
