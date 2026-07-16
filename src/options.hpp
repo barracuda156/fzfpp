@@ -48,6 +48,11 @@ struct Options {
     // Initial query
     std::string query;
 
+    // Disabled mode: the query box is shown and typing updates {q} and fires
+    // the change: event, but the query does NOT filter the list. Used with
+    // reload(...) so an external command does the filtering (viu's pattern).
+    bool disabled = false;
+
     // Filter mode (non-interactive)
     bool filter = false;
 

@@ -66,8 +66,21 @@ private:
     // Bind action execution
     bool execute_bind_action(const std::string& action);
 
+    // Given an action like "reload(cmd)" and a prefix "reload(", return the
+    // argument inside the balanced parentheses and set out_end to the index of
+    // the matching ')'. Returns false if the parens are unbalanced. Handles
+    // nested parens so a command may itself contain '(' and ')'.
+    static bool extract_paren_arg(const std::string& action, size_t open_paren_pos,
+                                  std::string& out_arg, size_t& out_end);
+
     // Expect key matching
     bool check_expect_key(const ftxui::Event& event, std::string& matched_key);
+
+    // Convert an arbitrary key event to fzf's bind key-name syntax (e.g.
+    // "ctrl-r", "ctrl-/", "ctrl-space", "alt-a"), for looking up --bind targets
+    // that aren't one of the specially-handled navigation keys. Returns empty
+    // string if the event doesn't map to a name fzf recognizes as a bind key.
+    static std::string event_to_bind_key(const ftxui::Event& event);
 
     // Preview support
     std::string substitute_placeholders(const std::string& cmd, size_t index);

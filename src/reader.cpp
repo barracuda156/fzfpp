@@ -138,6 +138,58 @@ void Reader::start_async_fd(int fd) {
     });
 }
 
+void Reader::load_from_command(const std::string& command) {
+    // Cancel any in-flight streaming read before swapping the item set, so the
+    // background thread can't append stale items after we clear.
+    if (read_thread_.joinable()) {
+        read_thread_.join();
+    }
+
+    // Reset state for the fresh item set.
+    {
+        std::lock_guard<std::mutex> lock(items_mutex_);
+        items_.clear();
+        item_count_.store(0, std::memory_order_relaxed);
+    }
+    read_finished_.store(false, std::memory_order_release);
+
+    FILE* fp = popen(command.c_str(), "r");
+    if (!fp) {
+        read_finished_.store(true, std::memory_order_release);
+        return;
+    }
+
+    if (read_zero_) {
+        std::string line;
+        int ch;
+        while ((ch = fgetc(fp)) != EOF) {
+            if (ch == '\0') {
+                add_item(std::move(line));
+                line.clear();
+            } else {
+                line += static_cast<char>(ch);
+            }
+        }
+        if (!line.empty()) {
+            add_item(std::move(line));
+        }
+    } else {
+        char* line = nullptr;
+        size_t len = 0;
+        ssize_t nread;
+        while ((nread = getline(&line, &len, fp)) != -1) {
+            if (nread > 0 && line[nread - 1] == '\n') {
+                line[nread - 1] = '\0';
+            }
+            add_item(std::string(line));
+        }
+        free(line);
+    }
+
+    pclose(fp);
+    read_finished_.store(true, std::memory_order_release);
+}
+
 void Reader::wait_for_finish() {
     if (read_thread_.joinable()) {
         read_thread_.join();

@@ -58,8 +58,9 @@ void Terminal::update_results(const std::string& query) {
 
     std::vector<MatchResult> new_results;
 
-    if (query.empty()) {
-        // No query: show all items
+    if (query.empty() || opts_.disabled) {
+        // No query (or --disabled: the query never filters, an external
+        // reload command does): show all items in their current order.
         for (const auto& item : items) {
             new_results.emplace_back(item, 0);
         }
@@ -344,6 +345,62 @@ bool Terminal::check_expect_key(const ftxui::Event& event, std::string& matched_
     return false;
 }
 
+std::string Terminal::event_to_bind_key(const ftxui::Event& event) {
+    // Control-character keys (ctrl-a..z, ctrl-space, ctrl-/, etc.) arrive as a
+    // single C0 byte via Event::Special, so type_ is Type::Unknown and
+    // is_character() is false — check the raw input byte directly instead of
+    // gating on is_character().
+    std::string input = event.input();
+    if (input.length() != 1) {
+        return "";
+    }
+    unsigned char c = static_cast<unsigned char>(input[0]);
+
+    // Ctrl+space and ctrl-` both send NUL on most terminals; fzf calls this ctrl-space.
+    if (c == 0x00) {
+        return "ctrl-space";
+    }
+    // Ctrl-a .. ctrl-z, skipping the ones FTXUI turns into named events before
+    // is_character() would even see them (ctrl-i=Tab, ctrl-m=Return, ctrl-h=Backspace).
+    if (c >= 0x01 && c <= 0x1a) {
+        char letter = static_cast<char>('a' + (c - 0x01));
+        return std::string("ctrl-") + letter;
+    }
+    // Ctrl-/ (and ctrl-_) conventionally send 0x1f.
+    if (c == 0x1f) {
+        return "ctrl-/";
+    }
+    // Ctrl-\  sends 0x1c.
+    if (c == 0x1c) {
+        return "ctrl-\\";
+    }
+    // Ctrl-] sends 0x1d.
+    if (c == 0x1d) {
+        return "ctrl-]";
+    }
+    return "";
+}
+
+bool Terminal::extract_paren_arg(const std::string& action, size_t open_paren_pos,
+                                 std::string& out_arg, size_t& out_end) {
+    if (open_paren_pos >= action.length() || action[open_paren_pos] != '(') {
+        return false;
+    }
+    int depth = 0;
+    for (size_t i = open_paren_pos; i < action.length(); ++i) {
+        if (action[i] == '(') {
+            depth++;
+        } else if (action[i] == ')') {
+            if (--depth == 0) {
+                out_arg = action.substr(open_paren_pos + 1, i - open_paren_pos - 1);
+                out_end = i;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 bool Terminal::execute_bind_action(const std::string& action) {
     if (action.find("execute(") == 0) {
         // Find matching closing parenthesis by counting nesting level
@@ -568,8 +625,41 @@ bool Terminal::execute_bind_action(const std::string& action) {
         return true;  // Stub: process replacement not implemented
     }
 
-    if (action.find("reload(") == 0) {
-        return true;  // Stub: dynamic reload not implemented
+    if (action.find("reload(") == 0 || action.find("reload-sync(") == 0) {
+        // reload(cmd): run cmd and replace the item set with its output.
+        // reload-sync is treated identically here (we always reload synchronously).
+        size_t open = action.find('(');
+        std::string cmd;
+        size_t end;
+        if (!extract_paren_arg(action, open, cmd, end)) {
+            return false;
+        }
+
+        size_t cursor_idx;
+        {
+            std::lock_guard<std::mutex> lock(results_mutex_);
+            cursor_idx = cursor_pos_;
+        }
+        std::string final_cmd = substitute_placeholders(cmd, cursor_idx);
+        if (!opts_.with_shell.empty()) {
+            final_cmd = opts_.with_shell + " '" + final_cmd + "'";
+        }
+
+        reader_.load_from_command(final_cmd);
+
+        // Reset cursor/scroll to the top for the fresh item set, then re-filter.
+        {
+            std::lock_guard<std::mutex> lock(results_mutex_);
+            cursor_pos_ = 0;
+            scroll_offset_ = 0;
+        }
+        update_results(current_query_);
+
+        // Honor a composite action chained after reload(...)+...
+        if (end + 1 < action.length() && action[end + 1] == '+') {
+            execute_bind_action(action.substr(end + 2));
+        }
+        return true;
     }
 
     if (action.find("change-preview(") == 0) {
@@ -1076,6 +1166,15 @@ std::vector<std::string> Terminal::run() {
     current_query_ = opts_.query;
     update_results(current_query_);
 
+    // Fire the start: event binding once (e.g. start:reload(...)), letting an
+    // external command populate the initial list before the loop begins.
+    {
+        auto start_it = opts_.bindings.find("start");
+        if (start_it != opts_.bindings.end()) {
+            execute_bind_action(start_it->second);
+        }
+    }
+
     // Start preview worker thread if preview is enabled
     if (!opts_.preview_command.empty()) {
         preview_thread_ = std::thread(&Terminal::preview_worker, this);
@@ -1274,6 +1373,22 @@ std::vector<std::string> Terminal::run() {
             return handle_mouse_event(event);
         }
 
+        // Custom bindings on ctrl/alt-modified keys (ctrl-r, ctrl-/, ctrl-space,
+        // etc.) that aren't one of the specially-handled navigation keys above.
+        // These arrive as "character" events carrying a control byte, so they
+        // must be checked before the plain is_character() fallthrough below
+        // would hand them to Input as literal query text.
+        {
+            std::string bind_key = event_to_bind_key(event);
+            if (!bind_key.empty()) {
+                auto bind_it = opts_.bindings.find(bind_key);
+                if (bind_it != opts_.bindings.end()) {
+                    execute_bind_action(bind_it->second);
+                    return true;
+                }
+            }
+        }
+
         if (event.is_character()) {
             // Character input - will trigger search update
             last_content_different = true;
@@ -1307,6 +1422,14 @@ std::vector<std::string> Terminal::run() {
             current_query_ = input_content;
             update_results(current_query_);
             last_content_different = false;
+
+            // Fire the change: event binding (e.g. change:reload(...)), which lets
+            // an external command rebuild the list from the new query. Its action
+            // runs its own update_results, so this happens after the local refilter.
+            auto change_it = opts_.bindings.find("change");
+            if (change_it != opts_.bindings.end()) {
+                execute_bind_action(change_it->second);
+            }
         }
 
         // Get visible results

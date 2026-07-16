@@ -304,6 +304,9 @@ Options parse_options(int argc, char* argv[]) {
     app.add_option("--preview-window", opts.preview_window,
                    "Preview window options");
 
+    app.add_flag("--disabled", opts.disabled,
+                 "Do not filter by the query; only track it for {q}/change: events");
+
     try {
         app.parse(new_argc, new_argv.data());
     } catch (const CLI::ParseError &e) {
@@ -318,13 +321,34 @@ Options parse_options(int argc, char* argv[]) {
         opts.accept_nth = parse_nth_spec(accept_nth_str);
     }
 
-    // Parse --bind specifications
+    // Parse --bind specifications. A single --bind argument may itself hold
+    // multiple comma-separated key:action pairs (e.g. yt-x's and viu's
+    // "ctrl-/:toggle-preview,ctrl-space:toggle-wrap+toggle-preview-wrap"), so
+    // split on top-level commas first. Commas inside an action's parenthesized
+    // argument (e.g. execute(echo a,b)) must not be split on, so track paren
+    // depth while scanning.
     for (const auto& spec : bind_specs) {
-        size_t colon = spec.find(':');
-        if (colon != std::string::npos) {
-            std::string key = spec.substr(0, colon);
-            std::string action = spec.substr(colon + 1);
-            opts.bindings[key] = action;
+        size_t start = 0;
+        int depth = 0;
+        for (size_t i = 0; i <= spec.size(); ++i) {
+            bool at_end = (i == spec.size());
+            char c = at_end ? '\0' : spec[i];
+            if (c == '(') depth++;
+            else if (c == ')') { if (depth > 0) depth--; }
+
+            if ((c == ',' && depth == 0) || at_end) {
+                std::string pair = spec.substr(start, i - start);
+                start = i + 1;
+
+                size_t colon = pair.find(':');
+                if (colon != std::string::npos) {
+                    std::string key = pair.substr(0, colon);
+                    std::string action = pair.substr(colon + 1);
+                    if (!key.empty()) {
+                        opts.bindings[key] = action;
+                    }
+                }
+            }
         }
     }
 

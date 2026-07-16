@@ -60,6 +60,13 @@ public:
     // Start async reading from a specific file descriptor
     void start_async_fd(int fd);
 
+    // Replace the entire item set with the output of a shell command (used by
+    // the reload(...) bind action). Runs synchronously: joins any in-flight read
+    // thread, clears the current items, then repopulates from the command's
+    // stdout. Item indices are reassigned from zero. Honors the read-zero and
+    // delimiter settings already configured on this reader.
+    void load_from_command(const std::string& command);
+
     // Wait for reading to finish
     void wait_for_finish();
 
