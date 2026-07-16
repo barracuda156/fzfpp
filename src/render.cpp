@@ -300,21 +300,41 @@ std::string sanitize_preview_line(const std::string& line) {
                 // sequence — including its data bytes — through verbatim, up
                 // to ST (ESC \ or 0x9c) or BEL. Data bytes are not scanned
                 // for escapes, so an 'H'/'J' inside a sixel payload is safe.
-                size_t j = i + 2;
+                size_t body_start = i + 2;
+                size_t j = body_start;
+                size_t term_start = n;  // index of the terminator (ST/BEL)
                 while (j < n) {
                     unsigned char b = static_cast<unsigned char>(line[j]);
                     if (b == 0x07 || b == 0x9c) {  // BEL or 8-bit ST
+                        term_start = j;
                         j++;
                         break;
                     }
                     if (b == '\x1b' && j + 1 < n &&
                         static_cast<unsigned char>(line[j + 1]) == '\\') {
+                        term_start = j;
                         j += 2;  // 7-bit ST: ESC \.
                         break;
                     }
                     j++;
                 }
-                out.append(line, i, j - i);
+
+                // DROP terminal-QUERY OSCs — a preview tool (chafa) probes the
+                // terminal for its background/foreground color (ESC]10;? /
+                // ESC]11;?) and palette (ESC]4;N;?) to pick an output format.
+                // With chafa's stdout captured by our popen pipe, those probes
+                // land in the preview text; forwarding them makes the terminal
+                // send REPLIES onto fzf's stdin, corrupting the query/keys. A
+                // query is an OSC whose body ends in '?' right before the
+                // terminator. Image OSCs (ESC]1337;File=…) never do, so they
+                // still pass through. DCS/APC/PM/SOS (sixel, kitty) are not
+                // color queries and pass through unchanged.
+                bool is_osc = (next == ']');
+                bool is_query = is_osc && term_start > body_start &&
+                                static_cast<unsigned char>(line[term_start - 1]) == '?';
+                if (!is_query) {
+                    out.append(line, i, j - i);
+                }
                 i = j;
                 continue;
             }
@@ -467,9 +487,16 @@ void write_preview_content(int fd, int top, int left,
                std::to_string(left + 1) + "H";
 
         const std::string& row = rows[r];
-        // A row carrying a string sequence (image blob) is emitted verbatim
-        // and un-truncated: its bytes must reach the terminal contiguous, and
-        // its "width" isn't column-measurable. Otherwise sanitize + clip.
+        // Every row goes through sanitize_preview_line: it passes real image
+        // blobs (sixel DCS, kitty APC, iTerm2 OSC 1337) through verbatim so the
+        // raster reaches the terminal intact, but strips the junk a preview
+        // tool interleaves around them — CSI cursor-moves/erases, and OSC
+        // COLOR-QUERY probes (ESC]10;? / ESC]11;?) that chafa emits to detect
+        // the terminal. Forwarding those probes made the terminal reply onto
+        // fzf's stdin, corrupting the query/keys and the display (the ytsurf
+        // sixel garbage). Only a blob-free row is column-clipped; a row that
+        // carries an image blob isn't (its width isn't column-measurable and
+        // clipping could cut the raster).
         bool has_blob = false;
         for (size_t k = 0; k + 1 < row.size(); ++k) {
             if (row[k] == '\x1b' && is_string_introducer(row[k + 1])) {
@@ -477,11 +504,8 @@ void write_preview_content(int fd, int top, int left,
                 break;
             }
         }
-        if (has_blob) {
-            out += row;
-        } else {
-            out += clip_text_line(sanitize_preview_line(row), max_cols);
-        }
+        std::string clean = sanitize_preview_line(row);
+        out += has_blob ? clean : clip_text_line(clean, max_cols);
     }
 
     out += "\x1b" "8";  // DECRC restore cursor
