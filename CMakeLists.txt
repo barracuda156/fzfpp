@@ -143,6 +143,15 @@ endif()
 add_executable(tty_smoketest tools/tty_smoketest.cpp src/tty.cpp)
 target_include_directories(tty_smoketest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
+# Standalone unit tests for src/keyparser.cpp — no pty/tty needed, just feeds
+# byte strings and asserts on the decoded KeyEvents.
+add_executable(keyparser_test tools/keyparser_test.cpp src/keyparser.cpp)
+target_include_directories(keyparser_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(keyparser_test PRIVATE utf8cpp)
+
+enable_testing()
+add_test(NAME keyparser_test COMMAND keyparser_test)
+
 # Install target
 install(TARGETS fzf DESTINATION bin)
 
