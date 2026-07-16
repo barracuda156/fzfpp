@@ -8,6 +8,7 @@
 #include <mutex>
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 
 namespace fzf {
 
@@ -15,6 +16,16 @@ namespace fzf {
 class Reader {
 public:
     Reader() : read_finished_(false), item_count_(0), read_zero_(false) {}
+
+    // Set a callback invoked (from whichever thread is reading) every time
+    // add_item() appends a new item. Used to wake a poll()-driven main loop
+    // via a self-pipe instead of the caller having to poll item_count() on a
+    // timer. The callback must be safe to call from a background thread and
+    // should be cheap (e.g. a single write() to a pipe) — it may be called
+    // once per item during a fast bulk read.
+    void set_wake_callback(std::function<void()> callback) {
+        wake_callback_ = std::move(callback);
+    }
 
     ~Reader() {
         if (read_thread_.joinable()) {
@@ -80,6 +91,7 @@ private:
     std::thread read_thread_;
     std::string delimiter_;
     bool read_zero_;  // Read null-delimited input
+    std::function<void()> wake_callback_;
 };
 
 } // namespace fzf

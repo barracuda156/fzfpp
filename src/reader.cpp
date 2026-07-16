@@ -27,6 +27,10 @@ void Reader::add_item(std::string line) {
         items_.push_back(item);
         item_count_.fetch_add(1, std::memory_order_relaxed);
     }
+
+    if (wake_callback_) {
+        wake_callback_();
+    }
 }
 
 void Reader::read_from_stdin() {

@@ -4,6 +4,7 @@
 #include "matcher.hpp"
 #include "reader.hpp"
 #include "options.hpp"
+#include "keyevent.hpp"
 #include <string>
 #include <vector>
 #include <memory>
@@ -14,10 +15,6 @@
 #include <unordered_map>
 #include <list>
 #include <chrono>
-
-namespace ftxui {
-    class Event;
-}
 
 namespace fzf {
 
@@ -51,7 +48,7 @@ private:
     void move_cursor_page_down();
 
     // Mouse handling
-    bool handle_mouse_event(ftxui::Event event);
+    bool handle_mouse_event(const KeyEvent& event);
 
     // Selection
     void toggle_selection();
@@ -74,13 +71,13 @@ private:
                                   std::string& out_arg, size_t& out_end);
 
     // Expect key matching
-    bool check_expect_key(const ftxui::Event& event, std::string& matched_key);
+    bool check_expect_key(const KeyEvent& event, std::string& matched_key);
 
     // Convert an arbitrary key event to fzf's bind key-name syntax (e.g.
     // "ctrl-r", "ctrl-/", "ctrl-space", "alt-a"), for looking up --bind targets
     // that aren't one of the specially-handled navigation keys. Returns empty
     // string if the event doesn't map to a name fzf recognizes as a bind key.
-    static std::string event_to_bind_key(const ftxui::Event& event);
+    static std::string event_to_bind_key(const KeyEvent& event);
 
     // Preview support
     std::string substitute_placeholders(const std::string& cmd, size_t index);
@@ -95,12 +92,40 @@ private:
     void calculate_preview_position(int& top, int& left, int& lines, int& cols) const;
     void set_preview_env_vars() const;  // Set FZF_PREVIEW_* environment variables
 
+    // --- Rendering (direct-terminal backend, replaces FTXUI) ---
+
+    // Recompute visible_lines_ from the current terminal size / opts_.height.
+    void recompute_visible_lines();
+
+    // Redraw the chrome (info/header/results/prompt/border) unconditionally,
+    // and the preview pane only if preview_dirty is true. Chrome and preview
+    // are written as two separate buffered writes so a partial-write
+    // interruption can't leave the cursor in the wrong saved slot for the
+    // other one — see render.hpp's write_raw_passthrough.
+    void repaint(bool preview_dirty);
+
+    // Query-buffer editing (replaces FTXUI's Input component). Operates on
+    // current_query_ and query_cursor_ (a codepoint index, not a byte index).
+    void query_insert_codepoints(const std::u32string& codepoints);
+    void query_backspace();
+    void query_delete();
+    void query_move_left();
+    void query_move_right();
+
+    // Dispatch one decoded KeyEvent: expect-key check, bind lookup, default
+    // navigation, or query-buffer editing. Returns true if the main loop
+    // should keep running, false if it should exit (accept/abort/expect-key
+    // match/double-click).
+    bool dispatch_event(const KeyEvent& event);
+
     const Options& opts_;
     Reader& reader_;
     Matcher matcher_;
 
     // UI state
     std::string current_query_;
+    std::u32string query_codepoints_;  // current_query_ decoded, for cursor math
+    size_t query_cursor_;              // codepoint index into query_codepoints_
     std::string current_prompt_;  // Live prompt; starts at opts_.prompt, changed by change-prompt
     std::string current_header_;  // Live header; starts at opts_.header, changed by transform-header
     std::vector<MatchResult> current_results_;
@@ -152,6 +177,12 @@ private:
     std::string get_cached_preview(const std::string& item_text);  // Check cache
     void cache_preview(const std::string& item_text, const std::string& content);  // Store in cache
     void populate_prefetch_queue();  // Populate prefetch queue from current results
+
+    // --- tty/poll-loop plumbing (replaces FTXUI ScreenInteractive) ---
+    int wake_read_fd_;
+    int wake_write_fd_;
+    int winch_read_fd_;
+    int winch_write_fd_;
 };
 
 } // namespace fzf

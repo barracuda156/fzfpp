@@ -1,26 +1,26 @@
 #include "terminal.hpp"
 #include "util.hpp"
-#include <ftxui/component/component.hpp>
-#include <ftxui/component/screen_interactive.hpp>
-#include <ftxui/dom/elements.hpp>
+#include "tty.hpp"
+#include "keyparser.hpp"
+#include "render.hpp"
 #include <algorithm>
 #include <iostream>
 #include <sstream>
 #include <cstdlib>
 #include <array>
 #include <chrono>
+#include <sys/select.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <utf8.h>
 
 namespace fzf {
 
-using namespace ftxui;
-
 Terminal::Terminal(const Options& opts, Reader& reader)
     : opts_(opts),
       reader_(reader),
       matcher_(opts.case_mode, opts.algo, !opts.fuzzy),
+      query_cursor_(0),
       cursor_pos_(0),
       scroll_offset_(0),
       running_(false),
@@ -37,7 +37,11 @@ Terminal::Terminal(const Options& opts, Reader& reader)
       preview_total_lines_(0),    // No preview lines initially
       preview_pending_(false),
       preview_cancel_(false),
-      preview_target_cursor_(SIZE_MAX)
+      preview_target_cursor_(SIZE_MAX),
+      wake_read_fd_(-1),
+      wake_write_fd_(-1),
+      winch_read_fd_(-1),
+      winch_write_fd_(-1)
 {
     current_prompt_ = opts_.prompt;
     current_header_ = opts_.header;
@@ -213,67 +217,56 @@ void Terminal::accept_selection() {
     running_ = false;
 }
 
-bool Terminal::check_expect_key(const ftxui::Event& event, std::string& matched_key) {
+bool Terminal::check_expect_key(const KeyEvent& event, std::string& matched_key) {
     if (opts_.expect_keys.empty()) {
         return false;
     }
 
-    std::string input = event.input();
+    const std::string& input = event.input;
 
-    // Check for special FTXUI events first
+    // Check for special named keys first
     for (const auto& expect : opts_.expect_keys) {
-        // Return/Enter key
-        if (expect == "enter" && event == Event::Return) {
+        if (expect == "enter" && event.type == KeyType::Special && event.special == SpecialKey::Return) {
             matched_key = "enter";
             return true;
         }
-
-        // Escape key
-        if (expect == "esc" && event == Event::Escape) {
+        if (expect == "esc" && event.type == KeyType::Special && event.special == SpecialKey::Escape) {
             matched_key = "esc";
             return true;
         }
-
-        // Tab key
-        if (expect == "tab" && event == Event::Tab) {
+        if (expect == "tab" && event.type == KeyType::Special && event.special == SpecialKey::Tab) {
             matched_key = "tab";
             return true;
         }
-
-        // Arrow keys (FTXUI events)
-        if (expect == "up" && event == Event::ArrowUp) {
+        if (expect == "up" && event.type == KeyType::Special && event.special == SpecialKey::ArrowUp) {
             matched_key = "up";
             return true;
         }
-        if (expect == "down" && event == Event::ArrowDown) {
+        if (expect == "down" && event.type == KeyType::Special && event.special == SpecialKey::ArrowDown) {
             matched_key = "down";
             return true;
         }
-        if (expect == "left" && event == Event::ArrowLeft) {
+        if (expect == "left" && event.type == KeyType::Special && event.special == SpecialKey::ArrowLeft) {
             matched_key = "left";
             return true;
         }
-        if (expect == "right" && event == Event::ArrowRight) {
+        if (expect == "right" && event.type == KeyType::Special && event.special == SpecialKey::ArrowRight) {
             matched_key = "right";
             return true;
         }
-
-        // Page Up/Down
-        if (expect == "page-up" && event == Event::PageUp) {
+        if (expect == "page-up" && event.type == KeyType::Special && event.special == SpecialKey::PageUp) {
             matched_key = "page-up";
             return true;
         }
-        if (expect == "page-down" && event == Event::PageDown) {
+        if (expect == "page-down" && event.type == KeyType::Special && event.special == SpecialKey::PageDown) {
             matched_key = "page-down";
             return true;
         }
-
-        // Home/End
-        if (expect == "home" && event == Event::Home) {
+        if (expect == "home" && event.type == KeyType::Special && event.special == SpecialKey::Home) {
             matched_key = "home";
             return true;
         }
-        if (expect == "end" && event == Event::End) {
+        if (expect == "end" && event.type == KeyType::Special && event.special == SpecialKey::End) {
             matched_key = "end";
             return true;
         }
@@ -281,7 +274,7 @@ bool Terminal::check_expect_key(const ftxui::Event& event, std::string& matched_
 
     // Map of ANSI sequences to key names for shift+arrow and other special keys
     // Try multiple variants as different terminals may use different sequences
-    std::map<std::string, std::string> key_map = {
+    static const std::pair<const char*, const char*> key_map[] = {
         // Standard xterm sequences for shift+arrows
         {"\x1b[1;2D", "shift-left"},
         {"\x1b[1;2C", "shift-right"},
@@ -346,12 +339,11 @@ bool Terminal::check_expect_key(const ftxui::Event& event, std::string& matched_
     return false;
 }
 
-std::string Terminal::event_to_bind_key(const ftxui::Event& event) {
-    // Control-character keys (ctrl-a..z, ctrl-space, ctrl-/, etc.) arrive as a
-    // single C0 byte via Event::Special, so type_ is Type::Unknown and
-    // is_character() is false — check the raw input byte directly instead of
-    // gating on is_character().
-    std::string input = event.input();
+std::string Terminal::event_to_bind_key(const KeyEvent& event) {
+    // Control-character keys (ctrl-a..z, ctrl-space, ctrl-/, etc.) arrive as
+    // Character events carrying a single control byte (see keyparser.cpp) —
+    // check the raw input byte directly rather than any printability check.
+    const std::string& input = event.input;
     if (input.length() != 1) {
         return "";
     }
@@ -361,8 +353,9 @@ std::string Terminal::event_to_bind_key(const ftxui::Event& event) {
     if (c == 0x00) {
         return "ctrl-space";
     }
-    // Ctrl-a .. ctrl-z, skipping the ones FTXUI turns into named events before
-    // is_character() would even see them (ctrl-i=Tab, ctrl-m=Return, ctrl-h=Backspace).
+    // Ctrl-a .. ctrl-z, skipping the ones the parser turns into named Special
+    // events before this would even be reached (ctrl-i=Tab, ctrl-m/j=Return,
+    // ctrl-h=Backspace).
     if (c >= 0x01 && c <= 0x1a) {
         char letter = static_cast<char>('a' + (c - 0x01));
         return std::string("ctrl-") + letter;
@@ -448,7 +441,7 @@ bool Terminal::execute_bind_action(const std::string& action) {
             shell_cmd = final_cmd;
         }
 
-        // Background the command so it doesn't block FTXUI
+        // Background the command so it doesn't block the UI loop.
         // The command will run asynchronously and write to /dev/tty
         std::string bg_cmd = "(" + shell_cmd + ") &";
 
@@ -618,6 +611,8 @@ bool Terminal::execute_bind_action(const std::string& action) {
 
     if (action == "clear-query") {
         current_query_.clear();
+        query_codepoints_.clear();
+        query_cursor_ = 0;
         update_results(current_query_);
         return true;
     }
@@ -715,13 +710,8 @@ bool Terminal::execute_bind_action(const std::string& action) {
     return false;
 }
 
-
 void Terminal::get_terminal_size(int& rows, int& cols) const {
-    struct winsize w;
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == 0) {
-        rows = w.ws_row;
-        cols = w.ws_col;
-    } else {
+    if (!fzf::get_terminal_size(STDOUT_FILENO, rows, cols)) {
         // Fallback to reasonable defaults
         rows = 24;
         cols = 80;
@@ -754,7 +744,7 @@ void Terminal::calculate_preview_position(int& top, int& left, int& lines, int& 
     // Bottom: Separator (1 row) + Input (1 row)
 
     int info_rows = opts_.info_hidden ? 0 : 1;
-    int header_rows = opts_.header.empty() ? 0 : 1;
+    int header_rows = current_header_.empty() ? 0 : 1;
     int top_ui_rows = info_rows + header_rows + 1; // info + header + separator
     int bottom_ui_rows = 2; // separator + input
     int content_rows = term_rows - top_ui_rows - bottom_ui_rows;
@@ -768,6 +758,11 @@ void Terminal::calculate_preview_position(int& top, int& left, int& lines, int& 
     }
     lines = content_rows;
     cols = preview_width;
+
+    if (opts_.border) {
+        top += 1;
+        left += 1;
+    }
 }
 
 void Terminal::set_preview_env_vars() const {
@@ -991,6 +986,7 @@ void Terminal::preview_worker() {
                         preview_content_ = accumulated_output;
                         preview_scroll_offset_ = 0;  // Reset scroll on content change
                     }
+                    wake_pipe(wake_write_fd_);
 
                     // Very small yield to prevent mutex starvation (1ms)
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -1007,6 +1003,7 @@ void Terminal::preview_worker() {
                         preview_scroll_offset_ = 0;  // Reset scroll on content change
                         item_text_for_cache = preview_target_item_;  // Get item text for caching
                     }
+                    wake_pipe(wake_write_fd_);
 
                     // Cache the preview result for instant display on next visit
                     if (!item_text_for_cache.empty() && !accumulated_output.empty()) {
@@ -1098,11 +1095,11 @@ void Terminal::preview_worker() {
     }
 }
 
-bool Terminal::handle_mouse_event(Event event) {
-    auto mouse = event.mouse();
+bool Terminal::handle_mouse_event(const KeyEvent& event) {
+    const MouseInfo& mouse = event.mouse;
 
     // Handle scroll wheel - scroll display without moving cursor
-    if (mouse.button == Mouse::WheelUp) {
+    if (mouse.button == MouseInfo::Button::WheelUp) {
         std::lock_guard<std::mutex> lock(results_mutex_);
         if (scroll_offset_ > 0) {
             scroll_offset_--;
@@ -1110,7 +1107,7 @@ bool Terminal::handle_mouse_event(Event event) {
         return true;
     }
 
-    if (mouse.button == Mouse::WheelDown) {
+    if (mouse.button == MouseInfo::Button::WheelDown) {
         std::lock_guard<std::mutex> lock(results_mutex_);
         size_t max_offset = current_results_.size() > visible_lines_
                           ? current_results_.size() - visible_lines_
@@ -1122,59 +1119,31 @@ bool Terminal::handle_mouse_event(Event event) {
     }
 
     // Handle mouse clicks (left button only for now)
-    // Note: Double-click is handled in the event loop (needs access to exit())
-    if (mouse.button == Mouse::Left && mouse.motion == Mouse::Pressed) {
-        // Single click: calculate which result was clicked
-        // The layout is complex, so we use a heuristic approach:
-        // - Count UI elements above the results area
-        // - Map click Y to result index
+    // Note: Double-click is handled by the caller (needs access to the exit path).
+    if (mouse.button == MouseInfo::Button::Left && mouse.motion == MouseInfo::Motion::Pressed) {
+        // Single click: calculate which result was clicked.
+        // The layout is the same top-down order regardless of --reverse/--layout
+        // today (a known, pre-existing gap — only this hit-test cared about
+        // LayoutType at all, and both branches computed the same thing).
+        int results_start_y = 0;
 
-        int results_start_y;
-        if (opts_.layout == LayoutType::Reverse) {
-            // Reverse layout: header/info at top, results below, input at bottom
-            results_start_y = 0;
-
-            // Add header/info based on header_first setting
-            if (opts_.header_first) {
-                if (!opts_.header.empty()) {
-                    results_start_y += 1;  // Header line
-                }
-                if (!opts_.info_hidden) {
-                    results_start_y += 1;  // Info line
-                }
-            } else {
-                if (!opts_.info_hidden) {
-                    results_start_y += 1;  // Info line
-                }
-                if (!opts_.header.empty()) {
-                    results_start_y += 1;  // Header line
-                }
+        if (opts_.header_first) {
+            if (!current_header_.empty()) {
+                results_start_y += 1;  // Header line
             }
-
-            results_start_y += 1;  // Separator after header/info
+            if (!opts_.info_hidden) {
+                results_start_y += 1;  // Info line
+            }
         } else {
-            // Default layout: same order as reverse, just affects result ordering
-            results_start_y = 0;
-
-            // Add header/info based on header_first setting
-            if (opts_.header_first) {
-                if (!opts_.header.empty()) {
-                    results_start_y += 1;  // Header line
-                }
-                if (!opts_.info_hidden) {
-                    results_start_y += 1;  // Info line
-                }
-            } else {
-                if (!opts_.info_hidden) {
-                    results_start_y += 1;  // Info line
-                }
-                if (!opts_.header.empty()) {
-                    results_start_y += 1;  // Header line
-                }
+            if (!opts_.info_hidden) {
+                results_start_y += 1;  // Info line
             }
-
-            results_start_y += 1;  // Separator after header/info
+            if (!current_header_.empty()) {
+                results_start_y += 1;  // Header line
+            }
         }
+
+        results_start_y += 1;  // Separator after header/info
 
         // Account for border offset (border adds 1 row at top)
         if (opts_.border) {
@@ -1190,7 +1159,7 @@ bool Terminal::handle_mouse_event(Event event) {
         size_t clicked_index = scroll_offset_ + click_offset;
 
         // Check if ctrl is pressed for multi-select toggle
-        bool ctrl_pressed = event.is_mouse() && (mouse.control);
+        bool ctrl_pressed = mouse.ctrl;
 
         {
             std::lock_guard<std::mutex> lock(results_mutex_);
@@ -1224,12 +1193,502 @@ bool Terminal::handle_mouse_event(Event event) {
     return true;  // Consume all mouse events
 }
 
+// --- Query-buffer editing (replaces FTXUI's Input component) ---
+
+void Terminal::query_insert_codepoints(const std::u32string& codepoints) {
+    query_codepoints_.insert(query_cursor_, codepoints);
+    query_cursor_ += codepoints.size();
+
+    std::string utf8_text;
+    utf8::utf32to8(query_codepoints_.begin(), query_codepoints_.end(), std::back_inserter(utf8_text));
+    current_query_ = utf8_text;
+}
+
+void Terminal::query_backspace() {
+    if (query_cursor_ == 0) {
+        return;
+    }
+    query_codepoints_.erase(query_cursor_ - 1, 1);
+    query_cursor_--;
+
+    std::string utf8_text;
+    utf8::utf32to8(query_codepoints_.begin(), query_codepoints_.end(), std::back_inserter(utf8_text));
+    current_query_ = utf8_text;
+}
+
+void Terminal::query_delete() {
+    if (query_cursor_ >= query_codepoints_.size()) {
+        return;
+    }
+    query_codepoints_.erase(query_cursor_, 1);
+
+    std::string utf8_text;
+    utf8::utf32to8(query_codepoints_.begin(), query_codepoints_.end(), std::back_inserter(utf8_text));
+    current_query_ = utf8_text;
+}
+
+void Terminal::query_move_left() {
+    if (query_cursor_ > 0) {
+        query_cursor_--;
+    }
+}
+
+void Terminal::query_move_right() {
+    if (query_cursor_ < query_codepoints_.size()) {
+        query_cursor_++;
+    }
+}
+
+// --- Rendering ---
+
+void Terminal::recompute_visible_lines() {
+    if (opts_.height > 0) {
+        if (opts_.height_is_percent) {
+            int term_rows, term_cols;
+            get_terminal_size(term_rows, term_cols);
+            visible_lines_ = static_cast<size_t>((term_rows * opts_.height) / 100);
+            if (visible_lines_ < 5) {
+                visible_lines_ = 5;
+            }
+        } else {
+            visible_lines_ = static_cast<size_t>(opts_.height);
+        }
+    } else {
+        int term_rows, term_cols;
+        get_terminal_size(term_rows, term_cols);
+
+        int info_rows = opts_.info_hidden ? 0 : 1;
+        int header_rows = current_header_.empty() ? 0 : 1;
+        int ui_overhead = info_rows + header_rows + 1 + 1 + 1;  // info + header + sep + sep + input
+        int computed = term_rows - ui_overhead;
+        if (opts_.border) {
+            computed -= 2;
+        }
+        visible_lines_ = computed > 0 ? static_cast<size_t>(computed) : 0;
+        if (visible_lines_ < 5) {
+            visible_lines_ = 5;
+        }
+    }
+}
+
+void Terminal::repaint(bool preview_dirty) {
+    int term_rows, term_cols;
+    get_terminal_size(term_rows, term_cols);
+
+    int margin = opts_.border ? 1 : 0;
+    int content_cols = term_cols - 2 * margin;
+    if (content_cols < 1) content_cols = 1;
+
+    FrameRenderer frame(term_rows, term_cols);
+    if (opts_.border) {
+        frame.draw_border();
+    }
+
+    int row = margin;
+
+    size_t result_count;
+    {
+        std::lock_guard<std::mutex> lock(results_mutex_);
+        result_count = current_results_.size();
+    }
+
+    std::string info = std::to_string(result_count);
+    if (opts_.multi && !selected_.empty()) {
+        info += " (" + std::to_string(selected_.size()) + " selected)";
+    }
+
+    bool has_header = !current_header_.empty();
+    std::string header_text = has_header ? strip_ansi_codes(current_header_) : "";
+
+    auto draw_info_line = [&]() {
+        if (!opts_.info_hidden) {
+            frame.draw_text(row++, margin, info, Style{}, content_cols);
+        }
+    };
+    auto draw_header_line = [&]() {
+        if (has_header) {
+            frame.draw_text(row++, margin, header_text, Style{Color::Default, true, false}, content_cols);
+        }
+    };
+
+    if (opts_.header_first) {
+        draw_header_line();
+        draw_info_line();
+    } else {
+        draw_info_line();
+        draw_header_line();
+    }
+
+    frame.draw_separator(row++);
+
+    // Results area (and preview pane, if enabled) share this vertical band.
+    int content_top = row;
+    bool show_preview = !opts_.preview_command.empty() && preview_visible_;
+
+    int preview_top = 0, preview_left = 0, preview_lines = 0, preview_cols = 0;
+    int results_col = margin;
+    int results_width = content_cols;
+
+    if (show_preview) {
+        calculate_preview_position(preview_top, preview_left, preview_lines, preview_cols);
+        int preview_width_with_sep = preview_cols + 1;  // + separator column
+        if (opts_.preview_position == "left") {
+            results_col = margin + preview_width_with_sep;
+            results_width = content_cols - preview_width_with_sep;
+        } else {
+            results_width = content_cols - preview_width_with_sep;
+        }
+        if (results_width < 1) results_width = 1;
+
+        // Vertical separator between preview and results.
+        int sep_col = (opts_.preview_position == "left")
+                          ? margin + preview_cols
+                          : margin + results_width;
+        for (int r = content_top; r < content_top + static_cast<int>(visible_lines_) && r < term_rows; ++r) {
+            frame.draw_text(r, sep_col, "\xE2\x94\x82", Style{}, 1);
+        }
+    }
+
+    auto visible = get_visible_results();
+
+    for (size_t i = 0; i < visible.size(); ++i) {
+        size_t actual_idx = scroll_offset_ + i;
+        const auto& result = visible[i];
+
+        bool is_cursor = (actual_idx == cursor_pos_);
+        bool is_sel = is_selected(result.item->index());
+
+        std::string line_prefix = (opts_.multi && is_sel) ? "> " : "  ";
+
+        std::string item_text;
+        if (!opts_.with_nth.empty() && result.item->has_fields()) {
+            std::string display = result.item->get_fields_by_ranges(opts_.with_nth, opts_.delimiter);
+            item_text = !display.empty() ? display : result.item->display_text();
+        } else {
+            item_text = result.item->display_text();
+        }
+        if (item_text.find('\x1b') != std::string::npos) {
+            item_text = strip_ansi_codes(item_text);
+        }
+
+        Row spans;
+        const auto& match_positions = result.positions;
+
+        if (!match_positions.empty() && !item_text.empty()) {
+            std::u32string u32_text;
+            try {
+                utf8::utf8to32(item_text.begin(), item_text.end(), std::back_inserter(u32_text));
+            } catch (...) {
+                u32_text.clear();
+            }
+
+            if (!u32_text.empty()) {
+                std::set<size_t> highlighted_positions;
+                for (const auto& match_pos : match_positions) {
+                    if (match_pos.start >= u32_text.size()) continue;
+                    size_t end = std::min(static_cast<size_t>(match_pos.end), u32_text.size());
+                    for (size_t p = match_pos.start; p < end; ++p) {
+                        highlighted_positions.insert(p);
+                    }
+                }
+
+                spans.push_back(Span{line_prefix, Style{}});
+
+                size_t seg_start = 0;
+                bool seg_highlighted = highlighted_positions.count(0) > 0;
+                for (size_t p = 1; p <= u32_text.size(); ++p) {
+                    bool is_highlighted = (p < u32_text.size()) && (highlighted_positions.count(p) > 0);
+                    if (p == u32_text.size() || is_highlighted != seg_highlighted) {
+                        std::string seg_text;
+                        utf8::utf32to8(u32_text.begin() + static_cast<long>(seg_start),
+                                        u32_text.begin() + static_cast<long>(p),
+                                        std::back_inserter(seg_text));
+                        Style style;
+                        if (seg_highlighted) {
+                            style.fg = Color::Yellow;
+                            style.bold = true;
+                        }
+                        spans.push_back(Span{seg_text, style});
+                        seg_start = p;
+                        seg_highlighted = is_highlighted;
+                    }
+                }
+            }
+        }
+
+        if (spans.empty()) {
+            spans.push_back(Span{line_prefix + item_text, Style{}});
+        }
+
+        if (is_cursor) {
+            for (auto& span : spans) {
+                span.style.inverted = true;
+            }
+        }
+
+        int row_num = content_top + static_cast<int>(i);
+        if (row_num < term_rows) {
+            frame.draw_row(row_num, results_col, spans, results_width);
+        }
+    }
+
+    // Blank out any leftover result rows from a previous, longer frame.
+    for (size_t i = visible.size(); i < visible_lines_; ++i) {
+        int row_num = content_top + static_cast<int>(i);
+        if (row_num >= term_rows) break;
+        frame.draw_row(row_num, results_col, {}, results_width);
+    }
+
+    int bottom_row = content_top + static_cast<int>(visible_lines_);
+    if (bottom_row < term_rows) {
+        frame.draw_separator(bottom_row);
+    }
+
+    int prompt_row = bottom_row + 1;
+    std::string prompt_line = current_prompt_ + current_query_;
+    if (prompt_row < term_rows) {
+        frame.draw_text(prompt_row, margin, prompt_line, Style{}, content_cols);
+    }
+
+    ssize_t written = write(STDOUT_FILENO, frame.bytes().data(), frame.bytes().size());
+    (void)written;
+
+    // Move the real cursor to the query-editing position.
+    size_t prompt_display_width = visible_width(current_prompt_);
+    int cursor_col = margin + static_cast<int>(prompt_display_width + query_cursor_);
+    std::string cursor_seq = "\x1b[" + std::to_string(prompt_row + 1) + ";" +
+                              std::to_string(cursor_col + 1) + "H";
+    ssize_t written2 = write(STDOUT_FILENO, cursor_seq.data(), cursor_seq.size());
+    (void)written2;
+
+    if (show_preview && preview_dirty) {
+        std::string preview_text;
+        {
+            std::lock_guard<std::mutex> lock(preview_mutex_);
+            preview_text = preview_content_;
+        }
+
+        // Clear the preview region first so a smaller/shorter new preview
+        // doesn't leave stale content from a larger previous one.
+        {
+            FrameRenderer clear_frame(term_rows, term_cols);
+            clear_frame.clear_region(preview_top, preview_left, preview_lines, preview_cols);
+            ssize_t w = write(STDOUT_FILENO, clear_frame.bytes().data(), clear_frame.bytes().size());
+            (void)w;
+        }
+
+        // Apply scroll offset by dropping leading lines, then clip to the
+        // pane's line budget. Raw passthrough: no color re-parsing, no width
+        // clipping beyond whole-line truncation, so sixel/kitty-graphics/SGR
+        // sequences in preview output reach the terminal unmodified.
+        std::vector<std::string> lines = split_lines(preview_text);
+        preview_total_lines_ = lines.size();
+        if (preview_total_lines_ > 0 && preview_scroll_offset_ >= preview_total_lines_) {
+            preview_scroll_offset_ = preview_total_lines_ - 1;
+        }
+
+        std::string visible_preview;
+        size_t shown = 0;
+        for (size_t li = preview_scroll_offset_; li < lines.size() && shown < static_cast<size_t>(preview_lines); ++li, ++shown) {
+            if (shown > 0) visible_preview += "\r\n";
+            visible_preview += lines[li];
+        }
+
+        write_raw_passthrough(STDOUT_FILENO, preview_top, preview_left, visible_preview);
+    }
+}
+
+bool Terminal::dispatch_event(const KeyEvent& event) {
+    // Check for expect keys first (matches FTXUI-era ordering: checked before
+    // any other handling, including default enter/escape behavior).
+    std::string matched_key;
+    if (check_expect_key(event, matched_key)) {
+        matched_expect_key_ = matched_key;
+        accept_selection();
+        running_ = false;
+        return false;
+    }
+
+    if (event.type == KeyType::Special && event.special == SpecialKey::Return) {
+        auto bind_it = opts_.bindings.find("enter");
+        if (bind_it != opts_.bindings.end()) {
+            execute_bind_action(bind_it->second);
+            return running_;
+        }
+        accept_selection();
+        return false;
+    }
+
+    if (event.type == KeyType::Special && event.special == SpecialKey::Escape) {
+        running_ = false;
+        return false;
+    }
+
+    if (event.type == KeyType::Special && event.special == SpecialKey::Tab) {
+        auto bind_it = opts_.bindings.find("tab");
+        if (bind_it != opts_.bindings.end()) {
+            execute_bind_action(bind_it->second);
+        } else if (opts_.multi) {
+            toggle_selection();
+        }
+        return running_;
+    }
+
+    if (event.type == KeyType::Special && event.special == SpecialKey::ArrowUp) {
+        auto bind_it = opts_.bindings.find("up");
+        if (bind_it != opts_.bindings.end()) {
+            execute_bind_action(bind_it->second);
+        } else {
+            move_cursor_up();
+        }
+        return running_;
+    }
+
+    if (event.type == KeyType::Special && event.special == SpecialKey::ArrowDown) {
+        auto bind_it = opts_.bindings.find("down");
+        if (bind_it != opts_.bindings.end()) {
+            execute_bind_action(bind_it->second);
+        } else {
+            move_cursor_down();
+        }
+        return running_;
+    }
+
+    if (event.type == KeyType::Special && event.special == SpecialKey::ArrowLeft) {
+        auto bind_it = opts_.bindings.find("left");
+        if (bind_it != opts_.bindings.end()) {
+            execute_bind_action(bind_it->second);
+        } else {
+            query_move_left();
+        }
+        return running_;
+    }
+
+    if (event.type == KeyType::Special && event.special == SpecialKey::ArrowRight) {
+        auto bind_it = opts_.bindings.find("right");
+        if (bind_it != opts_.bindings.end()) {
+            execute_bind_action(bind_it->second);
+        } else {
+            query_move_right();
+        }
+        return running_;
+    }
+
+    if (event.type == KeyType::Special && event.special == SpecialKey::PageUp) {
+        move_cursor_page_up();
+        return running_;
+    }
+
+    if (event.type == KeyType::Special && event.special == SpecialKey::PageDown) {
+        move_cursor_page_down();
+        return running_;
+    }
+
+    if (event.type == KeyType::Special && event.special == SpecialKey::Home) {
+        auto bind_it = opts_.bindings.find("home");
+        if (bind_it != opts_.bindings.end()) {
+            execute_bind_action(bind_it->second);
+        } else {
+            execute_bind_action("top");
+        }
+        return running_;
+    }
+
+    if (event.type == KeyType::Special && event.special == SpecialKey::End) {
+        auto bind_it = opts_.bindings.find("end");
+        if (bind_it != opts_.bindings.end()) {
+            execute_bind_action(bind_it->second);
+        } else {
+            execute_bind_action("bottom");
+        }
+        return running_;
+    }
+
+    if (!opts_.no_mouse && event.type == KeyType::Mouse) {
+        if (event.mouse.button == MouseInfo::Button::Left &&
+            event.mouse.motion == MouseInfo::Motion::Pressed) {
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_click_time_);
+
+            int dx = std::abs(event.mouse.x - last_click_x_);
+            int dy = std::abs(event.mouse.y - last_click_y_);
+            bool is_double_click = (elapsed.count() < 600) && (dx <= 2) && (dy <= 1);
+
+            last_click_time_ = now;
+            last_click_x_ = event.mouse.x;
+            last_click_y_ = event.mouse.y;
+
+            if (is_double_click) {
+                accept_selection();
+                running_ = false;
+                return false;
+            }
+        }
+
+        handle_mouse_event(event);
+        return running_;
+    }
+
+    // Custom bindings on ctrl/alt-modified keys (ctrl-r, ctrl-/, ctrl-space,
+    // etc.) that aren't one of the specially-handled navigation keys above.
+    {
+        std::string bind_key = event_to_bind_key(event);
+        if (!bind_key.empty()) {
+            auto bind_it = opts_.bindings.find(bind_key);
+            if (bind_it != opts_.bindings.end()) {
+                execute_bind_action(bind_it->second);
+                return running_;
+            }
+        }
+    }
+
+    if (event.type == KeyType::Special && event.special == SpecialKey::Backspace) {
+        query_backspace();
+        return running_;
+    }
+
+    if (event.type == KeyType::Special && event.special == SpecialKey::Delete) {
+        query_delete();
+        return running_;
+    }
+
+    if (event.is_character() && !event.codepoints.empty()) {
+        query_insert_codepoints(event.codepoints);
+        return running_;
+    }
+
+    return running_;
+}
+
 std::vector<std::string> Terminal::run() {
-    auto screen = ScreenInteractive::Fullscreen();
-    auto exit = screen.ExitLoopClosure();  // Get exit closure FIRST
+    RawMode raw(STDIN_FILENO);
+
+    enter_alt_screen(STDOUT_FILENO);
+    hide_cursor(STDOUT_FILENO);
+    if (!opts_.no_mouse) {
+        enable_mouse(STDOUT_FILENO);
+    }
+
+    if (!make_self_pipe(winch_read_fd_, winch_write_fd_)) {
+        winch_read_fd_ = winch_write_fd_ = -1;
+    }
+    if (!make_self_pipe(wake_read_fd_, wake_write_fd_)) {
+        wake_read_fd_ = wake_write_fd_ = -1;
+    }
+    if (winch_write_fd_ >= 0) {
+        install_sigwinch_handler(winch_write_fd_);
+    }
+
+    reader_.set_wake_callback([this]() { wake_pipe(wake_write_fd_); });
 
     // Initialize query
     current_query_ = opts_.query;
+    try {
+        utf8::utf8to32(current_query_.begin(), current_query_.end(), std::back_inserter(query_codepoints_));
+    } catch (...) {
+        query_codepoints_.clear();
+    }
+    query_cursor_ = query_codepoints_.size();
     update_results(current_query_);
 
     // Fire the start: event binding once (e.g. start:reload(...)), letting an
@@ -1246,268 +1705,116 @@ std::vector<std::string> Terminal::run() {
         preview_thread_ = std::thread(&Terminal::preview_worker, this);
     }
 
-    // Calculate visible lines based on actual terminal size
-    if (opts_.height > 0) {
-        if (opts_.height_is_percent) {
-            // Calculate percentage of terminal height
-            int term_rows, term_cols;
-            get_terminal_size(term_rows, term_cols);
-            visible_lines_ = (term_rows * opts_.height) / 100;
+    recompute_visible_lines();
 
-            // Ensure at least 5 lines visible
-            if (visible_lines_ < 5) {
-                visible_lines_ = 5;
-            }
-        } else {
-            // Absolute line count
-            visible_lines_ = opts_.height;
-        }
-    } else {
-        // Auto-calculate from terminal size
-        int term_rows, term_cols;
-        get_terminal_size(term_rows, term_cols);
-
-        // Calculate available space for results
-        // UI layout: info(0-1) + header(0-1) + separator(1) + content + separator(1) + input(1)
-        int info_rows = opts_.info_hidden ? 0 : 1;
-        int header_rows = opts_.header.empty() ? 0 : 1;
-        int ui_overhead = info_rows + header_rows + 1 + 1 + 1;  // info + header + sep + sep + input
-        visible_lines_ = term_rows - ui_overhead;
-
-        // Ensure at least 5 lines visible
-        if (visible_lines_ < 5) {
-            visible_lines_ = 5;
-        }
-    }
-
-    // Input component - we'll handle events manually
-    std::string input_content = current_query_;
-    auto input = Input(&input_content, opts_.prompt);
-
-    // Track if we need to update search
+    size_t last_item_count = reader_.item_count();
+    size_t last_focus_pos = SIZE_MAX;
     bool last_content_different = false;
 
-    // Create a component that handles ALL events before passing to Input
-    auto component = CatchEvent(input, [&, exit](Event event) {
-        // Handle critical events FIRST, before Input sees them
+    KeyParser parser;
 
-        // Check for expect keys
-        std::string matched_key;
-        if (check_expect_key(event, matched_key)) {
-            matched_expect_key_ = matched_key;
-            accept_selection();
-            running_ = false;
-            exit();
-            return true;
+    running_ = true;
+    repaint(/*preview_dirty=*/true);
+
+    int max_fd = std::max({STDIN_FILENO, winch_read_fd_, wake_read_fd_});
+
+    while (running_) {
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(STDIN_FILENO, &read_fds);
+        FD_SET(winch_read_fd_, &read_fds);
+        FD_SET(wake_read_fd_, &read_fds);
+
+        bool has_timeout = parser.has_pending();
+        struct timeval tv;
+        if (has_timeout) {
+            tv.tv_sec = KeyParser::kEscapeTimeoutMs / 1000;
+            tv.tv_usec = (KeyParser::kEscapeTimeoutMs % 1000) * 1000;
         }
 
-        if (event == Event::Return) {
-            // Check for custom enter binding
-            auto bind_it = opts_.bindings.find("enter");
-            if (bind_it != opts_.bindings.end()) {
-                // Execute custom binding using the common handler
-                execute_bind_action(bind_it->second);
-            } else {
-                // Default behavior: accept selection and exit
-                accept_selection();
-                exit();
+        int n = select(max_fd + 1, &read_fds, nullptr, nullptr, has_timeout ? &tv : nullptr);
+
+        bool needs_repaint = false;
+        bool preview_dirty = false;
+
+        if (n < 0) {
+            continue;  // EINTR or similar; loop and re-check state
+        }
+
+        if (n == 0 && parser.has_pending()) {
+            auto events = parser.timeout_tick(KeyParser::kEscapeTimeoutMs);
+            for (const auto& ev : events) {
+                if (!dispatch_event(ev)) break;
+                needs_repaint = true;
             }
-            return true;
         }
 
-        if (event == Event::Escape) {
-            running_ = false;
-            exit();  // Actually exit the loop
-            return true;
-        }
-
-        if (event == Event::Tab) {
-            // Check for custom tab binding
-            auto bind_it = opts_.bindings.find("tab");
-            if (bind_it != opts_.bindings.end()) {
-                execute_bind_action(bind_it->second);
-            } else if (opts_.multi) {
-                // Default behavior: toggle selection and move down
-                toggle_selection();
+        if (FD_ISSET(winch_read_fd_, &read_fds)) {
+            drain_pipe(winch_read_fd_);
+            recompute_visible_lines();
+            needs_repaint = true;
+            preview_dirty = true;  // stale image geometry; force re-render
+            if (!opts_.preview_command.empty() && !current_results_.empty()) {
+                last_preview_cursor_ = SIZE_MAX;  // force preview re-invocation
             }
-            return true;  // Consume the event
         }
 
-        if (event == Event::ArrowUp) {
-            // Check for custom up binding
-            auto bind_it = opts_.bindings.find("up");
-            if (bind_it != opts_.bindings.end()) {
-                execute_bind_action(bind_it->second);
-            } else {
-                move_cursor_up();
+        if (FD_ISSET(wake_read_fd_, &read_fds)) {
+            drain_pipe(wake_read_fd_);
+            size_t current_item_count = reader_.item_count();
+            if (current_item_count != last_item_count) {
+                last_item_count = current_item_count;
+                update_results(current_query_);
             }
-            return true;
+            needs_repaint = true;
+            preview_dirty = true;
         }
 
-        if (event == Event::ArrowDown) {
-            // Check for custom down binding
-            auto bind_it = opts_.bindings.find("down");
-            if (bind_it != opts_.bindings.end()) {
-                execute_bind_action(bind_it->second);
-            } else {
-                move_cursor_down();
-            }
-            return true;
-        }
+        if (FD_ISSET(STDIN_FILENO, &read_fds)) {
+            char buf[256];
+            ssize_t r = read(STDIN_FILENO, buf, sizeof(buf));
+            if (r > 0) {
+                auto events = parser.feed(std::string(buf, static_cast<size_t>(r)));
+                for (const auto& ev : events) {
+                    bool changes_query = ev.is_character() || (ev.type == KeyType::Special &&
+                        (ev.special == SpecialKey::Backspace || ev.special == SpecialKey::Delete));
+                    // Re-run matching before dispatching any later event in
+                    // this same read() batch (e.g. a fast "query\n" paste),
+                    // so accept/expect-key events see the filtered results
+                    // rather than a stale pre-keystroke list.
+                    if (last_content_different && !changes_query) {
+                        update_results(current_query_);
+                        last_content_different = false;
 
-        if (event == Event::ArrowLeft) {
-            // Check for custom left binding
-            auto bind_it = opts_.bindings.find("left");
-            if (bind_it != opts_.bindings.end()) {
-                execute_bind_action(bind_it->second);
-            }
-            // No default behavior for left arrow
-            return true;
-        }
-
-        if (event == Event::ArrowRight) {
-            // Check for custom right binding
-            auto bind_it = opts_.bindings.find("right");
-            if (bind_it != opts_.bindings.end()) {
-                execute_bind_action(bind_it->second);
-            }
-            // No default behavior for right arrow
-            return true;
-        }
-
-        if (event == Event::PageUp) {
-            move_cursor_page_up();
-            return true;
-        }
-
-        if (event == Event::PageDown) {
-            move_cursor_page_down();
-            return true;
-        }
-
-        if (event == Event::Home) {
-            // Check for custom home binding
-            auto bind_it = opts_.bindings.find("home");
-            if (bind_it != opts_.bindings.end()) {
-                execute_bind_action(bind_it->second);
-            } else {
-                // Default behavior: jump to first item
-                execute_bind_action("top");
-            }
-            return true;
-        }
-
-        if (event == Event::End) {
-            // Check for custom end binding
-            auto bind_it = opts_.bindings.find("end");
-            if (bind_it != opts_.bindings.end()) {
-                execute_bind_action(bind_it->second);
-            } else {
-                // Default behavior: jump to last item
-                execute_bind_action("bottom");
-            }
-            return true;
-        }
-
-        // Mouse events
-        if (!opts_.no_mouse && event.is_mouse()) {
-            auto mouse = event.mouse();
-
-            // Check for double-click first (needs access to exit())
-            if (mouse.button == Mouse::Left && mouse.motion == Mouse::Pressed) {
-                auto now = std::chrono::steady_clock::now();
-                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_click_time_);
-
-                int dx = std::abs(mouse.x - last_click_x_);
-                int dy = std::abs(mouse.y - last_click_y_);
-                bool is_double_click = (elapsed.count() < 600) && (dx <= 2) && (dy <= 1);
-
-                last_click_time_ = now;
-                last_click_x_ = mouse.x;
-                last_click_y_ = mouse.y;
-
-                if (is_double_click) {
-                    // Double-click: accept and exit
-                    accept_selection();
-                    running_ = false;
-                    exit();
-                    return true;
-                }
-            }
-
-            // Handle other mouse events
-            return handle_mouse_event(event);
-        }
-
-        // Custom bindings on ctrl/alt-modified keys (ctrl-r, ctrl-/, ctrl-space,
-        // etc.) that aren't one of the specially-handled navigation keys above.
-        // These arrive as "character" events carrying a control byte, so they
-        // must be checked before the plain is_character() fallthrough below
-        // would hand them to Input as literal query text.
-        {
-            std::string bind_key = event_to_bind_key(event);
-            if (!bind_key.empty()) {
-                auto bind_it = opts_.bindings.find(bind_key);
-                if (bind_it != opts_.bindings.end()) {
-                    execute_bind_action(bind_it->second);
-                    return true;
+                        auto change_it = opts_.bindings.find("change");
+                        if (change_it != opts_.bindings.end()) {
+                            execute_bind_action(change_it->second);
+                        }
+                    }
+                    if (!dispatch_event(ev)) break;
+                    if (changes_query) {
+                        last_content_different = true;
+                    }
+                    needs_repaint = true;
                 }
             }
         }
 
-        if (event.is_character()) {
-            // Character input - will trigger search update
-            last_content_different = true;
-            return false;  // Let Input handle the character
+        if (!running_) {
+            break;
         }
 
-        if (event == Event::Backspace || event == Event::Delete) {
-            last_content_different = true;
-            return false;  // Let Input handle the deletion
-        }
-
-        return false;  // Let Input handle other events
-    });
-
-    // Track last item count to detect when reader adds new items
-    // Initialize to current count since we just called update_results() above
-    size_t last_item_count = reader_.item_count();
-
-    // Track the last focused cursor position to fire focus: exactly once per
-    // actual move (e.g. focus:transform-header(...), used to show per-item
-    // context in the header as the cursor moves). SIZE_MAX forces the first
-    // frame to count as a focus change so the binding fires for the initial
-    // selection too.
-    size_t last_focus_pos = SIZE_MAX;
-
-    // Renderer
-    auto renderer = Renderer(component, [&] {
-        // Check if reader has new items
-        size_t current_item_count = reader_.item_count();
-        bool items_changed = (current_item_count != last_item_count);
-        if (items_changed) {
-            last_item_count = current_item_count;
-            update_results(current_query_);
-        }
-
-        // Update search if query changed
         if (last_content_different) {
-            current_query_ = input_content;
             update_results(current_query_);
             last_content_different = false;
 
-            // Fire the change: event binding (e.g. change:reload(...)), which lets
-            // an external command rebuild the list from the new query. Its action
-            // runs its own update_results, so this happens after the local refilter.
             auto change_it = opts_.bindings.find("change");
             if (change_it != opts_.bindings.end()) {
                 execute_bind_action(change_it->second);
             }
+            needs_repaint = true;
         }
 
-        // Fire the focus: event binding when the cursor lands on a new item
-        // (e.g. focus:transform-header(...), which recomputes the header from
-        // the newly-focused item via the {} placeholder).
         {
             size_t current_focus_pos;
             {
@@ -1520,428 +1827,68 @@ std::vector<std::string> Terminal::run() {
                 if (focus_it != opts_.bindings.end()) {
                     execute_bind_action(focus_it->second);
                 }
+                needs_repaint = true;
             }
         }
 
-        // Get visible results
-        auto visible = get_visible_results();
-
-        // Build result elements
-        Elements result_elements;
-        size_t result_count = 0;
-        {
-            std::lock_guard<std::mutex> lock(results_mutex_);
-            result_count = current_results_.size();
-        }
-
-        for (size_t i = 0; i < visible.size(); ++i) {
-            size_t actual_idx = scroll_offset_ + i;
-            const auto& result = visible[i];
-
-            bool is_cursor = (actual_idx == cursor_pos_);
-            bool is_sel = is_selected(result.item->index());
-
-            // Build line prefix (selection marker)
-            std::string line_prefix;
-            if (opts_.multi && is_sel) {
-                line_prefix = "> ";
-            } else {
-                line_prefix = "  ";
-            }
-
-            // Get item text (without prefix)
-            std::string item_text;
-            if (!opts_.with_nth.empty()) {
-                if (result.item->has_fields()) {
-                    std::string display =
-                        result.item->get_fields_by_ranges(opts_.with_nth, opts_.delimiter);
-                    if (!display.empty()) {
-                        item_text = display;
-                    } else {
-                        item_text = result.item->display_text();
-                    }
-                } else {
-                    item_text = result.item->display_text();
-                }
-            } else {
-                // Use display_text (ANSI codes already stripped during parsing)
-                item_text = result.item->display_text();
-            }
-
-            // display_text() already has ANSI codes stripped, no need to strip again
-            // (Unless field display added them back, so strip to be safe)
-            if (item_text.find('\x1b') != std::string::npos) {
-                item_text = strip_ansi_codes(item_text);
-            }
-
-            // Build element with match highlighting
-            Element element;
-            bool highlighting_success = false;
-
-            // Try to apply match highlighting
-            const auto& match_positions = result.positions;
-            if (!match_positions.empty() && !item_text.empty()) {
-                try {
-                    // Convert item_text to UTF-32 for position indexing
-                    std::u32string u32_text;
-                    utf8::utf8to32(item_text.begin(), item_text.end(), std::back_inserter(u32_text));
-
-                    // Create a set of highlighted positions (with bounds checking)
-                    std::set<size_t> highlighted_positions;
-                    for (const auto& match_pos : match_positions) {
-                        // Validate and clamp positions
-                        if (match_pos.start >= u32_text.size()) continue;
-                        size_t end = std::min(static_cast<size_t>(match_pos.end), u32_text.size());
-
-                        for (size_t i = match_pos.start; i < end; ++i) {
-                            highlighted_positions.insert(i);
-                        }
-                    }
-
-                    // Build segments with highlighting
-                    if (!highlighted_positions.empty()) {
-                        Elements line_elements;
-
-                        // Add prefix first
-                        line_elements.push_back(text(line_prefix));
-
-                        // Build text segments by grouping consecutive highlighted/non-highlighted chars
-                        size_t seg_start = 0;
-                        bool seg_highlighted = highlighted_positions.count(0) > 0;
-
-                        for (size_t i = 1; i <= u32_text.size(); ++i) {
-                            bool is_highlighted = (i < u32_text.size()) && (highlighted_positions.count(i) > 0);
-
-                            // Check if we need to start a new segment
-                            if (i == u32_text.size() || is_highlighted != seg_highlighted) {
-                                // Convert UTF-32 segment back to UTF-8
-                                std::string seg_text;
-                                utf8::utf32to8(u32_text.begin() + seg_start, u32_text.begin() + i,
-                                             std::back_inserter(seg_text));
-
-                                // Create text element with optional highlighting
-                                Element seg_elem = text(seg_text);
-                                if (seg_highlighted) {
-                                    seg_elem = seg_elem | color(Color::Yellow) | bold;
-                                }
-
-                                line_elements.push_back(seg_elem);
-
-                                // Start new segment
-                                seg_start = i;
-                                seg_highlighted = is_highlighted;
-                            }
-                        }
-
-                        element = hbox(line_elements);
-                        highlighting_success = true;
-                    }
-                } catch (...) {
-                    // UTF-8 conversion or other error - fall back to plain text
-                    highlighting_success = false;
-                }
-            }
-
-            // Fallback: render without highlighting
-            if (!highlighting_success) {
-                std::string full_line = line_prefix + item_text;
-                if (wrap_lines_) {
-                    element = paragraph(full_line);
-                } else {
-                    element = text(full_line);
-                }
-            }
-
-            // Apply cursor inversion
-            if (is_cursor) {
-                element = element | inverted;
-            }
-
-            result_elements.push_back(element);
-        }
-
-        // Trigger async preview update if cursor position changed
+        // Trigger async preview update if cursor position changed.
         if (!opts_.preview_command.empty() && !current_results_.empty()) {
             if (cursor_pos_ != last_preview_cursor_) {
                 last_preview_cursor_ = cursor_pos_;
 
-                // Get current item text for cache lookup
                 std::string current_item_text;
                 if (cursor_pos_ < current_results_.size()) {
                     current_item_text = current_results_[cursor_pos_].item->text();
                 }
 
-                // Check cache first for instant preview display
                 std::string cached_content = get_cached_preview(current_item_text);
                 if (!cached_content.empty()) {
-                    // Cache hit! Display immediately (instant like golang fzf)
-                    {
-                        std::lock_guard<std::mutex> lock(preview_mutex_);
-                        preview_content_ = cached_content;
-                        preview_scroll_offset_ = 0;  // Reset scroll on content change
-                    }
-                    // No need to execute preview command
+                    std::lock_guard<std::mutex> lock(preview_mutex_);
+                    preview_content_ = cached_content;
+                    preview_scroll_offset_ = 0;
                 } else {
-                    // Cache miss - need to execute preview command
-
-                    // Cancel any running preview
                     preview_cancel_.store(true);
-
-                    // Show "Loading..." immediately (like browser loading page)
-                    // Will be replaced by actual content as soon as command outputs
                     {
                         std::lock_guard<std::mutex> lock(preview_mutex_);
                         preview_content_ = "Loading preview...";
-                        preview_scroll_offset_ = 0;  // Reset scroll on content change
-                        preview_target_item_ = current_item_text;  // Store item text for caching
+                        preview_scroll_offset_ = 0;
+                        preview_target_item_ = current_item_text;
                     }
-
-                    // Request new preview (will start immediately and stream output)
                     preview_target_cursor_.store(cursor_pos_);
                     preview_pending_.store(true);
                     preview_cancel_.store(false);
                 }
+                preview_dirty = true;
+                needs_repaint = true;
             }
         }
 
-        // Info line
-        std::string info = std::to_string(result_count);
-        if (opts_.multi && !selected_.empty()) {
-            info += " (" + std::to_string(selected_.size()) + " selected)";
+        if (needs_repaint) {
+            repaint(preview_dirty);
         }
-
-        // Build main results box
-        auto results_box = vbox(result_elements) | frame;
-
-        // Build preview box if preview is enabled
-        Elements layout_elements;
-
-        // Build header element (if present)
-        Element header_element;
-        bool has_header = !current_header_.empty();
-
-        if (has_header) {
-            // Check if header contains ANSI codes
-            if (current_header_.find('\x1b') != std::string::npos) {
-                // Strip ANSI codes from header to avoid junk display
-                header_element = text(strip_ansi_codes(current_header_)) | bold;
-            } else {
-                header_element = text(current_header_) | bold;
-            }
-        }
-
-        // Add header and info line in the correct order
-        if (opts_.header_first) {
-            // Header first mode: header before info
-            if (has_header) {
-                layout_elements.push_back(header_element);
-            }
-            if (!opts_.info_hidden) {
-                layout_elements.push_back(text(info) | hcenter);
-            }
-        } else {
-            // Default mode: info before header
-            if (!opts_.info_hidden) {
-                layout_elements.push_back(text(info) | hcenter);
-            }
-            if (has_header) {
-                layout_elements.push_back(header_element);
-            }
-        }
-
-        layout_elements.push_back(separator());
-
-        // Main content area with optional preview
-        if (!opts_.preview_command.empty() && preview_visible_) {
-            // Split screen: results on left, preview on right
-            std::string preview_text;
-            {
-                std::lock_guard<std::mutex> lock(preview_mutex_);
-                preview_text = preview_content_;
-            }
-
-            // Parse preview text into lines - first collect all lines
-            std::istringstream stream(preview_text);
-            std::string line;
-            std::vector<std::string> all_preview_lines;
-
-            while (std::getline(stream, line)) {
-                all_preview_lines.push_back(line);
-            }
-
-            // Update total lines count
-            preview_total_lines_ = all_preview_lines.size();
-
-            // Clamp scroll offset to valid range
-            if (preview_total_lines_ > 0 && preview_scroll_offset_ >= preview_total_lines_) {
-                preview_scroll_offset_ = preview_total_lines_ - 1;
-            }
-
-            // Render only visible window of lines
-            Elements preview_elements;
-            size_t visible_start = preview_scroll_offset_;
-            size_t visible_end = all_preview_lines.size();  // Show all remaining lines (FTXUI will clip)
-
-            for (size_t line_idx = visible_start; line_idx < visible_end; line_idx++) {
-                const std::string& line = all_preview_lines[line_idx];
-                try {
-                    // Parse ANSI colored segments
-                    auto segments = parse_ansi_colored_text(line);
-
-                    if (segments.empty()) {
-                        preview_elements.push_back(text(""));
-                        continue;
-                    }
-
-                    // Build colored line
-                    Elements line_elements;
-                    for (const auto& seg : segments) {
-                        if (seg.text.empty()) continue;
-
-                        Element elem = text(seg.text);
-
-                    // Apply foreground color if specified
-                    if (seg.fg_is_rgb) {
-                        // RGB true color mode
-                        elem = elem | color(Color::RGB(seg.fg_rgb[0], seg.fg_rgb[1], seg.fg_rgb[2]));
-                    } else if (seg.fg_color >= 0 && seg.fg_color < 16) {
-                        // Basic 16 colors (Palette16)
-                        Color ftxui_color;
-                        switch (seg.fg_color) {
-                            case 0: ftxui_color = Color::Black; break;
-                            case 1: ftxui_color = Color::Red; break;
-                            case 2: ftxui_color = Color::Green; break;
-                            case 3: ftxui_color = Color::Yellow; break;
-                            case 4: ftxui_color = Color::Blue; break;
-                            case 5: ftxui_color = Color::Magenta; break;
-                            case 6: ftxui_color = Color::Cyan; break;
-                            case 7: ftxui_color = Color::GrayLight; break;
-                            case 8: ftxui_color = Color::GrayDark; break;
-                            case 9: ftxui_color = Color::RedLight; break;
-                            case 10: ftxui_color = Color::GreenLight; break;
-                            case 11: ftxui_color = Color::YellowLight; break;
-                            case 12: ftxui_color = Color::BlueLight; break;
-                            case 13: ftxui_color = Color::MagentaLight; break;
-                            case 14: ftxui_color = Color::CyanLight; break;
-                            case 15: ftxui_color = Color::White; break;
-                            default: ftxui_color = Color::Default; break;
-                        }
-                        elem = elem | color(ftxui_color);
-                    } else if (seg.fg_color >= 16 && seg.fg_color <= 255) {
-                        // 256-color palette
-                        elem = elem | color(Color::Palette256(seg.fg_color));
-                    }
-
-                    // Apply background color if specified
-                    if (seg.bg_is_rgb) {
-                        // RGB true color mode
-                        elem = elem | bgcolor(Color::RGB(seg.bg_rgb[0], seg.bg_rgb[1], seg.bg_rgb[2]));
-                    } else if (seg.bg_color >= 0 && seg.bg_color < 16) {
-                        // Basic 16 colors (Palette16)
-                        Color ftxui_bgcolor;
-                        switch (seg.bg_color) {
-                            case 0: ftxui_bgcolor = Color::Black; break;
-                            case 1: ftxui_bgcolor = Color::Red; break;
-                            case 2: ftxui_bgcolor = Color::Green; break;
-                            case 3: ftxui_bgcolor = Color::Yellow; break;
-                            case 4: ftxui_bgcolor = Color::Blue; break;
-                            case 5: ftxui_bgcolor = Color::Magenta; break;
-                            case 6: ftxui_bgcolor = Color::Cyan; break;
-                            case 7: ftxui_bgcolor = Color::GrayLight; break;
-                            case 8: ftxui_bgcolor = Color::GrayDark; break;
-                            case 9: ftxui_bgcolor = Color::RedLight; break;
-                            case 10: ftxui_bgcolor = Color::GreenLight; break;
-                            case 11: ftxui_bgcolor = Color::YellowLight; break;
-                            case 12: ftxui_bgcolor = Color::BlueLight; break;
-                            case 13: ftxui_bgcolor = Color::MagentaLight; break;
-                            case 14: ftxui_bgcolor = Color::CyanLight; break;
-                            case 15: ftxui_bgcolor = Color::White; break;
-                            default: ftxui_bgcolor = Color::Default; break;
-                        }
-                        elem = elem | bgcolor(ftxui_bgcolor);
-                    } else if (seg.bg_color >= 16 && seg.bg_color <= 255) {
-                        // 256-color palette
-                        elem = elem | bgcolor(Color::Palette256(seg.bg_color));
-                    }
-
-                    // Apply bold if specified
-                    if (seg.bold) {
-                        elem = elem | bold;
-                    }
-
-                    line_elements.push_back(elem);
-                }
-
-                // Combine segments into a single line
-                preview_elements.push_back(hbox(line_elements));
-                } catch (...) {
-                    // If color parsing fails, fall back to plain text
-                    preview_elements.push_back(text(strip_ansi_codes(line)));
-                }
-            }
-
-            auto preview_box = vbox(preview_elements) | frame;
-
-            // Horizontal split with configurable position
-            if (opts_.preview_position == "left") {
-                layout_elements.push_back(
-                    hbox({
-                        preview_box | flex,
-                        separator(),
-                        results_box | size(WIDTH, GREATER_THAN, 40)
-                    }) | flex
-                );
-            } else {
-                // Default: preview on right
-                layout_elements.push_back(
-                    hbox({
-                        results_box | size(WIDTH, GREATER_THAN, 40),
-                        separator(),
-                        preview_box | flex
-                    }) | flex
-                );
-            }
-        } else {
-            // No preview, just results
-            layout_elements.push_back(results_box | flex);
-        }
-
-        layout_elements.push_back(separator());
-        layout_elements.push_back(hbox({text(current_prompt_), component->Render()}));
-
-        auto layout = vbox(layout_elements);
-
-        // Apply border if requested
-        if (opts_.border) {
-            return layout | border;
-        }
-
-        return layout;
-    });
-
-    // Background thread to trigger screen updates when items arrive
-    // Only runs while reader is active and checks every 200ms (low overhead)
-    std::atomic<bool> update_thread_running{true};
-    size_t last_seen_count = last_item_count;
-    std::thread update_thread([&]() {
-        while (update_thread_running.load() && !reader_.is_finished()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
-            size_t current_count = reader_.item_count();
-            if (current_count != last_seen_count) {
-                last_seen_count = current_count;
-                screen.PostEvent(Event::Custom);
-            }
-        }
-    });
-
-    running_ = true;
-    screen.Loop(renderer);
-
-    // Stop update thread
-    update_thread_running.store(false);
-    if (update_thread.joinable()) {
-        update_thread.join();
     }
+
+    // Teardown, matching the RawMode/alt-screen/mouse setup at the top.
+    if (!opts_.no_mouse) {
+        disable_mouse(STDOUT_FILENO);
+    }
+    show_cursor(STDOUT_FILENO);
+    leave_alt_screen(STDOUT_FILENO);
+    if (winch_write_fd_ >= 0) {
+        restore_sigwinch_handler();
+    }
+    reader_.set_wake_callback(nullptr);
+
+    preview_cancel_.store(true);
+    preview_pending_.store(false);
+    if (preview_thread_.joinable()) {
+        preview_thread_.join();
+    }
+
+    if (winch_read_fd_ >= 0) close(winch_read_fd_);
+    if (winch_write_fd_ >= 0) close(winch_write_fd_);
+    if (wake_read_fd_ >= 0) close(wake_read_fd_);
+    if (wake_write_fd_ >= 0) close(wake_write_fd_);
 
     // Collect selected items
     std::vector<std::string> result;

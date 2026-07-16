@@ -5,15 +5,9 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Darwin-specific notes:
-# Bundled FTXUI allows new C++ ABI on libstdc++-using systems.
-# If you use a port for FTXUI and thus old ABI, you will likely find it useful to invoke
-# the executable via a wrapper that sets DYLD_LIBRARY_PATH to libgcc location.
-# See: https://github.com/macos-powerpc/powerpc-ports/blob/64891b48c96b37b529c25328d3a3d51b8126af78/_resources/port1.0/group/legacysupport-1.1.tcl#L244-L267
-# Also, using bundled dependencies introduces build-time dependency on git.
+# Note: using bundled dependencies introduces a build-time dependency on git.
 
 option(USE_SYSTEM_CLI11 "Use system CLI11 library" OFF)
-option(USE_SYSTEM_FTXUI "Use system FTXUI library" OFF)
 option(USE_SYSTEM_UTFCPP "Use system utfcpp library" OFF)
 
 # Compiler warnings and flags
@@ -85,28 +79,6 @@ else()
     endif()
 endif()
 
-# FTXUI - Terminal UI library
-if(USE_SYSTEM_FTXUI)
-    find_package(ftxui CONFIG REQUIRED)
-else()
-    # Use bundled FTXUI
-    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/ftxui/CMakeLists.txt")
-        message(STATUS "FTXUI not found, fetching the source")
-        include(FetchContent)
-        FetchContent_Declare(
-            ftxui
-            GIT_REPOSITORY https://github.com/ArthurSonzogni/FTXUI.git
-            GIT_TAG v5.0.0
-        )
-        FetchContent_MakeAvailable(ftxui)
-    else()
-        set(FTXUI_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-        set(FTXUI_BUILD_DOCS OFF CACHE BOOL "" FORCE)
-        set(FTXUI_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
-        add_subdirectory(external/ftxui EXCLUDE_FROM_ALL)
-    endif()
-endif()
-
 # Source files
 set(SOURCES
     src/main.cpp
@@ -114,6 +86,9 @@ set(SOURCES
     src/matcher.cpp
     src/reader.cpp
     src/terminal.cpp
+    src/tty.cpp
+    src/keyparser.cpp
+    src/render.cpp
 )
 
 # Main executable
@@ -124,9 +99,6 @@ target_include_directories(fzf PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(fzf PRIVATE
     CLI11::CLI11
     utf8cpp
-    ftxui::screen
-    ftxui::dom
-    ftxui::component
     Threads::Threads
 )
 
@@ -169,5 +141,4 @@ message(STATUS "  Build Type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "  Compiler: ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
 message(STATUS "  Use System CLI11: ${USE_SYSTEM_CLI11}")
 message(STATUS "  Use System utfcpp: ${USE_SYSTEM_UTFCPP}")
-message(STATUS "  Use System FTXUI: ${USE_SYSTEM_FTXUI}")
 message(STATUS "")
