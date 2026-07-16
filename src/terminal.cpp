@@ -40,6 +40,7 @@ Terminal::Terminal(const Options& opts, Reader& reader)
       preview_target_cursor_(SIZE_MAX)
 {
     current_prompt_ = opts_.prompt;
+    current_header_ = opts_.header;
 }
 
 Terminal::~Terminal() {
@@ -666,6 +667,51 @@ bool Terminal::execute_bind_action(const std::string& action) {
         return true;  // Stub: change-preview not implemented
     }
 
+    // transform-header supports both transform-header(CMD) and the colon form
+    // transform-header:CMD (fzf's "extends to end of bind string" syntax, used
+    // when CMD needs multiple lines or unbalanced parens, e.g. a shell `case`).
+    // Try the paren form first since it's unambiguous when present.
+    if (action.find("transform-header(") == 0) {
+        size_t open = action.find('(');
+        std::string cmd;
+        size_t end;
+        if (!extract_paren_arg(action, open, cmd, end)) {
+            return false;
+        }
+
+        size_t cursor_idx;
+        {
+            std::lock_guard<std::mutex> lock(results_mutex_);
+            cursor_idx = cursor_pos_;
+        }
+        std::string final_cmd = substitute_placeholders(cmd, cursor_idx);
+        if (!opts_.with_shell.empty()) {
+            final_cmd = opts_.with_shell + " '" + final_cmd + "'";
+        }
+        current_header_ = run_command_capture_output(final_cmd);
+
+        if (end + 1 < action.length() && action[end + 1] == '+') {
+            execute_bind_action(action.substr(end + 2));
+        }
+        return true;
+    }
+
+    if (action.find("transform-header:") == 0) {
+        std::string cmd = action.substr(std::string("transform-header:").length());
+
+        size_t cursor_idx;
+        {
+            std::lock_guard<std::mutex> lock(results_mutex_);
+            cursor_idx = cursor_pos_;
+        }
+        std::string final_cmd = substitute_placeholders(cmd, cursor_idx);
+        if (!opts_.with_shell.empty()) {
+            final_cmd = opts_.with_shell + " '" + final_cmd + "'";
+        }
+        current_header_ = run_command_capture_output(final_cmd);
+        return true;
+    }
+
     return false;
 }
 
@@ -811,6 +857,26 @@ std::string Terminal::substitute_placeholders(const std::string& cmd, size_t ind
     }
 
     return result;
+}
+
+std::string Terminal::run_command_capture_output(const std::string& cmd) {
+    FILE* pipe = popen(cmd.c_str(), "r");
+    if (!pipe) {
+        return "";
+    }
+
+    std::string output;
+    std::array<char, 4096> buffer;
+    size_t bytes_read;
+    while ((bytes_read = fread(buffer.data(), 1, buffer.size(), pipe)) > 0) {
+        output.append(buffer.data(), bytes_read);
+    }
+    pclose(pipe);
+
+    if (!output.empty() && output.back() == '\n') {
+        output.pop_back();
+    }
+    return output;
 }
 
 std::string Terminal::get_cached_preview(const std::string& item_text) {
@@ -1407,6 +1473,13 @@ std::vector<std::string> Terminal::run() {
     // Initialize to current count since we just called update_results() above
     size_t last_item_count = reader_.item_count();
 
+    // Track the last focused cursor position to fire focus: exactly once per
+    // actual move (e.g. focus:transform-header(...), used to show per-item
+    // context in the header as the cursor moves). SIZE_MAX forces the first
+    // frame to count as a focus change so the binding fires for the initial
+    // selection too.
+    size_t last_focus_pos = SIZE_MAX;
+
     // Renderer
     auto renderer = Renderer(component, [&] {
         // Check if reader has new items
@@ -1429,6 +1502,24 @@ std::vector<std::string> Terminal::run() {
             auto change_it = opts_.bindings.find("change");
             if (change_it != opts_.bindings.end()) {
                 execute_bind_action(change_it->second);
+            }
+        }
+
+        // Fire the focus: event binding when the cursor lands on a new item
+        // (e.g. focus:transform-header(...), which recomputes the header from
+        // the newly-focused item via the {} placeholder).
+        {
+            size_t current_focus_pos;
+            {
+                std::lock_guard<std::mutex> lock(results_mutex_);
+                current_focus_pos = cursor_pos_;
+            }
+            if (current_focus_pos != last_focus_pos) {
+                last_focus_pos = current_focus_pos;
+                auto focus_it = opts_.bindings.find("focus");
+                if (focus_it != opts_.bindings.end()) {
+                    execute_bind_action(focus_it->second);
+                }
             }
         }
 
@@ -1627,15 +1718,15 @@ std::vector<std::string> Terminal::run() {
 
         // Build header element (if present)
         Element header_element;
-        bool has_header = !opts_.header.empty();
+        bool has_header = !current_header_.empty();
 
         if (has_header) {
             // Check if header contains ANSI codes
-            if (opts_.header.find('\x1b') != std::string::npos) {
+            if (current_header_.find('\x1b') != std::string::npos) {
                 // Strip ANSI codes from header to avoid junk display
-                header_element = text(strip_ansi_codes(opts_.header)) | bold;
+                header_element = text(strip_ansi_codes(current_header_)) | bold;
             } else {
-                header_element = text(opts_.header) | bold;
+                header_element = text(current_header_) | bold;
             }
         }
 

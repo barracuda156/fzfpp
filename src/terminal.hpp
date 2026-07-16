@@ -85,6 +85,11 @@ private:
     // Preview support
     std::string substitute_placeholders(const std::string& cmd, size_t index);
 
+    // Run a shell command synchronously and return its stdout with a single
+    // trailing newline trimmed (matching fzf's convention for transform-*
+    // actions). Returns empty string if the command can't be started.
+    static std::string run_command_capture_output(const std::string& cmd);
+
     // Terminal size and layout calculation
     void get_terminal_size(int& rows, int& cols) const;
     void calculate_preview_position(int& top, int& left, int& lines, int& cols) const;
@@ -97,6 +102,7 @@ private:
     // UI state
     std::string current_query_;
     std::string current_prompt_;  // Live prompt; starts at opts_.prompt, changed by change-prompt
+    std::string current_header_;  // Live header; starts at opts_.header, changed by transform-header
     std::vector<MatchResult> current_results_;
     size_t cursor_pos_;           // Current cursor position
     size_t scroll_offset_;        // Scroll offset for results
