@@ -286,8 +286,14 @@ bool KeyParser::try_decode_one(std::vector<KeyEvent>& out, bool force_resolve) {
                 m.shift = (code & 4) != 0;
                 m.alt = (code & 8) != 0;
                 m.ctrl = (code & 16) != 0;
-                m.x = params[1];
-                m.y = params[2];
+                // SGR mouse reports 1-based cell coordinates (top-left is 1;1),
+                // but the renderer's frame coordinates are 0-based (move_to emits
+                // row+1/col+1). Convert here so mouse.x/mouse.y share the frame's
+                // 0-based origin that every consumer (click hit-testing against
+                // content_top/results_start_y) assumes. Without this the click
+                // landed one row too low — selecting the item below the click.
+                m.x = params[1] > 0 ? params[1] - 1 : 0;
+                m.y = params[2] > 0 ? params[2] - 1 : 0;
                 out.push_back(KeyEvent::make_mouse(m));
             }
             pending_.erase(0, i + 1);

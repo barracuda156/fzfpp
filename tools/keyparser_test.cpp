@@ -226,14 +226,17 @@ void test_multiple_events_in_one_feed() {
 }
 
 void test_sgr_mouse_left_click() {
-    // \x1b[<0;10;5M -> button 0 (left), press, x=10, y=5, no modifiers.
+    // \x1b[<0;10;5M -> button 0 (left), press, SGR reports 1-based col=10 row=5.
+    // The parser converts to 0-based frame coordinates (col=9, row=4) so mouse
+    // events share the renderer's 0-based origin used for click hit-testing.
     auto events = feed_all("\x1b[<0;10;5M");
     check(events.size() == 1, "SGR mouse left-click yields one event");
     if (events.size() == 1) {
         check(events[0].type == KeyType::Mouse, "mouse event type");
         check(events[0].mouse.button == MouseInfo::Button::Left, "left button decoded");
         check(events[0].mouse.motion == MouseInfo::Motion::Pressed, "press motion decoded");
-        check(events[0].mouse.x == 10 && events[0].mouse.y == 5, "mouse coordinates decoded");
+        check(events[0].mouse.x == 9 && events[0].mouse.y == 4,
+              "mouse coordinates decoded to 0-based");
         check(!events[0].mouse.shift && !events[0].mouse.alt && !events[0].mouse.ctrl,
               "no modifiers set");
     }
