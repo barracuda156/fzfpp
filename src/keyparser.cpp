@@ -111,6 +111,48 @@ bool KeyParser::try_decode_one(std::vector<KeyEvent>& out, bool force_resolve) {
 
         char c1 = pending_[1];
 
+        // String-terminated sequences: OSC (ESC ]), DCS (ESC P), APC (ESC _),
+        // PM (ESC ^) and SOS (ESC X). These carry a payload that runs until a
+        // String Terminator — ST (ESC \) or, for OSC, a BEL (0x07). Terminals
+        // emit them unsolicited (e.g. an OSC 11 "rgb:ffff/ffff/ffff" reply to a
+        // background-color query issued by chafa/tmux/the shell), and the reply
+        // lands on our input stream. Without this, ESC ] fell through to the
+        // Alt+key branch below: it consumed only "ESC ]" as alt-], then the
+        // "11;rgb:ffff/ffff/ffff" tail leaked through as literal characters and
+        // corrupted the query line (the "11;rgb;ffff/ffff/ffff" garbage seen in
+        // ytsurf). Consume the whole sequence and drop it.
+        if (c1 == ']' || c1 == 'P' || c1 == '_' || c1 == '^' || c1 == 'X') {
+            // Scan from byte 2 for the terminator.
+            for (size_t j = 2; j < pending_.size(); ++j) {
+                unsigned char b = static_cast<unsigned char>(pending_[j]);
+                if (b == 0x07) {  // BEL terminates (common for OSC)
+                    pending_.erase(0, j + 1);
+                    return true;
+                }
+                if (b == 0x1b && j + 1 < pending_.size() && pending_[j + 1] == '\\') {
+                    pending_.erase(0, j + 2);  // ST = ESC '\'
+                    return true;
+                }
+                if (b == 0x9c) {  // single-byte ST (8-bit C1)
+                    pending_.erase(0, j + 1);
+                    return true;
+                }
+                // A bare ESC at the end could be the start of ST; wait for the
+                // next byte unless we're forced to resolve now.
+                if (b == 0x1b && j + 1 >= pending_.size() && !force_resolve) {
+                    return false;
+                }
+            }
+            // Terminator not seen yet.
+            if (force_resolve) {
+                // Give up waiting; discard the partial sequence so its bytes
+                // never leak into the query.
+                pending_.clear();
+                return true;
+            }
+            return false;  // wait for more bytes to complete the sequence
+        }
+
         // Alt+letter: ESC followed by a single printable byte, not '[' or 'O'.
         // fzf's convention (matching event_to_bind_key's "alt-<letter>" ==
         // "\x1b" + letter check) is to carry both bytes on one event rather

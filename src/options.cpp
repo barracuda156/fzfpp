@@ -134,6 +134,18 @@ Options parse_options(int argc, char* argv[]) {
             case_sensitive_flag = true;
         } else if (arg == "+m") {
             no_multi_flag = true;
+        } else if (arg.size() > 2 && arg.compare(0, 2, "--") == 0 &&
+                   arg.back() == '=' &&
+                   arg.find('=') == arg.size() - 1) {
+            // `--opt=` with an empty right-hand side is an explicit empty-string
+            // assignment in fzf (e.g. yt-x's `--border-label=''`). CLI11 2.6.2
+            // treats an empty `=value` as "no value given" and then reaches
+            // forward to swallow the NEXT argument as the value — so
+            // `--border-label= -f query` ate the `-f`, silently disabling filter
+            // mode and aborting on /dev/tty. Split it into the option and a
+            // separate empty-string token, which CLI11 consumes as the value.
+            arg_storage.push_back(arg.substr(0, arg.size() - 1));
+            arg_storage.push_back(std::string());
         } else {
             arg_storage.push_back(arg);
         }
@@ -209,16 +221,27 @@ Options parse_options(int argc, char* argv[]) {
     // (rounded) border, `--border=STYLE` selects a style. Declaring it as a plain
     // flag made CLI11 try to convert the "=rounded" value to bool and abort
     // ("Could not convert: --border = true,rounded"), which broke yt-x and viu.
+    //
+    // fzf also lets the option be REPEATED, with the last occurrence winning —
+    // yt-x's FZF_DEFAULT_OPTS literally carries both `--border` and
+    // `--border=rounded`. CLI11 caps an option's total value count at its
+    // `expected` max across all occurrences, so `expected(0,1)` rejected the
+    // second one ("At most 1 required but received 2"). Accept any number of
+    // values (0 or 1 per occurrence, unbounded occurrences) and use the last
+    // non-empty style seen.
     app.add_option_function<std::vector<std::string>>(
         "--border",
         [&opts](const std::vector<std::string>& vals) {
             opts.border = true;
-            if (!vals.empty() && !vals.back().empty()) {
-                opts.border_style = vals.back();
+            for (auto it = vals.rbegin(); it != vals.rend(); ++it) {
+                if (!it->empty()) {
+                    opts.border_style = *it;
+                    break;
+                }
             }
         },
         "Draw border around interface (optional style, e.g. rounded/sharp/none)")
-        ->expected(0, 1);
+        ->expected(0, -1);
 
 
     app.add_flag("--wrap", opts.wrap, "Enable line wrapping");

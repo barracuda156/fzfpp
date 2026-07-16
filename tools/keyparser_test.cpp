@@ -258,6 +258,51 @@ void test_sgr_mouse_modifiers_and_ctrl_bit() {
     }
 }
 
+// --- String-terminated sequences (OSC/DCS/APC/PM/SOS) ---
+// Regression guard for the ytsurf "11;rgb;ffff/ffff/ffff" garbage: an
+// unsolicited OSC background-color reply arriving on our input must be
+// consumed whole, not mis-decoded as alt-] followed by literal characters.
+
+void test_osc_bel_terminated_is_dropped() {
+    // OSC 11 reply as a terminal would send it, BEL-terminated.
+    auto events = feed_all("\x1b]11;rgb:ffff/ffff/ffff\x07");
+    check(events.empty(), "BEL-terminated OSC reply produces no events");
+}
+
+void test_osc_st_terminated_is_dropped() {
+    // Same reply, ST-terminated (ESC '\').
+    auto events = feed_all("\x1b]11;rgb:1a1a/2b2b/3c3c\x1b\\");
+    check(events.empty(), "ST-terminated OSC reply produces no events");
+}
+
+void test_osc_then_real_key() {
+    // An OSC reply immediately followed by a genuine keypress: the reply is
+    // swallowed and only the keypress surfaces.
+    auto events = feed_all("\x1b]11;rgb:ffff/ffff/ffff\x07x");
+    check(events.size() == 1, "OSC reply + 'x' yields exactly one event");
+    if (events.size() == 1) {
+        check(events[0].type == KeyType::Character && events[0].input == "x",
+              "the surviving event is the real 'x' keypress");
+    }
+}
+
+void test_osc_split_across_feeds() {
+    // The reply can be delivered in pieces; nothing should leak mid-stream.
+    KeyParser p;
+    auto e1 = p.feed("\x1b]11;rgb:ffff");
+    check(e1.empty(), "partial OSC produces nothing yet");
+    check(p.has_pending(), "partial OSC leaves pending state");
+    auto e2 = p.feed("/ffff/ffff\x07");
+    check(e2.empty(), "completing the OSC still yields no events");
+    check(!p.has_pending(), "pending cleared after OSC completes");
+}
+
+void test_dcs_is_dropped() {
+    // DCS (ESC P ... ST), e.g. a DECRQSS / terminfo query reply.
+    auto events = feed_all("\x1bP1$r0m\x1b\\");
+    check(events.empty(), "DCS reply produces no events");
+}
+
 } // namespace
 
 int main() {
@@ -275,6 +320,11 @@ int main() {
     test_sgr_mouse_release();
     test_sgr_mouse_wheel();
     test_sgr_mouse_modifiers_and_ctrl_bit();
+    test_osc_bel_terminated_is_dropped();
+    test_osc_st_terminated_is_dropped();
+    test_osc_then_real_key();
+    test_osc_split_across_feeds();
+    test_dcs_is_dropped();
 
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
