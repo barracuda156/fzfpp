@@ -255,6 +255,67 @@ void write_raw_passthrough(int fd, int row, int col, const std::string& raw_byte
     write_all(fd, out);
 }
 
+namespace {
+
+// An escape sequence found SPLICED inside a DCS/sixel raster (chafa interleaves
+// terminal probes with the image bytes it streams). Given `line[start]` == ESC,
+// return the index one past the sequence in `*seg_end`, and whether it should be
+// KEPT (forwarded to the terminal) rather than dropped.
+//
+// Kept: a real image OSC (e.g. iTerm2 ESC]1337;File=…) — its ST is genuine data
+// we must not lose. Dropped: terminal-QUERY OSCs (ESC]10;? ESC]11;? ESC]4;N;?,
+// body ends in '?') and capability CSIs (ESC[18t window size, ESC[0c DA1) that
+// chafa emits to detect the terminal — forwarding them makes the terminal reply
+// onto fzf's stdin. Other lone escapes are dropped too. Never returns `start`
+// (always makes progress) so the caller's scan can't stall.
+bool spliced_sequence_kept(const std::string& line, size_t start, size_t n,
+                           size_t& seg_end) {
+    unsigned char intro = start + 1 < n
+                              ? static_cast<unsigned char>(line[start + 1])
+                              : 0;
+    if (intro == '[') {
+        // CSI: ESC [ params/intermediates final(0x40-0x7E). Always a
+        // cursor/capability control here — never image data. Drop it.
+        size_t j = start + 2;
+        while (j < n) {
+            unsigned char b = static_cast<unsigned char>(line[j]);
+            if (b >= 0x40 && b <= 0x7E) { j++; break; }
+            j++;
+        }
+        seg_end = j;
+        return false;
+    }
+    if (intro == ']' || intro == 'P' || intro == '_' || intro == '^' ||
+        intro == 'X') {
+        // Nested string sequence. Scan to its own ST/BEL.
+        size_t body_start = start + 2;
+        size_t j = body_start;
+        size_t term_start = n;
+        while (j < n) {
+            unsigned char b = static_cast<unsigned char>(line[j]);
+            if (b == 0x07 || b == 0x9c) { term_start = j; j++; break; }
+            if (b == '\x1b' && j + 1 < n &&
+                static_cast<unsigned char>(line[j + 1]) == '\\') {
+                term_start = j; j += 2; break;
+            }
+            j++;
+        }
+        seg_end = j;
+        // Keep only a real image OSC: an OSC whose body does NOT end in '?'.
+        // Query OSCs (…?ST) are probes — drop. Non-OSC string seqs spliced
+        // mid-raster aren't image data we can trust; drop them too.
+        bool is_osc = (intro == ']');
+        bool is_query = term_start > body_start &&
+                        static_cast<unsigned char>(line[term_start - 1]) == '?';
+        return is_osc && !is_query;
+    }
+    // Lone two-byte escape (or trailing ESC): drop it.
+    seg_end = std::min(start + 2, n);
+    return false;
+}
+
+} // namespace
+
 std::string sanitize_preview_line(const std::string& line) {
     std::string out;
     out.reserve(line.size());
@@ -292,14 +353,61 @@ std::string sanitize_preview_line(const std::string& line) {
                 break;
             }
 
-            if (next == ']' || next == 'P' || next == '_' ||
-                next == '^' || next == 'X') {
-                // String-terminated sequence: OSC / DCS / APC / PM / SOS.
-                // These carry sixel and kitty-graphics payloads (the whole
-                // point of the direct-terminal backend), so pass the entire
-                // sequence — including its data bytes — through verbatim, up
-                // to ST (ESC \ or 0x9c) or BEL. Data bytes are not scanned
-                // for escapes, so an 'H'/'J' inside a sixel payload is safe.
+            if (next == 'P' || next == '_' || next == '^' || next == 'X') {
+                // DCS / APC / PM / SOS — carries sixel and kitty-graphics
+                // payloads (the whole point of the direct-terminal backend).
+                // Pass the intro + data bytes through verbatim up to ST
+                // (ESC \ / 0x9c) or BEL. Data bytes are otherwise opaque: an
+                // 'H'/'J' inside a sixel payload is data, not a cursor move.
+                //
+                // ONE exception. A real sixel/DCS payload never contains a
+                // raw ESC except the terminating ST — but chafa splices its
+                // color/size PROBES (ESC]10;? ESC]11;? ESC[18t ESC[0c …) into
+                // the MIDDLE of the raster it streams. If we treated the first
+                // ESC as the DCS terminator we'd (a) stop the sixel early,
+                // forwarding the probe's own ESC\ ST as if it closed the DCS,
+                // and (b) forward the probe itself — the terminal then replies
+                // onto fzf's stdin and mlterm spews garbage (the reported
+                // ytsurf bug). So while scanning the DCS payload, when we meet
+                // an ESC that ISN'T the ST (ESC\), skip that whole spliced
+                // sequence in place — dropping probe OSC/CSI, keeping any real
+                // image OSC — and keep the surrounding sixel data contiguous.
+                out.push_back('\x1b');
+                out.push_back(static_cast<char>(next));
+                size_t j = i + 2;
+                while (j < n) {
+                    unsigned char b = static_cast<unsigned char>(line[j]);
+                    if (b == 0x07 || b == 0x9c) {  // BEL / 8-bit ST: end DCS
+                        out.push_back(static_cast<char>(b));
+                        j++;
+                        break;
+                    }
+                    if (b == '\x1b') {
+                        if (j + 1 < n &&
+                            static_cast<unsigned char>(line[j + 1]) == '\\') {
+                            out.append("\x1b\\", 2);  // 7-bit ST: end DCS
+                            j += 2;
+                            break;
+                        }
+                        // A spliced escape sequence inside the raster. Consume
+                        // it without ending the DCS: append it only if it's a
+                        // real image OSC (not a terminal-query probe), then
+                        // resume streaming sixel data.
+                        size_t seg_end;
+                        bool keep = spliced_sequence_kept(line, j, n, seg_end);
+                        if (keep) out.append(line, j, seg_end - j);
+                        j = seg_end;
+                        continue;
+                    }
+                    out.push_back(static_cast<char>(b));
+                    j++;
+                }
+                i = j;
+                continue;
+            }
+
+            if (next == ']') {
+                // OSC. Scan to ST (ESC \ / 0x9c) or BEL.
                 size_t body_start = i + 2;
                 size_t j = body_start;
                 size_t term_start = n;  // index of the terminator (ST/BEL)
@@ -327,10 +435,8 @@ std::string sanitize_preview_line(const std::string& line) {
                 // send REPLIES onto fzf's stdin, corrupting the query/keys. A
                 // query is an OSC whose body ends in '?' right before the
                 // terminator. Image OSCs (ESC]1337;File=…) never do, so they
-                // still pass through. DCS/APC/PM/SOS (sixel, kitty) are not
-                // color queries and pass through unchanged.
-                bool is_osc = (next == ']');
-                bool is_query = is_osc && term_start > body_start &&
+                // still pass through.
+                bool is_query = term_start > body_start &&
                                 static_cast<unsigned char>(line[term_start - 1]) == '?';
                 if (!is_query) {
                     out.append(line, i, j - i);
