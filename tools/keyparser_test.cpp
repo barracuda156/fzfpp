@@ -151,8 +151,19 @@ void test_bare_escape_via_timeout() {
     check(events.empty(), "bare ESC produces nothing before timeout");
     check(p.has_pending(), "bare ESC leaves pending state");
 
+    // A bare lone ESC now gets ONE grace tick before resolving to Escape: its
+    // continuation (a CSI/OSC/DCS introducer) may be arriving in the next read,
+    // split across the escape timeout (e.g. chafa's terminal probes trickling
+    // onto stdin). The first tick holds; the second resolves the still-bare ESC
+    // as a genuine keypress. This adds at most one timeout window (~50 ms) of
+    // latency to a real Esc press but stops a split control sequence's tail from
+    // leaking into the query as literal text.
+    auto tick1 = p.timeout_tick(KeyParser::kEscapeTimeoutMs);
+    check(tick1.empty(), "bare ESC holds for one grace tick");
+    check(p.has_pending(), "bare ESC still pending after first tick");
+
     auto timeout_events = p.timeout_tick(KeyParser::kEscapeTimeoutMs);
-    check(timeout_events.size() == 1, "bare ESC resolves after timeout");
+    check(timeout_events.size() == 1, "bare ESC resolves after second timeout tick");
     if (timeout_events.size() == 1) {
         check(timeout_events[0].type == KeyType::Special, "resolved ESC is Special type");
         check(timeout_events[0].special == SpecialKey::Escape, "resolved ESC key matches");
@@ -303,6 +314,64 @@ void test_dcs_is_dropped() {
     check(events.empty(), "DCS reply produces no events");
 }
 
+// The exact terminal-probe cluster chafa writes to the controlling tty when its
+// stdout is a pipe (OSC fg/bg color queries + CSI window-size/DA1 capability
+// probes). These land on fzf's stdin. Split across the escape timeout they used
+// to leak their tail into the query as literal text (the "]10;?...[18t[0c"
+// garbage on the prompt line during a preview load). None of these bytes may
+// ever surface as a Character event, no matter how the cluster is fragmented.
+const char* kProbeCluster =
+    "\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b[18t\x1b[14t\x1b[16t\x1b[0c";
+
+int count_characters(const std::vector<KeyEvent>& evs) {
+    int n = 0;
+    for (const auto& e : evs) if (e.type == KeyType::Character) n++;
+    return n;
+}
+
+void test_probe_cluster_one_feed() {
+    auto events = feed_all(kProbeCluster);
+    check(events.empty(), "chafa probe cluster in one feed produces no events");
+}
+
+void test_probe_cluster_split_across_feeds() {
+    // A fragmented-but-continuous stream: the run-loop's select() reports input
+    // ready, so each fragment arrives via feed() with NO timeout tick between
+    // (a tick only fires on genuine silence). No Character may leak at any split
+    // point.
+    const std::string cluster(kProbeCluster);
+    bool any_leak = false;
+    for (size_t k = 1; k < cluster.size(); ++k) {
+        KeyParser p;
+        std::vector<KeyEvent> evs;
+        auto a = p.feed(cluster.substr(0, k));
+        auto b = p.feed(cluster.substr(k));
+        evs.insert(evs.end(), a.begin(), a.end());
+        evs.insert(evs.end(), b.begin(), b.end());
+        if (count_characters(evs) != 0) any_leak = true;
+    }
+    check(!any_leak, "probe cluster never leaks a character at any feed split");
+}
+
+void test_probe_cluster_pause_between_groups() {
+    // The realistic timeout case: chafa writes its OSC color queries, pauses
+    // (fzf's select() times out → timeout_tick), then writes the CSI capability
+    // queries. The pause straddles the escape timeout; still nothing may leak.
+    const std::string cluster(kProbeCluster);
+    size_t split = cluster.find("\x1b[18t");  // OSC group | CSI group boundary
+    KeyParser p;
+    std::vector<KeyEvent> evs;
+    auto a = p.feed(cluster.substr(0, split));
+    auto t = p.timeout_tick(KeyParser::kEscapeTimeoutMs);
+    auto t2 = p.timeout_tick(KeyParser::kEscapeTimeoutMs);
+    auto b = p.feed(cluster.substr(split));
+    auto t3 = p.timeout_tick(KeyParser::kEscapeTimeoutMs);
+    auto t4 = p.timeout_tick(KeyParser::kEscapeTimeoutMs);
+    for (auto* v : {&a, &t, &t2, &b, &t3, &t4})
+        evs.insert(evs.end(), v->begin(), v->end());
+    check(count_characters(evs) == 0, "probe cluster with a pause between groups leaks nothing");
+}
+
 } // namespace
 
 int main() {
@@ -325,6 +394,9 @@ int main() {
     test_osc_then_real_key();
     test_osc_split_across_feeds();
     test_dcs_is_dropped();
+    test_probe_cluster_one_feed();
+    test_probe_cluster_split_across_feeds();
+    test_probe_cluster_pause_between_groups();
 
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

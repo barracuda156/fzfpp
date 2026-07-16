@@ -102,12 +102,32 @@ bool KeyParser::try_decode_one(std::vector<KeyEvent>& out, bool force_resolve) {
     if (c0 == 0x1b) {
         if (pending_.size() < 2) {
             if (force_resolve) {
+                // A bare lone ESC times out. It's EITHER a real Esc keypress OR
+                // the split head of a control sequence (an arrow key, or chafa's
+                // terminal probes arriving on our stdin) whose introducer byte is
+                // still in flight. The run-loop only force-resolves after select()
+                // saw NO input for a whole timeout window, so a continuation that
+                // was really coming arrives via feed() (select ready) rather than
+                // triggering this tick. We still hedge ONE extra window: hold the
+                // ESC on the first timeout; if the introducer lands during the
+                // hold, feed() appends it to the still-pending ESC and the whole
+                // sequence is parsed as a unit (a probe/reply is then dropped) —
+                // so its tail can never leak into the query as literal text, and
+                // crucially no spurious Escape is emitted. Only a SECOND timeout
+                // with the ESC still bare (a full ~2× window of real silence)
+                // resolves it to a genuine Esc keypress.
+                if (!lone_esc_pending_) {
+                    lone_esc_pending_ = true;
+                    return false;  // hold one window; wait for introducer / more silence
+                }
+                lone_esc_pending_ = false;
                 out.push_back(KeyEvent::make_special(SpecialKey::Escape, pending_));
                 pending_.clear();
                 return true;
             }
             return false;  // wait for more bytes (could be CSI/SS3/Alt+key)
         }
+        lone_esc_pending_ = false;  // introducer present; no longer a bare ESC
 
         char c1 = pending_[1];
 
@@ -143,10 +163,13 @@ bool KeyParser::try_decode_one(std::vector<KeyEvent>& out, bool force_resolve) {
                     return false;
                 }
             }
-            // Terminator not seen yet.
+            // Terminator not seen yet. If more bytes may still come, wait. On a
+            // forced resolve, discard the partial silently — its body must never
+            // leak into the query. (A real OSC/DCS reply or chafa probe arrives
+            // as one contiguous burst, so its ST lands in the same or the very
+            // next read; a forced resolve here means the stream genuinely
+            // stalled mid-sequence, and dropping it is correct.)
             if (force_resolve) {
-                // Give up waiting; discard the partial sequence so its bytes
-                // never leak into the query.
                 pending_.clear();
                 return true;
             }
@@ -205,9 +228,15 @@ bool KeyParser::try_decode_one(std::vector<KeyEvent>& out, bool force_resolve) {
         }
         if (i >= pending_.size()) {
             if (force_resolve) {
-                // Incomplete CSI with nothing more coming; treat the ESC as
-                // a lone Escape keypress and drop the rest as unrecognized.
-                out.push_back(KeyEvent::make_special(SpecialKey::Escape, pending_));
+                // Incomplete CSI (ESC [ … with no final byte yet). A human can't
+                // type ESC[ as a keypress — this is a machine sequence (arrow
+                // key, or a terminal capability probe/reply like ESC[18t / ESC[0c
+                // from chafa) whose final byte hasn't arrived. Emitting Escape +
+                // clearing orphans the tail so it leaks into the query as literal
+                // text ("[18t" etc.). Discard the partial silently instead — its
+                // bytes must never surface as characters. (A genuine arrow key
+                // arrives as one read burst, well inside the timeout, so this
+                // only ever drops a stalled machine sequence.)
                 pending_.clear();
                 return true;
             }

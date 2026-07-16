@@ -47,6 +47,14 @@ private:
     bool try_decode_one(std::vector<KeyEvent>& out, bool force_resolve);
 
     std::string pending_;
+    // A bare lone ESC that hit the escape timeout once and is being held for one
+    // extra window before it resolves to an Escape keypress — so a control
+    // sequence whose introducer is split just after its ESC has time to land
+    // (via the next feed(), appended to this still-pending ESC) and be parsed as
+    // a sequence and dropped, rather than leaking its tail into the query as
+    // literal text or emitting a spurious Escape. Reset the moment a second byte
+    // joins the ESC or the ESC is finally resolved.
+    bool lone_esc_pending_ = false;
 };
 
 } // namespace fzf
