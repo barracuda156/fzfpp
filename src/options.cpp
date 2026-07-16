@@ -80,6 +80,17 @@ static std::vector<FieldRange> parse_nth_spec(const std::string& spec) {
         if (a == std::string::npos) continue;
         term = term.substr(a, b - a + 1);
 
+        // Tolerate a brace-wrapped spec: yt-x passes --with-nth/--accept-nth as
+        // "{2..}" (with the placeholder braces), and fzf accepts that as the
+        // field range 2... Without stripping the braces, to_int("{2") failed and
+        // the whole term was rejected ("Invalid field range: {2..}"), so
+        // --accept-nth was ignored and fzf echoed the full delimited line
+        // (field1|title) instead of just the title — breaking yt-x downstream.
+        if (term.size() >= 2 && term.front() == '{' && term.back() == '}') {
+            term = term.substr(1, term.size() - 2);
+        }
+        if (term.empty()) continue;
+
         FieldRange r;
         size_t dots = term.find("..");
         if (dots == std::string::npos) {
