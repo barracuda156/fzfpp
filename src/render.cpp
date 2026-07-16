@@ -257,61 +257,131 @@ void write_raw_passthrough(int fd, int row, int col, const std::string& raw_byte
 
 namespace {
 
-// An escape sequence found SPLICED inside a DCS/sixel raster (chafa interleaves
-// terminal probes with the image bytes it streams). Given `line[start]` == ESC,
-// return the index one past the sequence in `*seg_end`, and whether it should be
-// KEPT (forwarded to the terminal) rather than dropped.
+// Classify one escape sequence that begins at `line[start]` (== ESC). Sets
+// `*seg_end` to one past the sequence, `*kept` to whether it should be forwarded
+// to the terminal (vs dropped), and `*seq_terminated` to whether the sequence
+// actually reached its own terminator within [start,n) (false = the buffer was
+// cut mid-sequence by a streaming chunk boundary). Never leaves seg_end==start
+// (always makes progress) so a caller's scan can't stall.
 //
-// Kept: a real image OSC (e.g. iTerm2 ESC]1337;File=…) — its ST is genuine data
-// we must not lose. Dropped: terminal-QUERY OSCs (ESC]10;? ESC]11;? ESC]4;N;?,
-// body ends in '?') and capability CSIs (ESC[18t window size, ESC[0c DA1) that
-// chafa emits to detect the terminal — forwarding them makes the terminal reply
-// onto fzf's stdin. Other lone escapes are dropped too. Never returns `start`
-// (always makes progress) so the caller's scan can't stall.
-bool spliced_sequence_kept(const std::string& line, size_t start, size_t n,
-                           size_t& seg_end) {
+// Used two ways: (1) to drop chafa's terminal PROBES that are SPLICED into a
+// sixel raster (query OSCs whose body ends '?', capability CSIs like ESC[18t /
+// ESC[0c) while KEEPING a real image OSC (ESC]1337;File=…, no '?'); (2) to tell
+// whether a spliced sub-sequence at the tail is complete, so a partially
+// streamed image is correctly held back rather than painted truncated.
+void classify_escape_seq(const std::string& line, size_t start, size_t n,
+                         size_t* seg_end, bool* kept, bool* seq_terminated) {
     unsigned char intro = start + 1 < n
                               ? static_cast<unsigned char>(line[start + 1])
                               : 0;
     if (intro == '[') {
-        // CSI: ESC [ params/intermediates final(0x40-0x7E). Always a
-        // cursor/capability control here — never image data. Drop it.
+        // CSI: ESC [ params/intermediates final(0x40-0x7E). A cursor/capability
+        // control here (never image data) — drop it.
         size_t j = start + 2;
+        bool term = false;
         while (j < n) {
             unsigned char b = static_cast<unsigned char>(line[j]);
-            if (b >= 0x40 && b <= 0x7E) { j++; break; }
+            if (b >= 0x40 && b <= 0x7E) { j++; term = true; break; }
             j++;
         }
-        seg_end = j;
-        return false;
+        *seg_end = j;
+        *kept = false;
+        *seq_terminated = term;
+        return;
     }
     if (intro == ']' || intro == 'P' || intro == '_' || intro == '^' ||
         intro == 'X') {
-        // Nested string sequence. Scan to its own ST/BEL.
+        // String sequence (OSC / DCS / APC / PM / SOS). Scan to its own ST/BEL.
         size_t body_start = start + 2;
         size_t j = body_start;
         size_t term_start = n;
+        bool term = false;
         while (j < n) {
             unsigned char b = static_cast<unsigned char>(line[j]);
-            if (b == 0x07 || b == 0x9c) { term_start = j; j++; break; }
+            if (b == 0x07 || b == 0x9c) { term_start = j; j++; term = true; break; }
             if (b == '\x1b' && j + 1 < n &&
                 static_cast<unsigned char>(line[j + 1]) == '\\') {
-                term_start = j; j += 2; break;
+                term_start = j; j += 2; term = true; break;
             }
             j++;
         }
-        seg_end = j;
+        *seg_end = j;
+        *seq_terminated = term;
         // Keep only a real image OSC: an OSC whose body does NOT end in '?'.
         // Query OSCs (…?ST) are probes — drop. Non-OSC string seqs spliced
-        // mid-raster aren't image data we can trust; drop them too.
+        // mid-raster aren't trustworthy image data — drop them too.
         bool is_osc = (intro == ']');
         bool is_query = term_start > body_start &&
                         static_cast<unsigned char>(line[term_start - 1]) == '?';
-        return is_osc && !is_query;
+        *kept = is_osc && !is_query;
+        return;
     }
-    // Lone two-byte escape (or trailing ESC): drop it.
-    seg_end = std::min(start + 2, n);
-    return false;
+    // Lone two-byte escape, or a trailing lone ESC (chunk cut before we even
+    // know the introducer). Drop it; treat a bare trailing ESC as unterminated.
+    if (start + 1 >= n) {
+        *seg_end = n;
+        *kept = false;
+        *seq_terminated = false;
+        return;
+    }
+    *seg_end = std::min(start + 2, n);
+    *kept = false;
+    *seq_terminated = true;
+}
+
+// Thin wrapper kept for sanitize_preview_line's DCS loop: does this spliced
+// sub-sequence get forwarded?
+bool spliced_sequence_kept(const std::string& line, size_t start, size_t n,
+                           size_t& seg_end) {
+    bool kept = false, term = false;
+    classify_escape_seq(line, start, n, &seg_end, &kept, &term);
+    return kept;
+}
+
+// Find the end of a DCS/APC/PM/SOS payload (sixel / kitty graphics) beginning at
+// `content[start]` (ESC + introducer P/_/^/X). A real DCS payload's ONLY raw ESC
+// is its terminating ST (ESC \); but chafa SPLICES terminal-probe sequences
+// (ESC]10;? with its own ESC\, ESC[18t, …) into the raster mid-stream. A spliced
+// probe's ESC\ must NOT be mistaken for the DCS terminator — that early stop is
+// what let a still-loading (truncated) image get painted as garbage. So we skip
+// each spliced sub-sequence whole and keep scanning for the DCS's OWN ST/BEL.
+//
+// Returns the index one past the DCS terminator, and sets *terminated. If the
+// buffer ends before a real terminator — image still streaming, OR a spliced
+// sub-sequence at the tail is itself cut — returns the remaining length with
+// *terminated=false so the caller holds the blob back.
+size_t dcs_seq_end(const std::string& content, size_t start, bool* terminated) {
+    const size_t n = content.size();
+    size_t j = start + 2;  // skip ESC + introducer
+    while (j < n) {
+        unsigned char b = static_cast<unsigned char>(content[j]);
+        if (b == 0x07 || b == 0x9c) {  // BEL / 8-bit ST: real DCS terminator
+            if (terminated) *terminated = true;
+            return j - start + 1;
+        }
+        if (b == '\x1b') {
+            if (j + 1 < n &&
+                static_cast<unsigned char>(content[j + 1]) == '\\') {
+                if (terminated) *terminated = true;
+                return j - start + 2;  // 7-bit ST: ESC \ — real DCS terminator
+            }
+            // A spliced sub-sequence (or a trailing lone ESC). Skip it whole; if
+            // IT is unterminated (tail of a streaming chunk), the whole DCS is
+            // unterminated — hold it back.
+            size_t seg_end;
+            bool kept, sub_term;
+            classify_escape_seq(content, j, n, &seg_end, &kept, &sub_term);
+            if (!sub_term) {
+                if (terminated) *terminated = false;
+                return n - start;
+            }
+            j = seg_end;
+            continue;
+        }
+        j++;
+    }
+    if (terminated) *terminated = false;
+    return n - start;  // unterminated — image still streaming
 }
 
 } // namespace
@@ -491,8 +561,21 @@ namespace {
 // sixel terminals (mlterm) spew the raw payload as garbage. The caller holds
 // an unterminated trailing blob back until a later repaint carries its ST/BEL.
 size_t string_seq_len(const std::string& content, size_t start, bool* terminated) {
-    size_t j = start + 2;  // skip ESC + introducer
     const size_t n = content.size();
+    unsigned char intro = start + 1 < n
+                              ? static_cast<unsigned char>(content[start + 1])
+                              : 0;
+    // DCS/APC/PM/SOS (sixel, kitty graphics) can have chafa's terminal probes
+    // SPLICED into the raster; a probe carries its own ESC\ that must not be
+    // taken as the DCS terminator, or a still-streaming (truncated) image gets
+    // mis-flagged "terminated" and painted as garbage. dcs_seq_end skips spliced
+    // sub-sequences and reports termination on the DCS's OWN ST only.
+    if (intro == 'P' || intro == '_' || intro == '^' || intro == 'X') {
+        return dcs_seq_end(content, start, terminated);
+    }
+    // OSC (ESC ]) — iTerm2 1337 images and the like. A single ST-terminated
+    // sequence; scan straight to its ST/BEL.
+    size_t j = start + 2;  // skip ESC + introducer
     while (j < n) {
         unsigned char b = static_cast<unsigned char>(content[j]);
         if (b == 0x07 || b == 0x9c) {  // BEL / 8-bit ST
