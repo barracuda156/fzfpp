@@ -93,47 +93,94 @@ def run_fzf(fzf_path, args, rows, cols, feed_lines, drain_s=2.0, nudge=None,
     return buf.decode(errors="replace")
 
 
+def _is_extended_pictographic(cp):
+    """Mirrors is_extended_pictographic() in render.cpp: the emoji-supplement
+    block plus legacy dingbat/symbol codepoints with default emoji
+    presentation. Keep in sync with that function."""
+    return (0x1f300 <= cp <= 0x1faff) or \
+        (0x2614 <= cp <= 0x2615) or (0x2648 <= cp <= 0x2653) or \
+        cp == 0x267f or cp == 0x2693 or cp == 0x26a1 or \
+        (0x26aa <= cp <= 0x26ab) or (0x26bd <= cp <= 0x26be) or \
+        (0x26c4 <= cp <= 0x26c5) or cp == 0x26ce or cp == 0x26d4 or \
+        cp == 0x26ea or (0x26f2 <= cp <= 0x26f3) or cp == 0x26f5 or \
+        cp == 0x26fa or cp == 0x26fd or cp == 0x2705 or \
+        (0x270a <= cp <= 0x270b) or cp == 0x2728 or cp == 0x274c or \
+        cp == 0x274e or (0x2753 <= cp <= 0x2755) or cp == 0x2757 or \
+        (0x2795 <= cp <= 0x2797) or cp == 0x27b0 or cp == 0x27bf or \
+        (0x2b1b <= cp <= 0x2b1c) or cp == 0x2b50 or cp == 0x2b55
+
+
+def _codepoint_width(cp):
+    """Mirrors codepoint_width() in render.cpp. Keep in sync with that
+    function."""
+    if cp == 0 or cp < 0x20 or (0x7f <= cp < 0xa0):
+        return 0
+    if (0x0300 <= cp <= 0x036f) or (0x200b <= cp <= 0x200f) or \
+       (0xfe00 <= cp <= 0xfe0f) or cp == 0xfeff or \
+       (0x1f3fb <= cp <= 0x1f3ff):
+        return 0
+    if (0x1100 <= cp <= 0x115f) or (0x2e80 <= cp <= 0x303e) or \
+       (0x3041 <= cp <= 0x33ff) or (0x3400 <= cp <= 0x4dbf) or \
+       (0x4e00 <= cp <= 0x9fff) or (0xa000 <= cp <= 0xa4cf) or \
+       (0xac00 <= cp <= 0xd7a3) or (0xf900 <= cp <= 0xfaff) or \
+       (0xfe30 <= cp <= 0xfe4f) or (0xff00 <= cp <= 0xff60) or \
+       (0xffe0 <= cp <= 0xffe6) or (0x1f1e6 <= cp <= 0x1f1ff) or \
+       (0x20000 <= cp <= 0x3fffd):
+        return 2
+    if _is_extended_pictographic(cp):
+        return 2
+    if (0xe000 <= cp <= 0xf8ff) or (0xf0000 <= cp <= 0xffffd) or \
+       (0x100000 <= cp <= 0x10fffd):
+        return 2
+    return 1
+
+
+class _GraphemeWidthScanner:
+    """Mirrors GraphemeWidthScanner in render.cpp: collapses ZWJ sequences
+    and VS16-upgraded bases to their cluster width instead of summing each
+    codepoint. Keep in sync with that class."""
+
+    def __init__(self):
+        self.prev_was_pictographic = False
+        self.pending_zwj = False
+        self.last_emitted_width = 0
+
+    def consume(self, cp):
+        if cp == 0x200d:  # ZWJ
+            self.pending_zwj = True
+            return 0
+        if cp == 0xfe0f:  # VS16
+            delta = 0
+            if not self.prev_was_pictographic and self.last_emitted_width < 2:
+                delta = 2 - self.last_emitted_width
+                self.last_emitted_width = 2
+            self.prev_was_pictographic = True
+            return delta
+        if 0xfe00 <= cp <= 0xfe0e:
+            return 0
+
+        is_pictographic = _is_extended_pictographic(cp)
+        cw = _codepoint_width(cp)
+
+        if self.pending_zwj and self.prev_was_pictographic and is_pictographic:
+            self.pending_zwj = False
+            return 0
+
+        self.pending_zwj = False
+        if cw != 0:
+            self.prev_was_pictographic = is_pictographic
+            self.last_emitted_width = cw
+        return cw
+
+
 def visible_width(s):
-    """Display-column width matching fzfpp's codepoint_width table (compact
-    wcwidth): CJK/Hangul/fullwidth/emoji/PUA = 2, combining/controls = 0."""
-    w = 0
-    for ch in s:
-        cp = ord(ch)
-        if cp == 0 or cp < 0x20 or (0x7f <= cp < 0xa0):
-            continue
-        if (0x0300 <= cp <= 0x036f) or (0x200b <= cp <= 0x200f) or \
-           (0xfe00 <= cp <= 0xfe0f) or cp == 0xfeff:
-            continue
-        if (0x1100 <= cp <= 0x115f) or (0x2e80 <= cp <= 0x303e) or \
-           (0x3041 <= cp <= 0x33ff) or (0x3400 <= cp <= 0x4dbf) or \
-           (0x4e00 <= cp <= 0x9fff) or (0xa000 <= cp <= 0xa4cf) or \
-           (0xac00 <= cp <= 0xd7a3) or (0xf900 <= cp <= 0xfaff) or \
-           (0xfe30 <= cp <= 0xfe4f) or (0xff00 <= cp <= 0xff60) or \
-           (0xffe0 <= cp <= 0xffe6) or (0x1f300 <= cp <= 0x1faff) or \
-           (0x20000 <= cp <= 0x3fffd):
-            w += 2
-            continue
-        if (0xe000 <= cp <= 0xf8ff) or (0xf0000 <= cp <= 0xffffd) or \
-           (0x100000 <= cp <= 0x10fffd):
-            w += 2
-            continue
-        # Legacy symbol/dingbat codepoints with default emoji presentation
-        # (Emoji_Presentation=Yes) -- see codepoint_width() in render.cpp for
-        # the full citation. Keep this list in sync with that function.
-        if (0x2614 <= cp <= 0x2615) or (0x2648 <= cp <= 0x2653) or \
-           cp == 0x267f or cp == 0x2693 or cp == 0x26a1 or \
-           (0x26aa <= cp <= 0x26ab) or (0x26bd <= cp <= 0x26be) or \
-           (0x26c4 <= cp <= 0x26c5) or cp == 0x26ce or cp == 0x26d4 or \
-           cp == 0x26ea or (0x26f2 <= cp <= 0x26f3) or cp == 0x26f5 or \
-           cp == 0x26fa or cp == 0x26fd or cp == 0x2705 or \
-           (0x270a <= cp <= 0x270b) or cp == 0x2728 or cp == 0x274c or \
-           cp == 0x274e or (0x2753 <= cp <= 0x2755) or cp == 0x2757 or \
-           (0x2795 <= cp <= 0x2797) or cp == 0x27b0 or cp == 0x27bf or \
-           (0x2b1b <= cp <= 0x2b1c) or cp == 0x2b50 or cp == 0x2b55:
-            w += 2
-            continue
-        w += 1
-    return w
+    """Display-column width matching fzfpp's codepoint_width/
+    GraphemeWidthScanner (compact wcwidth + ZWJ/skin-tone-modifier
+    collapsing): CJK/Hangul/fullwidth/emoji/PUA = 2, combining/controls = 0,
+    ZWJ-joined emoji clusters and VS16-upgraded bases collapse to one
+    cluster's width instead of summing each codepoint."""
+    scanner = _GraphemeWidthScanner()
+    return sum(scanner.consume(ord(ch)) for ch in s)
 
 
 def strip_sgr(s):
@@ -319,6 +366,77 @@ def test_legacy_emoji_width(fzf, rows=33, cols=97):
           f"star-emoji row, saw {sep_cols_seen}")
 
 
+def test_zwj_and_skintone_emoji_width(fzf, rows=37, cols=106):
+    """Regression test for a real user-reported bug (video WRpHQQdS_Qc's
+    title, 2026-07-21): a title containing an emoji + Fitzpatrick skin-tone
+    modifier (🤟🏻 = U+1F91F + U+1F3FB) and a ZWJ-joined sequence
+    (❤️‍🔥 = U+2764 heart + VS16 + ZWJ + U+1F525 fire) measured WIDER than
+    the terminal actually renders them, because summing each codepoint's
+    width independently double-counts a skin-tone modifier (both codepoints
+    individually fall in the wide 0x1f300-0x1faff range) and a ZWJ chain
+    (each joined pictograph individually wide). Real terminals collapse each
+    cluster to ONE glyph's width. Confirms GraphemeWidthScanner correctly
+    collapses both cases so the row's measured width and the separator
+    column agree with calculate_column_layout's expectation."""
+    title = ("The Perfect Fukuoka Trip\U0001f91f\U0001f3fb Fukuoka Again "
+              "with ILLIT❤️‍\U0001f525"
+              "I #Where_is_SU_ILLIT #Odigassyu_ILLIT #EP1")
+    items = [title] + [f"item{i}" for i in range(20)]
+    text = run_fzf(fzf, ["--height=100%", "--preview-window=right,50%",
+                          "--preview=echo x"], rows, cols, items,
+                    drain_s=1.5)
+
+    content_cols = cols
+    preview_cols = (content_cols * 50) // 100
+    results_width = content_cols - preview_cols - 1
+    sep_col_abs = results_width + 1
+
+    anchor = "Perfect"
+    aidx = text.find(anchor)
+    check("clip/zwj-row-found", aidx >= 0,
+          "couldn't find the ZWJ/skin-tone-emoji title in captured output")
+    if aidx < 0:
+        return
+
+    moves_before = list(re.finditer(r"\x1b\[(\d+);(\d+)H", text[:aidx]))
+    check("clip/zwj-row-parsed", bool(moves_before),
+          "found the title but no preceding cursor move to anchor its row")
+    if not moves_before:
+        return
+
+    row_start = moves_before[-1].start()
+    row_end_match = re.search(r"\x1b\[\d+;\d+H", text[aidx:])
+    row_end = aidx + row_end_match.start() if row_end_match else len(text)
+    m = re.match(r"\x1b\[(\d+);(\d+)H(.*)", text[row_start:row_end], re.S)
+    if not m:
+        check("clip/zwj-row-content", False,
+              "couldn't parse the row's cursor-move/content")
+        return
+
+    row_content = strip_sgr(m.group(3))
+    w = visible_width(row_content)
+    # The title is long enough to always fill the results pane exactly (it
+    # overflows even the widest of these test terminal sizes), so a
+    # correctly-measuring build clips it to EXACTLY results_width -- not
+    # just "no more than". An OVER-counting bug (skin-tone modifier or ZWJ
+    # member summed instead of collapsed) clips too EARLY, under-filling the
+    # row with wasted blank columns instead of overlapping the separator;
+    # an UNDER-counting bug (the ⭐ class from test_legacy_emoji_width)
+    # clips too LATE. Asserting equality catches both directions.
+    check("clip/zwj-row-width", w == results_width,
+          f"row measured {w} display columns, budget is {results_width} -- "
+          f"a skin-tone modifier or ZWJ sequence is being summed instead of "
+          f"collapsed to one cluster's width (row under-fills, wasting "
+          f"columns) or a wide char is under-measured (row overflows)")
+
+    sep_positions = re.findall(r"\x1b\[(\d+);(\d+)H(?:\x1b\[0?m)?│", text)
+    sep_cols_seen = sorted(set(int(c) for _, c in sep_positions
+                               if int(c) not in (1, cols)))
+    check("clip/zwj-separator-column", sep_cols_seen == [sep_col_abs],
+          f"expected the separator only at col {sep_col_abs} even on the "
+          f"ZWJ/skin-tone-emoji row, saw {sep_cols_seen}")
+
+
 def test_preview_line_overlong_clip(fzf, rows=24, cols=80):
     """A single preview line far longer than the pane's column budget must be
     clipped, not left to auto-wrap into (and push down) the results list.
@@ -434,6 +552,7 @@ def main():
 
     test_results_row_clip(real)
     test_legacy_emoji_width(real)
+    test_zwj_and_skintone_emoji_width(real)
     test_preview_line_overlong_clip(real)
     test_probe_and_cursor_home_stripped(real)
     test_preview_uses_dollar_shell(real)

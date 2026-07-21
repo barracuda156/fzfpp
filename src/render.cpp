@@ -18,16 +18,58 @@ namespace {
 // and made per-row padding too short to erase the previous frame (stale text /
 // superimposed lists). This table covers the ranges those consumers actually
 // hit; it is deliberately compact, not a full Unicode width database.
+// Extended_Pictographic emoji bases (the newer emoji-supplement block plus
+// the legacy dingbat/symbol codepoints with default emoji presentation).
+// Factored out of codepoint_width so GraphemeWidthScanner can ask "is this
+// codepoint a pictograph a ZWJ sequence could be built on" without
+// duplicating the range list.
+bool is_extended_pictographic(char32_t cp) {
+    return (cp >= 0x1f300 && cp <= 0x1faff) ||
+           (cp >= 0x2614 && cp <= 0x2615) ||   // umbrella w/ rain..hot beverage
+           (cp >= 0x2648 && cp <= 0x2653) ||   // Aries..Pisces
+           cp == 0x267f ||                     // wheelchair symbol
+           cp == 0x2693 ||                     // anchor
+           cp == 0x26a1 ||                     // high voltage
+           (cp >= 0x26aa && cp <= 0x26ab) ||   // white circle..black circle
+           (cp >= 0x26bd && cp <= 0x26be) ||   // soccer ball..baseball
+           (cp >= 0x26c4 && cp <= 0x26c5) ||   // snowman..sun behind cloud
+           cp == 0x26ce ||                     // Ophiuchus
+           cp == 0x26d4 ||                     // no entry
+           cp == 0x26ea ||                     // church
+           (cp >= 0x26f2 && cp <= 0x26f3) ||   // fountain..flag in hole
+           cp == 0x26f5 ||                     // sailboat
+           cp == 0x26fa ||                     // tent
+           cp == 0x26fd ||                     // fuel pump
+           cp == 0x2705 ||                     // check mark button
+           (cp >= 0x270a && cp <= 0x270b) ||   // raised fist..raised hand
+           cp == 0x2728 ||                     // sparkles
+           cp == 0x274c ||                     // cross mark
+           cp == 0x274e ||                     // cross mark button
+           (cp >= 0x2753 && cp <= 0x2755) ||   // red question..white excl. mark
+           cp == 0x2757 ||                     // red exclamation mark
+           (cp >= 0x2795 && cp <= 0x2797) ||   // plus..divide
+           cp == 0x27b0 ||                     // curly loop
+           cp == 0x27bf ||                     // double curly loop
+           (cp >= 0x2b1b && cp <= 0x2b1c) ||   // black/white large square
+           cp == 0x2b50 ||                     // star
+           cp == 0x2b55;                       // hollow red circle
+}
+
 int codepoint_width(char32_t cp) {
     if (cp == 0) return 0;
     // C0/C1 controls: not printable, treat as zero so they don't shift columns.
     if (cp < 0x20 || (cp >= 0x7f && cp < 0xa0)) return 0;
 
-    // Zero-width: combining marks, ZWJ/ZWNJ, variation selectors, BOM.
+    // Zero-width: combining marks, ZWJ/ZWNJ, variation selectors, BOM,
+    // Fitzpatrick skin-tone modifiers (U+1F3FB-1F3FF only ever appear glued
+    // to a preceding emoji base -- they recolor it in place rather than
+    // adding a column; see GraphemeWidthScanner for why this alone isn't
+    // enough to get ZWJ sequences right).
     if ((cp >= 0x0300 && cp <= 0x036f) ||   // combining diacritical marks
         (cp >= 0x200b && cp <= 0x200f) ||   // ZWSP..RLM
         (cp >= 0xfe00 && cp <= 0xfe0f) ||   // variation selectors
-        cp == 0xfeff) {                     // BOM / ZWNBSP
+        cp == 0xfeff ||                     // BOM / ZWNBSP
+        (cp >= 0x1f3fb && cp <= 0x1f3ff)) { // emoji skin-tone modifiers
         return 0;
     }
 
@@ -43,50 +85,23 @@ int codepoint_width(char32_t cp) {
         (cp >= 0xfe30 && cp <= 0xfe4f) ||   // CJK compat forms
         (cp >= 0xff00 && cp <= 0xff60) ||   // fullwidth forms
         (cp >= 0xffe0 && cp <= 0xffe6) ||   // fullwidth signs
-        (cp >= 0x1f300 && cp <= 0x1faff) || // emoji & pictographs
+        (cp >= 0x1f1e6 && cp <= 0x1f1ff) || // regional indicators (flags)
         (cp >= 0x20000 && cp <= 0x3fffd)) { // CJK Ext B+ (SIP)
         return 2;
     }
 
-    // Legacy symbol/dingbat codepoints with DEFAULT emoji presentation
-    // (Emoji_Presentation=Yes per Unicode emoji-data.txt) -- these render
-    // wide even without a trailing VS16, unlike most of their neighbors in
-    // the same block which stay text-presentation (narrow) until VS16.
-    // Confirmed this exactly matches East_Asian_Width=Wide for these three
-    // blocks, and matches go-runewidth's default doublewidth table. Real
-    // titles (YouTube-style, the ytsurf/yt-x use case) routinely carry stars
-    // and hearts from these legacy blocks alongside the newer 0x1f300+
-    // emoji-supplement range already covered above; without this, a title
-    // with e.g. U+2B50 (star) measured one column narrower than it renders,
-    // desyncing the results/preview separator on that row.
-    if ((cp >= 0x2614 && cp <= 0x2615) ||   // umbrella w/ rain..hot beverage
-        (cp >= 0x2648 && cp <= 0x2653) ||   // Aries..Pisces
-        cp == 0x267f ||                     // wheelchair symbol
-        cp == 0x2693 ||                     // anchor
-        cp == 0x26a1 ||                     // high voltage
-        (cp >= 0x26aa && cp <= 0x26ab) ||   // white circle..black circle
-        (cp >= 0x26bd && cp <= 0x26be) ||   // soccer ball..baseball
-        (cp >= 0x26c4 && cp <= 0x26c5) ||   // snowman..sun behind cloud
-        cp == 0x26ce ||                     // Ophiuchus
-        cp == 0x26d4 ||                     // no entry
-        cp == 0x26ea ||                     // church
-        (cp >= 0x26f2 && cp <= 0x26f3) ||   // fountain..flag in hole
-        cp == 0x26f5 ||                     // sailboat
-        cp == 0x26fa ||                     // tent
-        cp == 0x26fd ||                     // fuel pump
-        cp == 0x2705 ||                     // check mark button
-        (cp >= 0x270a && cp <= 0x270b) ||   // raised fist..raised hand
-        cp == 0x2728 ||                     // sparkles
-        cp == 0x274c ||                     // cross mark
-        cp == 0x274e ||                     // cross mark button
-        (cp >= 0x2753 && cp <= 0x2755) ||   // red question..white excl. mark
-        cp == 0x2757 ||                     // red exclamation mark
-        (cp >= 0x2795 && cp <= 0x2797) ||   // plus..divide
-        cp == 0x27b0 ||                     // curly loop
-        cp == 0x27bf ||                     // double curly loop
-        (cp >= 0x2b1b && cp <= 0x2b1c) ||   // black/white large square
-        cp == 0x2b50 ||                     // star
-        cp == 0x2b55) {                     // hollow red circle
+    // Emoji & pictographs (0x1f300-0x1faff), plus legacy symbol/dingbat
+    // codepoints with DEFAULT emoji presentation (Emoji_Presentation=Yes per
+    // Unicode emoji-data.txt) -- the latter render wide even without a
+    // trailing VS16, unlike most of their neighbors in the same block which
+    // stay text-presentation (narrow) until VS16. Confirmed this exactly
+    // matches East_Asian_Width=Wide for those legacy blocks, and matches
+    // go-runewidth's default doublewidth table. Real titles (YouTube-style,
+    // the ytsurf/yt-x use case) routinely carry stars and hearts from these
+    // legacy blocks alongside the newer emoji-supplement range; without
+    // this, a title with e.g. U+2B50 (star) measured one column narrower
+    // than it renders, desyncing the results/preview separator on that row.
+    if (is_extended_pictographic(cp)) {
         return 2;
     }
 
@@ -101,15 +116,92 @@ int codepoint_width(char32_t cp) {
     return 1;
 }
 
+// Collapses an emoji grapheme cluster to its base's width instead of summing
+// each codepoint. Two real-world cases this fixes (found via a live ytsurf
+// title: "...Trip🤟🏻 Fukuoka..." and "...ILLIT❤️‍🔥I #Where..."):
+//   - Skin-tone modifiers (U+1F3FB-1F3FF) already measure 0 in
+//     codepoint_width, so a simple sum gets "🤟🏻" right (2+0=2) -- but a
+//     naive per-codepoint sum without this scanner treated the modifier as
+//     wide too (see history), so this class is guarded here as well.
+//   - ZWJ (U+200D) sequences: "❤️‍🔥" is heart + VS16 + ZWJ + fire, four
+//     codepoints. Summing codepoint_width for each gives 1+0+0+2=3, but a
+//     terminal renders the whole ZWJ-joined cluster as ONE glyph, 2 columns
+//     (the width of its first pictographic member). This scanner tracks
+//     "did we just see a ZWJ, and was the codepoint before it a pictograph"
+//     and if so suppresses the width of a following pictograph, so the
+//     cluster contributes only its base's width regardless of how many
+//     ZWJ-joined pictographs follow (family emoji, etc.) -- this is the
+//     emoji-adjacent slice of UAX #29's grapheme-cluster rules (GB9/GB9c/
+//     GB11), not full grapheme segmentation.
+// Regional-indicator flag pairs (e.g. US flag = two RI codepoints) are
+// NOT handled here: codepoint_width already counts each RI as 2, and a
+// well-formed pair summing to 4 would be wrong (a flag is 2 columns, one
+// glyph) -- but that's a pre-existing gap this change doesn't newly
+// introduce or worsen, and no real title in the reports so far has hit it.
+class GraphemeWidthScanner {
+public:
+    // Feed one decoded codepoint; returns its incremental contribution to
+    // the string's display width (0, or a small delta -- see VS16 below).
+    int consume(char32_t cp) {
+        if (cp == 0x200d) {  // ZWJ: zero width, arms the "next pictograph
+                              // glued to previous" suppression.
+            pending_zwj_ = true;
+            return 0;
+        }
+
+        if (cp == 0xfe0f) {  // VS16: forces EMOJI presentation on the
+            // codepoint just emitted, even one that isn't default-emoji
+            // (e.g. U+2764 heart is text-presentation, width 1, until VS16
+            // follows -- with VS16 it renders as a 2-column emoji glyph).
+            // If that base already contributed 2 (already pictographic),
+            // there's nothing to add; otherwise emit the +1 delta needed to
+            // bring the cluster up to width 2, and mark it pictographic so
+            // a following ZWJ join suppresses correctly.
+            int delta = 0;
+            if (!prev_was_pictographic_ && last_emitted_width_ < 2) {
+                delta = 2 - last_emitted_width_;
+                last_emitted_width_ = 2;
+            }
+            prev_was_pictographic_ = true;
+            return delta;
+        }
+        if (cp >= 0xfe00 && cp <= 0xfe0e) {  // other variation selectors: 0.
+            return 0;
+        }
+
+        bool is_pictographic = is_extended_pictographic(cp);
+        int cw = codepoint_width(cp);
+
+        if (pending_zwj_ && prev_was_pictographic_ && is_pictographic) {
+            pending_zwj_ = false;
+            // Cluster already counted via its first pictographic member.
+            return 0;
+        }
+
+        pending_zwj_ = false;
+        if (cw != 0) {
+            prev_was_pictographic_ = is_pictographic;
+            last_emitted_width_ = cw;
+        }
+        return cw;
+    }
+
+private:
+    bool prev_was_pictographic_ = false;
+    bool pending_zwj_ = false;
+    int last_emitted_width_ = 0;
+};
+
 // Display-column width of a UTF-8 string (no ANSI stripping; caller strips SGR
 // first if needed). Falls back to byte count on malformed UTF-8.
 size_t utf8_display_width(const std::string& s) {
     size_t w = 0;
     try {
         auto it = s.begin();
+        GraphemeWidthScanner scanner;
         while (it != s.end()) {
             char32_t cp = utf8::next(it, s.end());
-            w += static_cast<size_t>(codepoint_width(cp));
+            w += static_cast<size_t>(scanner.consume(cp));
         }
     } catch (...) {
         return s.size();
@@ -191,6 +283,10 @@ void FrameRenderer::draw_row(int row, int col, const Row& spans, int max_cols) {
     // edge and shoved every row below it down, and left the padding too short
     // to erase the previous, longer frame.
     int written = 0;
+    // Shared across spans (not reset per span) so a ZWJ emoji sequence split
+    // across a match-highlight span boundary still collapses to one glyph's
+    // width instead of being double-counted at the seam.
+    GraphemeWidthScanner width_scanner;
     for (const auto& span : spans) {
         if (written >= budget) {
             break;
@@ -211,7 +307,7 @@ void FrameRenderer::draw_row(int row, int col, const Row& spans, int max_cols) {
         // padding below) rather than emitted half-off the pane.
         std::u32string seg_cps;
         for (char32_t cp : cps) {
-            int cw = codepoint_width(cp);
+            int cw = width_scanner.consume(cp);
             if (written + cw > budget) break;
             seg_cps.push_back(cp);
             written += cw;
@@ -765,6 +861,7 @@ std::string truncate_ansi_text(const std::string& text, size_t max_cols) {
     size_t visible_count = 0;
     bool any_sgr = false;
     size_t i = 0;
+    GraphemeWidthScanner width_scanner;
 
     while (i < text.size() && visible_count < max_cols) {
         if (text[i] == '\x1b') {
@@ -792,7 +889,7 @@ std::string truncate_ansi_text(const std::string& text, size_t max_cols) {
         try {
             auto it = text.begin() + static_cast<long>(i);
             char32_t cp = utf8::next(it, text.end());
-            cw = codepoint_width(cp);
+            cw = width_scanner.consume(cp);
         } catch (...) {
             cw = 1;
         }
