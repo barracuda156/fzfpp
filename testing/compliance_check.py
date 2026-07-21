@@ -117,6 +117,21 @@ def visible_width(s):
            (0x100000 <= cp <= 0x10fffd):
             w += 2
             continue
+        # Legacy symbol/dingbat codepoints with default emoji presentation
+        # (Emoji_Presentation=Yes) -- see codepoint_width() in render.cpp for
+        # the full citation. Keep this list in sync with that function.
+        if (0x2614 <= cp <= 0x2615) or (0x2648 <= cp <= 0x2653) or \
+           cp == 0x267f or cp == 0x2693 or cp == 0x26a1 or \
+           (0x26aa <= cp <= 0x26ab) or (0x26bd <= cp <= 0x26be) or \
+           (0x26c4 <= cp <= 0x26c5) or cp == 0x26ce or cp == 0x26d4 or \
+           cp == 0x26ea or (0x26f2 <= cp <= 0x26f3) or cp == 0x26f5 or \
+           cp == 0x26fa or cp == 0x26fd or cp == 0x2705 or \
+           (0x270a <= cp <= 0x270b) or cp == 0x2728 or cp == 0x274c or \
+           cp == 0x274e or (0x2753 <= cp <= 0x2755) or cp == 0x2757 or \
+           (0x2795 <= cp <= 0x2797) or cp == 0x27b0 or cp == 0x27bf or \
+           (0x2b1b <= cp <= 0x2b1c) or cp == 0x2b50 or cp == 0x2b55:
+            w += 2
+            continue
         w += 1
     return w
 
@@ -244,6 +259,66 @@ def test_results_row_clip(fzf, rows=24, cols=80):
               f"terminal and push the whole list down")
 
 
+def test_legacy_emoji_width(fzf, rows=33, cols=97):
+    """Regression test for a real user-reported bug (ytsurf7.png,
+    2026-07-21): a title containing a legacy dingbat/symbol emoji with
+    default emoji presentation (e.g. U+2B50 star) but no CJK/emoji-supplement
+    codepoint measured one column narrower than it actually renders, so
+    fzfpp clipped the row one character too late -- the separator (drawn
+    independently at a fixed column) ended up with the row's last character
+    landing ON or PAST it instead of stopping one column short. Confirms the
+    separator column and the row's measured width both land where
+    calculate_column_layout expects, for a title using ONLY a legacy-block
+    emoji (no Hangul/CJK/emoji-supplement) so this can't be masked by
+    already-covered wide ranges."""
+    title = "#MANATO Got Your Back⭐ #BEFIRST @BEFIRSTOfficial"
+    items = [title] + [f"item{i}" for i in range(20)]
+    text = run_fzf(fzf, ["--height=100%", "--preview-window=right,50%",
+                          "--preview=echo x"], rows, cols, items,
+                    drain_s=1.2)
+
+    content_cols = cols
+    preview_cols = (content_cols * 50) // 100
+    results_width = content_cols - preview_cols - 1
+    sep_col_abs = results_width + 1
+
+    anchor = "MANATO"
+    aidx = text.find(anchor)
+    check("clip/legacy-emoji-row-found", aidx >= 0,
+          "couldn't find the star-emoji title in captured output")
+    if aidx < 0:
+        return
+
+    moves_before = list(re.finditer(r"\x1b\[(\d+);(\d+)H", text[:aidx]))
+    check("clip/legacy-emoji-row-parsed", bool(moves_before),
+          "found the title but no preceding cursor move to anchor its row")
+    if not moves_before:
+        return
+
+    row_start = moves_before[-1].start()
+    row_end_match = re.search(r"\x1b\[\d+;\d+H", text[aidx:])
+    row_end = aidx + row_end_match.start() if row_end_match else len(text)
+    m = re.match(r"\x1b\[(\d+);(\d+)H(.*)", text[row_start:row_end], re.S)
+    if not m:
+        check("clip/legacy-emoji-row-content", False,
+              "couldn't parse the row's cursor-move/content")
+        return
+
+    row_content = strip_sgr(m.group(3))
+    w = visible_width(row_content)
+    check("clip/legacy-emoji-row-width", w <= results_width,
+          f"row measured {w} display columns, budget is {results_width} -- "
+          f"a legacy-block emoji (e.g. star U+2B50) is under-measured if "
+          f"this fails, letting the row spill past its pane")
+
+    sep_positions = re.findall(r"\x1b\[(\d+);(\d+)H(?:\x1b\[0?m)?│", text)
+    sep_cols_seen = sorted(set(int(c) for _, c in sep_positions
+                               if int(c) not in (1, cols)))
+    check("clip/legacy-emoji-separator-column", sep_cols_seen == [sep_col_abs],
+          f"expected the separator only at col {sep_col_abs} even on the "
+          f"star-emoji row, saw {sep_cols_seen}")
+
+
 def test_preview_line_overlong_clip(fzf, rows=24, cols=80):
     """A single preview line far longer than the pane's column budget must be
     clipped, not left to auto-wrap into (and push down) the results list.
@@ -358,6 +433,7 @@ def main():
     test_column_layout(real, True, "right", rows=33, cols=97)  # odd size
 
     test_results_row_clip(real)
+    test_legacy_emoji_width(real)
     test_preview_line_overlong_clip(real)
     test_probe_and_cursor_home_stripped(real)
     test_preview_uses_dollar_shell(real)

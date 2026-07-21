@@ -48,6 +48,48 @@ int codepoint_width(char32_t cp) {
         return 2;
     }
 
+    // Legacy symbol/dingbat codepoints with DEFAULT emoji presentation
+    // (Emoji_Presentation=Yes per Unicode emoji-data.txt) -- these render
+    // wide even without a trailing VS16, unlike most of their neighbors in
+    // the same block which stay text-presentation (narrow) until VS16.
+    // Confirmed this exactly matches East_Asian_Width=Wide for these three
+    // blocks, and matches go-runewidth's default doublewidth table. Real
+    // titles (YouTube-style, the ytsurf/yt-x use case) routinely carry stars
+    // and hearts from these legacy blocks alongside the newer 0x1f300+
+    // emoji-supplement range already covered above; without this, a title
+    // with e.g. U+2B50 (star) measured one column narrower than it renders,
+    // desyncing the results/preview separator on that row.
+    if ((cp >= 0x2614 && cp <= 0x2615) ||   // umbrella w/ rain..hot beverage
+        (cp >= 0x2648 && cp <= 0x2653) ||   // Aries..Pisces
+        cp == 0x267f ||                     // wheelchair symbol
+        cp == 0x2693 ||                     // anchor
+        cp == 0x26a1 ||                     // high voltage
+        (cp >= 0x26aa && cp <= 0x26ab) ||   // white circle..black circle
+        (cp >= 0x26bd && cp <= 0x26be) ||   // soccer ball..baseball
+        (cp >= 0x26c4 && cp <= 0x26c5) ||   // snowman..sun behind cloud
+        cp == 0x26ce ||                     // Ophiuchus
+        cp == 0x26d4 ||                     // no entry
+        cp == 0x26ea ||                     // church
+        (cp >= 0x26f2 && cp <= 0x26f3) ||   // fountain..flag in hole
+        cp == 0x26f5 ||                     // sailboat
+        cp == 0x26fa ||                     // tent
+        cp == 0x26fd ||                     // fuel pump
+        cp == 0x2705 ||                     // check mark button
+        (cp >= 0x270a && cp <= 0x270b) ||   // raised fist..raised hand
+        cp == 0x2728 ||                     // sparkles
+        cp == 0x274c ||                     // cross mark
+        cp == 0x274e ||                     // cross mark button
+        (cp >= 0x2753 && cp <= 0x2755) ||   // red question..white excl. mark
+        cp == 0x2757 ||                     // red exclamation mark
+        (cp >= 0x2795 && cp <= 0x2797) ||   // plus..divide
+        cp == 0x27b0 ||                     // curly loop
+        cp == 0x27bf ||                     // double curly loop
+        (cp >= 0x2b1b && cp <= 0x2b1c) ||   // black/white large square
+        cp == 0x2b50 ||                     // star
+        cp == 0x2b55) {                     // hollow red circle
+        return 2;
+    }
+
     // Nerd Font glyphs live in the Private Use Area; the fonts these TUIs
     // assume render them double-width. Treat PUA as wide.
     if ((cp >= 0xe000 && cp <= 0xf8ff) ||       // BMP PUA
