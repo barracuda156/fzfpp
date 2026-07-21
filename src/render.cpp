@@ -242,6 +242,12 @@ void FrameRenderer::clear_region(int row, int col, int height, int width) {
     for (int r = row; r < row + height && r < rows_; ++r) {
         if (r < 0) continue;
         move_to(r, col);
+        // Reset SGR before the blank fill: a preview row (e.g. chafa block-mode
+        // output) can end mid-color with no trailing reset, so without this the
+        // "blank" spaces inherit that background color instead of truly
+        // clearing it -- visible as a stray color bleed when scrolling to a
+        // new preview clears the old one.
+        buffer_ += "\x1b[0m";
         buffer_ += blank;
     }
 }
