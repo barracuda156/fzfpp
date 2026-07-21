@@ -90,6 +90,13 @@ private:
     // Terminal size and layout calculation
     void get_terminal_size(int& rows, int& cols) const;
     void calculate_preview_position(int& top, int& left, int& lines, int& cols) const;
+    // Single source of truth for the results/separator/preview column split.
+    // Both repaint() and calculate_preview_position() must derive from this
+    // so the border and the preview pane never disagree on where the split
+    // falls (a prior divergence let the preview pane overshoot the border
+    // and painted stale columns nobody cleared -- see render.cpp history).
+    void calculate_column_layout(int content_cols, int& results_width,
+                                  int& preview_cols, int& sep_col) const;
     void set_preview_env_vars() const;  // Set FZF_PREVIEW_* environment variables
 
     // --- Rendering (direct-terminal backend, replaces FTXUI) ---

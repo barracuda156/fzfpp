@@ -721,6 +721,18 @@ void Terminal::get_terminal_size(int& rows, int& cols) const {
     }
 }
 
+void Terminal::calculate_column_layout(int content_cols, int& results_width,
+                                       int& preview_cols, int& sep_col) const {
+    int preview_width = (content_cols * opts_.preview_size_percent) / 100;
+    preview_cols = preview_width;
+    results_width = content_cols - preview_width - 1; // -1 for separator
+    if (results_width < 1) results_width = 1;
+
+    sep_col = (opts_.preview_position == "left")
+                  ? preview_cols
+                  : results_width;
+}
+
 void Terminal::calculate_preview_position(int& top, int& left, int& lines, int& cols) const {
     int term_rows, term_cols;
     get_terminal_size(term_rows, term_cols);
@@ -735,9 +747,12 @@ void Terminal::calculate_preview_position(int& top, int& left, int& lines, int& 
         return;
     }
 
-    // Split-screen layout with configurable preview position and size
-    int preview_width = (term_cols * opts_.preview_size_percent) / 100;
-    int results_width = term_cols - preview_width - 1; // -1 for separator
+    int margin = opts_.border ? 1 : 0;
+    int content_cols = term_cols - 2 * margin;
+    if (content_cols < 1) content_cols = 1;
+
+    int results_width, preview_cols, sep_col;
+    calculate_column_layout(content_cols, results_width, preview_cols, sep_col);
 
     // Calculate vertical layout:
     // Row 0: Info line (1 row, if not hidden)
@@ -751,21 +766,21 @@ void Terminal::calculate_preview_position(int& top, int& left, int& lines, int& 
     int top_ui_rows = info_rows + header_rows + 1; // info + header + separator
     int bottom_ui_rows = 2; // separator + input
     int content_rows = term_rows - top_ui_rows - bottom_ui_rows;
+    if (opts_.border) {
+        top_ui_rows += 1;
+        bottom_ui_rows += 1;
+        content_rows = term_rows - top_ui_rows - bottom_ui_rows;
+    }
 
     // Preview starts after top UI elements
     top = top_ui_rows;
     if (opts_.preview_position == "left") {
-        left = 0; // Preview starts at left edge
+        left = margin; // Preview starts at the content area's left edge
     } else {
-        left = results_width + 1; // After results + separator
+        left = margin + sep_col + 1; // After results + separator
     }
     lines = content_rows;
-    cols = preview_width;
-
-    if (opts_.border) {
-        top += 1;
-        left += 1;
-    }
+    cols = preview_cols;
 }
 
 void Terminal::set_preview_env_vars() const {
@@ -1347,20 +1362,24 @@ void Terminal::repaint(bool preview_dirty) {
     int results_width = content_cols;
 
     if (show_preview) {
+        // calculate_column_layout is the single source of truth for the
+        // results/separator/preview split; calculate_preview_position derives
+        // its preview_top/left/lines/cols from the exact same call, so the
+        // separator drawn here and the pane write_preview_content/clear_region
+        // paint into can never disagree (a prior divergence let the preview
+        // pane overshoot the border and left stale, never-cleared columns
+        // between the separator and the pane).
+        int col_results_width, col_preview_cols, col_sep_col;
+        calculate_column_layout(content_cols, col_results_width, col_preview_cols, col_sep_col);
         calculate_preview_position(preview_top, preview_left, preview_lines, preview_cols);
-        int preview_width_with_sep = preview_cols + 1;  // + separator column
+
+        results_width = col_results_width;
         if (opts_.preview_position == "left") {
-            results_col = margin + preview_width_with_sep;
-            results_width = content_cols - preview_width_with_sep;
-        } else {
-            results_width = content_cols - preview_width_with_sep;
+            results_col = margin + col_sep_col + 1;
         }
-        if (results_width < 1) results_width = 1;
 
         // Vertical separator between preview and results.
-        int sep_col = (opts_.preview_position == "left")
-                          ? margin + preview_cols
-                          : margin + results_width;
+        int sep_col = margin + col_sep_col;
         for (int r = content_top; r < content_top + static_cast<int>(visible_lines_) && r < term_rows; ++r) {
             frame.draw_text(r, sep_col, "\xE2\x94\x82", Style{}, 1);
         }
