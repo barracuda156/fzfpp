@@ -12,9 +12,82 @@
 #include <sys/select.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
+#include <sys/wait.h>
 #include <utf8.h>
 
 namespace fzf {
+
+namespace {
+
+// popen(3) always execs the *system* shell (/bin/sh), never the user's
+// $SHELL. Real fzf runs preview/execute commands under $SHELL (falling back
+// to "sh" if unset) -- on most Linux distros /bin/sh is dash, whose printf
+// builtin doesn't support bash's \xHH hex escapes and differs from bash in
+// other ways preview scripts routinely rely on, so a script that works under
+// interactive bash can silently misbehave when fzfpp runs it through dash.
+// This is a minimal popen(cmd, "r") replacement that execs $SHELL -c cmd
+// instead, keeping the same "read stdout, later reap the child" shape as the
+// call sites already use.
+struct ShellPipe {
+    FILE* stream = nullptr;
+    pid_t pid = -1;
+};
+
+ShellPipe shell_popen(const std::string& cmd) {
+    ShellPipe result;
+
+    int fds[2];
+    if (pipe(fds) != 0) {
+        return result;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        return result;
+    }
+
+    if (pid == 0) {
+        // Child: stdout -> write end of the pipe, then exec the shell.
+        close(fds[0]);
+        dup2(fds[1], STDOUT_FILENO);
+        close(fds[1]);
+
+        const char* shell = getenv("SHELL");
+        if (!shell || shell[0] == '\0') {
+            shell = "/bin/sh";
+        }
+        execl(shell, shell, "-c", cmd.c_str(), static_cast<char*>(nullptr));
+        _exit(127);  // exec failed
+    }
+
+    // Parent: stdin <- read end of the pipe.
+    close(fds[1]);
+    result.stream = fdopen(fds[0], "r");
+    if (!result.stream) {
+        close(fds[0]);
+        int status;
+        waitpid(pid, &status, 0);
+        return ShellPipe{};
+    }
+    result.pid = pid;
+    return result;
+}
+
+void shell_pclose(ShellPipe& p) {
+    if (p.stream) {
+        fclose(p.stream);
+        p.stream = nullptr;
+    }
+    if (p.pid > 0) {
+        int status;
+        waitpid(p.pid, &status, 0);
+        p.pid = -1;
+    }
+}
+
+}  // namespace
 
 Terminal::Terminal(const Options& opts, Reader& reader)
     : opts_(opts),
@@ -873,18 +946,18 @@ std::string Terminal::substitute_placeholders(const std::string& cmd, size_t ind
 }
 
 std::string Terminal::run_command_capture_output(const std::string& cmd) {
-    FILE* pipe = popen(cmd.c_str(), "r");
-    if (!pipe) {
+    ShellPipe pipe = shell_popen(cmd);
+    if (!pipe.stream) {
         return "";
     }
 
     std::string output;
     std::array<char, 4096> buffer;
     size_t bytes_read;
-    while ((bytes_read = fread(buffer.data(), 1, buffer.size(), pipe)) > 0) {
+    while ((bytes_read = fread(buffer.data(), 1, buffer.size(), pipe.stream)) > 0) {
         output.append(buffer.data(), bytes_read);
     }
-    pclose(pipe);
+    shell_pclose(pipe);
 
     if (!output.empty() && output.back() == '\n') {
         output.pop_back();
@@ -982,8 +1055,8 @@ void Terminal::preview_worker() {
                 set_preview_env_vars();
 
                 // Execute command and stream output
-                FILE* pipe = popen(cmd.c_str(), "r");
-                if (!pipe) {
+                ShellPipe pipe = shell_popen(cmd);
+                if (!pipe.stream) {
                     std::lock_guard<std::mutex> lock(preview_mutex_);
                     preview_content_ = "Error: Could not execute preview command";
                     preview_scroll_offset_ = 0;  // Reset scroll on content change
@@ -995,7 +1068,7 @@ void Terminal::preview_worker() {
                 std::string accumulated_output;
                 size_t bytes_read;
 
-                while (!preview_cancel_.load() && (bytes_read = fread(buffer.data(), 1, buffer.size(), pipe)) > 0) {
+                while (!preview_cancel_.load() && (bytes_read = fread(buffer.data(), 1, buffer.size(), pipe.stream)) > 0) {
                     accumulated_output.append(buffer.data(), bytes_read);
 
                     // Update preview immediately - text needs to appear instantly
@@ -1010,7 +1083,7 @@ void Terminal::preview_worker() {
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 }
 
-                pclose(pipe);
+                shell_pclose(pipe);
 
                 // Final update if not cancelled
                 if (!preview_cancel_.load()) {
@@ -1077,8 +1150,8 @@ void Terminal::preview_worker() {
                                     // Set environment variables
                                     set_preview_env_vars();
 
-                                    FILE* pipe = popen(cmd.c_str(), "r");
-                                    if (pipe) {
+                                    ShellPipe pipe = shell_popen(cmd);
+                                    if (pipe.stream) {
                                         std::array<char, 4096> buffer;
                                         std::string accumulated_output;
                                         size_t bytes_read;
@@ -1090,14 +1163,14 @@ void Terminal::preview_worker() {
                                                 interrupted = true;
                                                 break;
                                             }
-                                            bytes_read = fread(buffer.data(), 1, buffer.size(), pipe);
+                                            bytes_read = fread(buffer.data(), 1, buffer.size(), pipe.stream);
                                             if (bytes_read == 0) break;  // clean EOF
                                             accumulated_output.append(buffer.data(), bytes_read);
                                             // Small yield to allow priority requests to interrupt
                                             std::this_thread::sleep_for(std::chrono::milliseconds(1));
                                         }
 
-                                        pclose(pipe);
+                                        shell_pclose(pipe);
 
                                         // Only cache a COMPLETE capture. If we broke out because a
                                         // priority request arrived, accumulated_output is truncated —
