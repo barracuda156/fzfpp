@@ -1,3 +1,4 @@
 build/
 build_noftxui/
 *.patch
+__pycache__/
