@@ -23,7 +23,13 @@ public:
     // timer. The callback must be safe to call from a background thread and
     // should be cheap (e.g. a single write() to a pipe) — it may be called
     // once per item during a fast bulk read.
+    //
+    // Guarded by wake_mutex_: the reader thread may be invoking the previous
+    // callback concurrently with a caller reassigning/clearing it here.
+    // set_wake_callback(nullptr) at teardown blocks until any in-flight
+    // invocation completes, so no later invocation observes the old callback.
     void set_wake_callback(std::function<void()> callback) {
+        std::lock_guard<std::mutex> lock(wake_mutex_);
         wake_callback_ = std::move(callback);
     }
 
@@ -82,7 +88,12 @@ public:
     void wait_for_finish();
 
 private:
-    void add_item(std::string line);
+    // trim_newline: true for newline-delimited reads (strip exactly one
+    // trailing \n and at most one \r before it, fzf semantics). false for
+    // --read0 records, which must be added verbatim (minus the \0
+    // delimiter) since NUL-delimited input exists precisely to carry
+    // embedded/trailing newlines.
+    void add_item(std::string line, bool trim_newline);
 
     std::vector<std::shared_ptr<Item>> items_;
     mutable std::mutex items_mutex_;
@@ -91,6 +102,7 @@ private:
     std::thread read_thread_;
     std::string delimiter_;
     bool read_zero_;  // Read null-delimited input
+    std::mutex wake_mutex_;
     std::function<void()> wake_callback_;
 };
 

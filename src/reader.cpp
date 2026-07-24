@@ -1,17 +1,29 @@
 #include "reader.hpp"
 #include "util.hpp"
+#include "shellcmd.hpp"
 #include <iostream>
 #include <fstream>
 #include <sstream>
 #include <cstdio>
+#include <unistd.h>
 
 namespace fzf {
 
-void Reader::add_item(std::string line) {
-    // Remove trailing newline/carriage return
-    while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
-        line.pop_back();
+void Reader::add_item(std::string line, bool trim_newline) {
+    if (trim_newline) {
+        // fzf semantics: trim exactly one trailing \n and at most one \r
+        // before it — not a strip-all-trailing-CR/LF loop ("data\r\r\n"
+        // becomes "data\r\r", not "data").
+        if (!line.empty() && line.back() == '\n') {
+            line.pop_back();
+        }
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
     }
+    // --read0 records (trim_newline == false) are kept verbatim (minus the
+    // \0 delimiter) — NUL-delimited input exists precisely to carry
+    // embedded/trailing newlines.
 
     // Keep all lines like fzf does (including empty lines)
     {
@@ -28,8 +40,13 @@ void Reader::add_item(std::string line) {
         item_count_.fetch_add(1, std::memory_order_relaxed);
     }
 
-    if (wake_callback_) {
-        wake_callback_();
+    std::function<void()> callback;
+    {
+        std::lock_guard<std::mutex> lock(wake_mutex_);
+        callback = wake_callback_;
+    }
+    if (callback) {
+        callback();
     }
 }
 
@@ -40,7 +57,7 @@ void Reader::read_from_stdin() {
         char ch;
         while (std::cin.get(ch)) {
             if (ch == '\0') {
-                add_item(std::move(line));
+                add_item(std::move(line), /*trim_newline=*/false);
                 line.clear();
             } else {
                 line += ch;
@@ -48,13 +65,13 @@ void Reader::read_from_stdin() {
         }
         // Add last item if any
         if (!line.empty()) {
-            add_item(std::move(line));
+            add_item(std::move(line), /*trim_newline=*/false);
         }
     } else {
         // Read newline-delimited input (default)
         std::string line;
         while (std::getline(std::cin, line)) {
-            add_item(std::move(line));
+            add_item(std::move(line), /*trim_newline=*/true);
         }
     }
     read_finished_.store(true, std::memory_order_release);
@@ -68,7 +85,7 @@ bool Reader::read_from_file(const std::string& filename) {
 
     std::string line;
     while (std::getline(file, line)) {
-        add_item(std::move(line));
+        add_item(std::move(line), /*trim_newline=*/true);
     }
 
     read_finished_.store(true, std::memory_order_release);
@@ -79,7 +96,7 @@ void Reader::read_from_string(const std::string& content) {
     std::istringstream stream(content);
     std::string line;
     while (std::getline(stream, line)) {
-        add_item(std::move(line));
+        add_item(std::move(line), /*trim_newline=*/true);
     }
     read_finished_.store(true, std::memory_order_release);
 }
@@ -100,6 +117,7 @@ void Reader::start_async_fd(int fd) {
         // Read from the provided file descriptor
         FILE* fp = fdopen(fd, "r");
         if (!fp) {
+            close(fd);
             read_finished_.store(true, std::memory_order_release);
             return;
         }
@@ -110,7 +128,7 @@ void Reader::start_async_fd(int fd) {
             int ch;
             while ((ch = fgetc(fp)) != EOF) {
                 if (ch == '\0') {
-                    add_item(std::move(line));
+                    add_item(std::move(line), /*trim_newline=*/false);
                     line.clear();
                 } else {
                     line += static_cast<char>(ch);
@@ -118,7 +136,7 @@ void Reader::start_async_fd(int fd) {
             }
             // Add last item if any
             if (!line.empty()) {
-                add_item(std::move(line));
+                add_item(std::move(line), /*trim_newline=*/false);
             }
         } else {
             // Read newline-delimited input (default)
@@ -127,11 +145,9 @@ void Reader::start_async_fd(int fd) {
             ssize_t nread;
 
             while ((nread = getline(&line, &len, fp)) != -1) {
-                // Remove trailing newline
-                if (nread > 0 && line[nread-1] == '\n') {
-                    line[nread-1] = '\0';
-                }
-                add_item(std::string(line));
+                // Construct with the known length rather than from the
+                // char* — strlen() would truncate at an embedded NUL.
+                add_item(std::string(line, static_cast<size_t>(nread)), /*trim_newline=*/true);
             }
 
             free(line);
@@ -157,7 +173,11 @@ void Reader::load_from_command(const std::string& command) {
     }
     read_finished_.store(false, std::memory_order_release);
 
-    FILE* fp = popen(command.c_str(), "r");
+    // Run reload commands under $SHELL like preview/execute do (shell_popen);
+    // libc popen hardcodes /bin/sh, which broke bashisms in reload() specs
+    // the same way it once broke preview scripts (commit cbd93cd).
+    ShellPipe pipe = shell_popen(command);
+    FILE* fp = pipe.stream;
     if (!fp) {
         read_finished_.store(true, std::memory_order_release);
         return;
@@ -168,29 +188,28 @@ void Reader::load_from_command(const std::string& command) {
         int ch;
         while ((ch = fgetc(fp)) != EOF) {
             if (ch == '\0') {
-                add_item(std::move(line));
+                add_item(std::move(line), /*trim_newline=*/false);
                 line.clear();
             } else {
                 line += static_cast<char>(ch);
             }
         }
         if (!line.empty()) {
-            add_item(std::move(line));
+            add_item(std::move(line), /*trim_newline=*/false);
         }
     } else {
         char* line = nullptr;
         size_t len = 0;
         ssize_t nread;
         while ((nread = getline(&line, &len, fp)) != -1) {
-            if (nread > 0 && line[nread - 1] == '\n') {
-                line[nread - 1] = '\0';
-            }
-            add_item(std::string(line));
+            // Construct with the known length rather than from the char* —
+            // strlen() would truncate at an embedded NUL.
+            add_item(std::string(line, static_cast<size_t>(nread)), /*trim_newline=*/true);
         }
         free(line);
     }
 
-    pclose(fp);
+    shell_pclose(pipe);
     read_finished_.store(true, std::memory_order_release);
 }
 
