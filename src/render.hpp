@@ -28,6 +28,18 @@ struct Span {
 
 using Row = std::vector<Span>;
 
+// Module-level tab stop width used to expand '\t' to spaces wherever this
+// file measures or emits row content (draw_row's span loop,
+// utf8_display_width/visible_width, truncate_ansi_text, clip_text_line /
+// write_preview_content). A tab previously measured as width 0 (a C0
+// control) and was emitted raw, so a tab-bearing row's true on-screen width
+// exceeded the column budget computed from the width-0 measurement,
+// overflowing into the separator/preview pane. Defaults to 8 (fzf/terminal
+// convention); the CLI's --tabstop value must be pushed in via
+// set_tabstop() before any frame is rendered. NOT thread-safe -- call it
+// once at startup from the main thread, same as other one-time setup.
+void set_tabstop(int tabstop);
+
 // Direct-terminal-output layer replacing FTXUI's DOM/Elements. Not a
 // retained-mode tree: callers build up one frame's worth of "chrome" rows
 // (info/header/results/prompt/border) via the FrameRenderer, which
@@ -49,9 +61,14 @@ public:
     // Convenience for a single-style full-width row.
     void draw_text(int row, int col, const std::string& text, Style style = {}, int max_cols = 0);
 
-    // Draws a horizontal line of box-drawing characters (or '-' if
-    // unsupported) spanning the full terminal width at `row`.
-    void draw_separator(int row);
+    // Draws a horizontal line of box-drawing characters at `row`. By default
+    // (col_start/width both 0) spans the full terminal width from column 0
+    // and finishes with EL (erase-to-end-of-line), matching the original
+    // behavior. Pass col_start/width to keep the separator confined inside
+    // --border verticals (e.g. col_start = 1, width = cols - 2): in that case
+    // EL is skipped, since it would erase the border's right-hand bar sitting
+    // just past the bounded span.
+    void draw_separator(int row, int col_start = 0, int width = 0);
 
     // Draws a single-line box border around the full frame (rows/cols given
     // to the constructor). Must be called after all interior content is

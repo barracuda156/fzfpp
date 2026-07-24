@@ -1,5 +1,6 @@
 #include "render.hpp"
 #include "util.hpp"
+#include "tty.hpp"
 
 #include <algorithm>
 #include <unistd.h>
@@ -8,6 +9,12 @@
 namespace fzf {
 
 namespace {
+
+// Module-level tab stop (see set_tabstop in render.hpp). Tabs are expanded to
+// spaces up to the next multiple of this width, measured from the current
+// visible column within the row/pane being drawn -- NOT a fixed per-codepoint
+// width, since how many columns a '\t' consumes depends on where it lands.
+int g_tabstop = 8;
 
 // Display-column width of a single Unicode codepoint, à la wcwidth(3). fzf++
 // consumers show CJK/Hangul titles (each 2 columns), Nerd Font glyphs in the
@@ -192,8 +199,20 @@ private:
     int last_emitted_width_ = 0;
 };
 
+// Width a '\t' contributes when the visible column immediately before it is
+// `col`: spaces up to (but not including) the next tab stop. Matches the
+// classic terminal/fzf convention (a tab at the tab stop itself consumes a
+// full tabstop's width, not zero).
+int tab_width_at(size_t col) {
+    int ts = g_tabstop > 0 ? g_tabstop : 8;
+    return ts - static_cast<int>(col % static_cast<size_t>(ts));
+}
+
 // Display-column width of a UTF-8 string (no ANSI stripping; caller strips SGR
-// first if needed). Falls back to byte count on malformed UTF-8.
+// first if needed), expanding '\t' per the module tab stop measured from
+// column 0 (the caller is always a full line/row starting at its own left
+// edge -- see visible_width/clip_text_line's usage). Falls back to byte count
+// on malformed UTF-8.
 size_t utf8_display_width(const std::string& s) {
     size_t w = 0;
     try {
@@ -201,6 +220,10 @@ size_t utf8_display_width(const std::string& s) {
         GraphemeWidthScanner scanner;
         while (it != s.end()) {
             char32_t cp = utf8::next(it, s.end());
+            if (cp == '\t') {
+                w += static_cast<size_t>(tab_width_at(w));
+                continue;
+            }
             w += static_cast<size_t>(scanner.consume(cp));
         }
     } catch (...) {
@@ -223,18 +246,11 @@ const char* sgr_fg_code(Color c) {
     }
 }
 
-void write_all(int fd, const std::string& data) {
-    size_t written = 0;
-    while (written < data.size()) {
-        ssize_t n = write(fd, data.data() + written, data.size() - written);
-        if (n <= 0) {
-            return;
-        }
-        written += static_cast<size_t>(n);
-    }
-}
-
 } // namespace
+
+void set_tabstop(int tabstop) {
+    g_tabstop = tabstop > 0 ? tabstop : 8;
+}
 
 FrameRenderer::FrameRenderer(int rows, int cols) : rows_(rows), cols_(cols) {}
 
@@ -287,8 +303,17 @@ void FrameRenderer::draw_row(int row, int col, const Row& spans, int max_cols) {
     // across a match-highlight span boundary still collapses to one glyph's
     // width instead of being double-counted at the seam.
     GraphemeWidthScanner width_scanner;
+    // Set once a span's content doesn't fit the remaining budget (a wide char
+    // or an expanded tab straddling the last column). Previously the inner
+    // codepoint loop merely `break`'d, which only ended that span -- the outer
+    // loop then moved on to the NEXT span and kept drawing, so a row clipped
+    // mid-string (e.g. "ab漢|cd" clipped at col 3) deleted the char that didn't
+    // fit but then resumed with trailing text ("abc" instead of stopping at
+    // "ab"). Once the row is full, no further span may emit anything; the
+    // padding below fills the rest exactly as the normal end-of-row case does.
+    bool row_done = false;
     for (const auto& span : spans) {
-        if (written >= budget) {
+        if (row_done || written >= budget) {
             break;
         }
         std::u32string cps;
@@ -302,13 +327,23 @@ void FrameRenderer::draw_row(int row, int col, const Row& spans, int max_cols) {
         }
 
         // Take as many codepoints as fit in the remaining column budget,
-        // measuring each by its display width. A wide char that would straddle
-        // the last remaining column is dropped (and the column left blank via
-        // padding below) rather than emitted half-off the pane.
+        // measuring each by its display width ('\t' expands to spaces up to
+        // the next tab stop from the current column). A wide char or tab that
+        // would straddle the last remaining column stops emission for the
+        // WHOLE row (not just this span) and the rest is left for the padding
+        // pass below, rather than dropping one char and letting later spans
+        // keep drawing past the clip point.
         std::u32string seg_cps;
         for (char32_t cp : cps) {
+            if (cp == '\t') {
+                int tw = tab_width_at(static_cast<size_t>(written));
+                if (written + tw > budget) { row_done = true; break; }
+                seg_cps.append(static_cast<size_t>(tw), U' ');
+                written += tw;
+                continue;
+            }
             int cw = width_scanner.consume(cp);
-            if (written + cw > budget) break;
+            if (written + cw > budget) { row_done = true; break; }
             seg_cps.push_back(cp);
             written += cw;
         }
@@ -339,16 +374,31 @@ void FrameRenderer::draw_text(int row, int col, const std::string& text, Style s
     draw_row(row, col, spans, max_cols);
 }
 
-void FrameRenderer::draw_separator(int row) {
+void FrameRenderer::draw_separator(int row, int col_start, int width) {
     if (row < 0 || row >= rows_) {
         return;
     }
-    move_to(row, 0);
-    for (int i = 0; i < cols_; ++i) {
+    // Default (width <= 0, matching draw_row's max_cols convention): span the
+    // whole terminal width from column 0, as before.
+    int start = col_start > 0 ? col_start : 0;
+    int span = width > 0 ? width : (cols_ - start);
+    if (span <= 0) {
+        return;
+    }
+    move_to(row, start);
+    for (int i = 0; i < span; ++i) {
         // U+2500 BOX DRAWINGS LIGHT HORIZONTAL, encoded as UTF-8.
         buffer_ += "\xE2\x94\x80";
     }
-    buffer_ += "\x1b[K";
+    // EL (erase to end of line) is only safe when the separator legitimately
+    // owns the rest of the physical line (the full-width default). With a
+    // bounded width -- i.e. the caller is keeping the separator inside
+    // --border verticals -- EL would erase the border's right-hand bar (and
+    // anything else past `start + span`), so it's skipped; the drawn run of
+    // box-drawing chars is the only output for a bounded separator.
+    if (col_start <= 0 && width <= 0) {
+        buffer_ += "\x1b[K";
+    }
 }
 
 void FrameRenderer::draw_border() {
@@ -413,6 +463,24 @@ namespace {
 // ESC[0c) while KEEPING a real image OSC (ESC]1337;File=…, no '?'); (2) to tell
 // whether a spliced sub-sequence at the tail is complete, so a partially
 // streamed image is correctly held back rather than painted truncated.
+//
+// Is `content[j]` (== 0x9c) a genuine 8-bit ST, or the trailing continuation
+// byte of a multibyte UTF-8 codepoint (e.g. Ü = C3 9C)? This is a UTF-8 world:
+// 0x9c only ever legitimately terminates a string sequence when the byte
+// immediately before it is itself a single-byte ASCII byte (< 0x80) — a
+// continuation byte can only follow a UTF-8 lead byte (>= 0xC0) or another
+// continuation byte, both of which are >= 0x80. Checking just the immediately
+// preceding byte is sufficient (and is what every scan site below already has
+// on hand): if it's ASCII, 0x9c cannot be mid-sequence in THIS string, because
+// a lead byte would have to sit between them. Applied identically at every
+// 0x9c check in this file (classify_escape_seq, dcs_seq_end,
+// sanitize_preview_line's DCS/OSC loops, string_seq_len) so the splitter and
+// the sanitizer can never disagree about where a sequence ends.
+bool is_real_st(const std::string& content, size_t j) {
+    if (j == 0) return true;
+    return static_cast<unsigned char>(content[j - 1]) < 0x80;
+}
+
 void classify_escape_seq(const std::string& line, size_t start, size_t n,
                          size_t* seg_end, bool* kept, bool* seq_terminated) {
     unsigned char intro = start + 1 < n
@@ -442,7 +510,9 @@ void classify_escape_seq(const std::string& line, size_t start, size_t n,
         bool term = false;
         while (j < n) {
             unsigned char b = static_cast<unsigned char>(line[j]);
-            if (b == 0x07 || b == 0x9c) { term_start = j; j++; term = true; break; }
+            if (b == 0x07 || (b == 0x9c && is_real_st(line, j))) {
+                term_start = j; j++; term = true; break;
+            }
             if (b == '\x1b' && j + 1 < n &&
                 static_cast<unsigned char>(line[j + 1]) == '\\') {
                 term_start = j; j += 2; term = true; break;
@@ -499,7 +569,10 @@ size_t dcs_seq_end(const std::string& content, size_t start, bool* terminated) {
     size_t j = start + 2;  // skip ESC + introducer
     while (j < n) {
         unsigned char b = static_cast<unsigned char>(content[j]);
-        if (b == 0x07 || b == 0x9c) {  // BEL / 8-bit ST: real DCS terminator
+        if (b == 0x07 || (b == 0x9c && is_real_st(content, j))) {
+            // BEL / genuine 8-bit ST: real DCS terminator. (A 0x9c that's a
+            // UTF-8 continuation byte of a multibyte codepoint in the raster
+            // falls through and is treated as ordinary payload data below.)
             if (terminated) *terminated = true;
             return j - start + 1;
         }
@@ -591,7 +664,10 @@ std::string sanitize_preview_line(const std::string& line) {
                 size_t j = i + 2;
                 while (j < n) {
                     unsigned char b = static_cast<unsigned char>(line[j]);
-                    if (b == 0x07 || b == 0x9c) {  // BEL / 8-bit ST: end DCS
+                    if (b == 0x07 || (b == 0x9c && is_real_st(line, j))) {
+                        // BEL / genuine 8-bit ST: end DCS. A 0x9c that's a
+                        // UTF-8 continuation byte (e.g. Ü = C3 9C inside the
+                        // raster/payload) falls through as ordinary data.
                         out.push_back(static_cast<char>(b));
                         j++;
                         break;
@@ -627,7 +703,9 @@ std::string sanitize_preview_line(const std::string& line) {
                 size_t term_start = n;  // index of the terminator (ST/BEL)
                 while (j < n) {
                     unsigned char b = static_cast<unsigned char>(line[j]);
-                    if (b == 0x07 || b == 0x9c) {  // BEL or 8-bit ST
+                    if (b == 0x07 || (b == 0x9c && is_real_st(line, j))) {
+                        // BEL or genuine 8-bit ST (not a UTF-8 continuation
+                        // byte, e.g. Ü = C3 9C inside an OSC 8 hyperlink URI).
                         term_start = j;
                         j++;
                         break;
@@ -722,7 +800,10 @@ size_t string_seq_len(const std::string& content, size_t start, bool* terminated
     size_t j = start + 2;  // skip ESC + introducer
     while (j < n) {
         unsigned char b = static_cast<unsigned char>(content[j]);
-        if (b == 0x07 || b == 0x9c) {  // BEL / 8-bit ST
+        if (b == 0x07 || (b == 0x9c && is_real_st(content, j))) {
+            // BEL / genuine 8-bit ST (see is_real_st: 0x9c preceded by a
+            // UTF-8 lead/continuation byte is payload, e.g. Ü = C3 9C in an
+            // OSC 8 hyperlink URI, not a terminator).
             if (terminated) *terminated = true;
             return j - start + 1;
         }
@@ -739,6 +820,28 @@ size_t string_seq_len(const std::string& content, size_t start, bool* terminated
 
 bool is_string_introducer(char c) {
     return c == ']' || c == 'P' || c == '_' || c == '^' || c == 'X';
+}
+
+// Is the string sequence starting at `row[k]` (== ESC) a genuine graphics
+// blob that must bypass column clipping -- DCS (sixel, ESC P), APC (kitty
+// graphics, ESC _), or specifically an OSC 1337 (iTerm2 inline image, "ESC ]
+// 1337 ; File=..."), as opposed to a plain OSC that happens to share the same
+// introducer (OSC 8 hyperlinks, OSC 0/1/2 window/tab title)? Those plain OSCs
+// carry ordinary text around them and must still go through the normal
+// ANSI-aware clip (escape sequences preserved, visible columns budgeted) --
+// only real image data has "width that isn't column-measurable". Exempting
+// every OSC (the previous behavior) let e.g. `ls --hyperlink` preview output
+// skip clipping entirely and wrap into the results pane.
+bool is_graphics_blob_start(const std::string& row, size_t k) {
+    if (k + 1 >= row.size() || row[k] != '\x1b') return false;
+    char intro = row[k + 1];
+    if (intro == 'P' || intro == '_') return true;
+    if (intro != ']') return false;
+    // OSC: only 1337 (iTerm2 file/image protocol) counts as a graphics blob.
+    static const std::string kMarker = "1337;";
+    size_t body = k + 2;
+    if (body > row.size()) return false;  // compare() throws if pos > size()
+    return row.compare(body, kMarker.size(), kMarker) == 0;
 }
 
 // Truncate an already-sanitized text line (SGR only, no cursor/erase escapes,
@@ -827,12 +930,16 @@ void write_preview_content(int fd, int top, int left,
         // COLOR-QUERY probes (ESC]10;? / ESC]11;?) that chafa emits to detect
         // the terminal. Forwarding those probes made the terminal reply onto
         // fzf's stdin, corrupting the query/keys and the display (the ytsurf
-        // sixel garbage). Only a blob-free row is column-clipped; a row that
-        // carries an image blob isn't (its width isn't column-measurable and
-        // clipping could cut the raster).
+        // sixel garbage). Only a row with a genuine graphics blob (DCS/APC/OSC
+        // 1337) skips column clipping (its width isn't column-measurable and
+        // clipping could cut the raster); a plain OSC (hyperlink, title) still
+        // carries ordinary column-measurable text and goes through the normal
+        // clip like any other row -- exempting every OSC let hyperlinked
+        // preview text (`ls --hyperlink`) skip clipping and wrap into the
+        // results pane.
         bool has_blob = false;
         for (size_t k = 0; k + 1 < row.size(); ++k) {
-            if (row[k] == '\x1b' && is_string_introducer(row[k + 1])) {
+            if (is_graphics_blob_start(row, k)) {
                 has_blob = true;
                 break;
             }
@@ -877,6 +984,20 @@ std::string truncate_ansi_text(const std::string& text, size_t max_cols) {
             result.append(text, start, j - start);
             any_sgr = true;
             i = j;
+            continue;
+        }
+
+        if (text[i] == '\t') {
+            // Expand to spaces up to the next tab stop from the current
+            // visible column; stop (without emitting a partial tab) if even
+            // the first expanded space would straddle max_cols.
+            int tw = tab_width_at(visible_count);
+            if (visible_count + static_cast<size_t>(tw) > max_cols) {
+                break;
+            }
+            result.append(static_cast<size_t>(tw), ' ');
+            i += 1;
+            visible_count += static_cast<size_t>(tw);
             continue;
         }
 
