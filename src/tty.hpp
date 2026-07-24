@@ -67,4 +67,17 @@ void wake_pipe(int write_fd);
 // repeated signals/wakes coalesce into a single action.
 void drain_pipe(int read_fd);
 
+// EINTR-safe, short-write-safe blocking write of `len` bytes from `data` to
+// `fd`. Retries on EINTR instead of giving up, and keeps writing on a short
+// write (n > 0 but n < remaining) until the whole buffer is out or a real
+// error (n < 0, errno != EINTR) occurs. Shared by render.cpp's chrome/preview
+// writes and terminal.cpp's frame writes so a signal landing mid-write can't
+// truncate output — the exact failure class the sixel/DCS hold-back logic in
+// render.cpp guards against at the protocol level; this guards the same blob
+// at the syscall level.
+void write_all(int fd, const char* data, size_t len);
+inline void write_all(int fd, const std::string& data) {
+    write_all(fd, data.data(), data.size());
+}
+
 } // namespace fzf
