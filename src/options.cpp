@@ -3,6 +3,8 @@
 #include <iostream>
 #include <sstream>
 #include <cstdlib>
+#include <algorithm>
+#include <cctype>
 
 namespace fzf {
 
@@ -118,15 +120,44 @@ static std::vector<FieldRange> parse_nth_spec(const std::string& spec) {
     return ranges;
 }
 
+// fzf's key names are case-insensitive (`Ctrl-A`, `BTab`, `ALT-b` all work),
+// but this port's bindings map and terminal.cpp's lookups are all lowercase
+// (see event_to_bind_key / the "tab","home","end","btab" etc. literals).
+// Normalize to lowercase, with one exception: the letter immediately after
+// "alt-" must keep its original case, since fzf's alt-<letter> encodes the
+// literal Meta-shifted byte (alt-B and alt-b are genuinely different keys —
+// terminal.cpp's alt handling forwards the raw second byte unchanged).
+static std::string normalize_bind_key(const std::string& key) {
+    std::string lower = key;
+    for (char& c : lower) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    // "alt-" is 4 chars; if that's really what precedes the remainder in the
+    // ORIGINAL (case-sensitive) string, restore the original casing of the
+    // single letter that follows.
+    if (lower.size() > 4 && lower.compare(0, 4, "alt-") == 0) {
+        lower[4] = key[4];
+    }
+    return lower;
+}
+
 Options parse_options(int argc, char* argv[]) {
     Options opts;
 
     // Build the effective argument list: $FZF_DEFAULT_OPTS first (so real
     // command-line args override it), then argv. Handle +i and +m here too
     // (CLI11 doesn't support the + prefix), from either source.
-    bool case_sensitive_flag = false;
     bool no_multi_flag = false;
     std::vector<std::string> arg_storage;
+
+    // Case-mode precedence in real fzf is LAST-OCCURRENCE-WINS across -i,
+    // +i, and --case=X, in command-line order (after FZF_DEFAULT_OPTS
+    // prepending, so a per-invocation flag overrides a default-opts one).
+    // CLI11 gives us each option's own last value but not their relative
+    // order against each other, so track the winner directly while walking
+    // the merged, already-ordered raw_args below.
+    bool case_mode_seen = false;
+    CaseMode last_case_mode = CaseMode::Smart;
 
     arg_storage.push_back(argv[0]);
 
@@ -140,10 +171,27 @@ Options parse_options(int argc, char* argv[]) {
         raw_args.push_back(argv[i]);
     }
 
-    for (const auto& arg : raw_args) {
-        if (arg == "+i") {
-            case_sensitive_flag = true;
-        } else if (arg == "+m") {
+    for (size_t ai = 0; ai < raw_args.size(); ++ai) {
+        const auto& arg = raw_args[ai];
+        if (arg == "-i") {
+            case_mode_seen = true;
+            last_case_mode = CaseMode::Ignore;
+        } else if (arg == "+i") {
+            case_mode_seen = true;
+            last_case_mode = CaseMode::Respect;
+        } else if (arg.compare(0, 7, "--case=") == 0) {
+            std::string v = arg.substr(7);
+            if (v == "smart") { case_mode_seen = true; last_case_mode = CaseMode::Smart; }
+            else if (v == "ignore") { case_mode_seen = true; last_case_mode = CaseMode::Ignore; }
+            else if (v == "respect") { case_mode_seen = true; last_case_mode = CaseMode::Respect; }
+        } else if (arg == "--case" && ai + 1 < raw_args.size()) {
+            const std::string& v = raw_args[ai + 1];
+            if (v == "smart") { case_mode_seen = true; last_case_mode = CaseMode::Smart; }
+            else if (v == "ignore") { case_mode_seen = true; last_case_mode = CaseMode::Ignore; }
+            else if (v == "respect") { case_mode_seen = true; last_case_mode = CaseMode::Respect; }
+        }
+
+        if (arg == "+m") {
             no_multi_flag = true;
         } else if (arg.size() > 2 && arg.compare(0, 2, "--") == 0 &&
                    arg.back() == '=' &&
@@ -301,8 +349,9 @@ Options parse_options(int argc, char* argv[]) {
     app.add_option("-q,--query", opts.query, "Initial query string");
 
     std::string filter_query;
-    app.add_option("-f,--filter", filter_query,
-                   "Filter mode (non-interactive, print matches)");
+    CLI::Option* filter_opt =
+        app.add_option("-f,--filter", filter_query,
+                       "Filter mode (non-interactive, print matches)");
 
     app.add_flag("-1,--select-1", opts.select_1,
                  "Auto-select if only one match");
@@ -334,9 +383,14 @@ Options parse_options(int argc, char* argv[]) {
         ->allow_extra_args()
         ->multi_option_policy(CLI::MultiOptionPolicy::TakeAll);
 
-    std::string expect_str;
-    app.add_option("--expect", expect_str,
-                   "Comma-separated list of keys that trigger exit with key name");
+    // fzf semantics: repeated --expect ACCUMULATE (each occurrence adds keys)
+    // rather than the last one replacing the others. Opt into TakeAll like
+    // --bind/--color and merge every occurrence's comma-separated keys below.
+    std::vector<std::string> expect_specs;
+    app.add_option("--expect", expect_specs,
+                   "Comma-separated list of keys that trigger exit with key name")
+        ->allow_extra_args()
+        ->multi_option_policy(CLI::MultiOptionPolicy::TakeAll);
 
     app.add_option("--with-shell", opts.with_shell,
                    "Shell to use for execute actions");
@@ -367,33 +421,98 @@ Options parse_options(int argc, char* argv[]) {
         opts.accept_nth = parse_nth_spec(accept_nth_str);
     }
 
+    // Key-taking actions whose argument extends to the END OF THE SPEC — fzf
+    // does not comma-split inside them, unlike the parenthesized action form.
+    // e.g. `--bind 'focus:transform-header:case $a in a,b) ... esac'` keeps
+    // the comma in the shell case statement as part of the argument.
+    static const std::vector<std::string> trailing_colon_actions = {
+        "reload", "preview", "change-preview", "change-prompt", "change-header",
+        "transform-header", "transform", "execute", "execute-silent",
+        "become", "unbind", "rebind",
+    };
+
+    // Returns the length of a trailing-colon action name if the segment
+    // starting at spec[seg_start] is exactly one of trailing_colon_actions
+    // immediately followed by ':' at spec[seg_start+len], else 0. seg_start
+    // is the start of the current action-name segment (after the key's
+    // colon, or after a '+' composite separator) — NOT the start of the
+    // whole key:action pair.
+    auto match_trailing_colon_action = [](const std::string& s, size_t seg_start) -> size_t {
+        for (const auto& name : trailing_colon_actions) {
+            size_t n = name.size();
+            if (seg_start + n < s.size() && s.compare(seg_start, n, name) == 0 &&
+                s[seg_start + n] == ':') {
+                return n;
+            }
+        }
+        return 0;
+    };
+
     // Parse --bind specifications. A single --bind argument may itself hold
     // multiple comma-separated key:action pairs (e.g. yt-x's and viu's
     // "ctrl-/:toggle-preview,ctrl-space:toggle-wrap+toggle-preview-wrap"), so
-    // split on top-level commas first. Commas inside an action's parenthesized
-    // argument (e.g. execute(echo a,b)) must not be split on, so track paren
-    // depth while scanning.
+    // split on top-level commas first. Commas inside an action's
+    // parenthesized/bracketed argument (e.g. execute(echo a,b), or fzf's
+    // alternate execute[...]/execute{...} delimiters) must not be split on,
+    // so track paren/bracket depth while scanning. Additionally, once we
+    // recognize a trailing-colon arg-taking action (NAME: with no bracket,
+    // e.g. focus:transform-header:CMD), the rest of the ENTIRE spec string
+    // is that action's argument — stop splitting altogether for the
+    // remainder, including any commas inside it.
     for (const auto& spec : bind_specs) {
-        size_t start = 0;
+        size_t start = 0;      // start of the current key:action pair
+        size_t seg_start = 0;  // start of the current action-NAME segment
+        bool seg_start_valid = false;  // false while still scanning the key part
         int depth = 0;
+        bool in_trailing_arg = false;  // rest of spec is one action's argument
         for (size_t i = 0; i <= spec.size(); ++i) {
             bool at_end = (i == spec.size());
             char c = at_end ? '\0' : spec[i];
-            if (c == '(') depth++;
-            else if (c == ')') { if (depth > 0) depth--; }
 
-            if ((c == ',' && depth == 0) || at_end) {
+            if (!in_trailing_arg) {
+                if (c == '(' || c == '[' || c == '{') {
+                    depth++;
+                } else if (c == ')' || c == ']' || c == '}') {
+                    if (depth > 0) depth--;
+                } else if (c == ':' && depth == 0) {
+                    if (!seg_start_valid) {
+                        // This is the key/action separator; the action-name
+                        // segment begins right after it.
+                        seg_start_valid = true;
+                        seg_start = i + 1;
+                    } else {
+                        // A second top-level ':' — check whether the segment
+                        // since the last '+' (or since the key colon) is one
+                        // of the arg-taking action names.
+                        size_t n = match_trailing_colon_action(spec, seg_start);
+                        if (n > 0 && seg_start + n == i) {
+                            in_trailing_arg = true;
+                        }
+                    }
+                } else if (c == '+' && depth == 0 && seg_start_valid) {
+                    // Composite separator between actions (e.g.
+                    // "toggle+preview:CMD" is not real fzf syntax for
+                    // trailing-colon actions, but keep the segment tracking
+                    // consistent so a future action name after '+' is still
+                    // recognized at its own boundary).
+                    seg_start = i + 1;
+                }
+            }
+
+            if ((c == ',' && depth == 0 && !in_trailing_arg) || at_end) {
                 std::string pair = spec.substr(start, i - start);
                 start = i + 1;
+                seg_start_valid = false;
 
                 size_t colon = pair.find(':');
                 if (colon != std::string::npos) {
                     std::string key = pair.substr(0, colon);
                     std::string action = pair.substr(colon + 1);
                     if (!key.empty()) {
-                        opts.bindings[key] = action;
+                        opts.bindings[normalize_bind_key(key)] = action;
                     }
                 }
+                if (in_trailing_arg) break;  // remainder already consumed as one pair
             }
         }
     }
@@ -408,55 +527,102 @@ Options parse_options(int argc, char* argv[]) {
         opts.bindings.emplace(key, "abort");
     }
 
+    // Seed fzf's remaining default keymap (readline-style line editing plus
+    // the standard scroll/toggle keys). emplace() is a no-op where the key
+    // is already bound, so an explicit --bind for any of these still wins.
+    // terminal.cpp implements the actual key->action dispatch separately;
+    // unknown action strings are currently no-ops there, so landing the
+    // bindings here first is safe even before that dispatch exists.
+    static const std::pair<const char*, const char*> default_binds[] = {
+        {"ctrl-j", "down"},
+        {"ctrl-k", "up"},
+        {"ctrl-p", "up"},
+        {"ctrl-n", "down"},
+        {"ctrl-u", "unix-line-discard"},
+        {"ctrl-w", "unix-word-rubout"},
+        {"ctrl-a", "beginning-of-line"},
+        {"ctrl-e", "end-of-line"},
+        {"ctrl-b", "backward-char"},
+        {"ctrl-f", "forward-char"},
+        {"ctrl-d", "delete-char/eof"},
+        {"ctrl-h", "backward-delete-char"},
+        {"alt-b", "backward-word"},
+        {"alt-f", "forward-word"},
+        {"alt-d", "kill-word"},
+        {"alt-bs", "backward-kill-word"},
+        {"btab", "toggle+up"},
+        {"tab", "toggle+down"},
+        {"home", "first"},
+        {"end", "last"},
+    };
+    for (const auto& [key, action] : default_binds) {
+        opts.bindings.emplace(key, action);
+    }
+
     if (version) {
         std::cout << "fzf++ version 0.2.0 (C++20 implementation)" << std::endl;
         std::cout << "Compatible with fzf" << std::endl;
         std::exit(0);
     }
 
-    if (!filter_query.empty()) {
+    // Detect PRESENCE of -f/--filter, not string emptiness: `fzf -f ''` is a
+    // valid (and common) way to ask for filter mode with an empty query
+    // (print every line non-interactively), and must not fall through to the
+    // interactive TUI.
+    if (filter_opt->count() > 0) {
         opts.filter = true;
         opts.query = filter_query;
     }
 
+    // fzf's --margin takes 1, 2, or 4 comma-separated values (each an
+    // absolute line/col count or a percentage): 1 = all sides; 2 =
+    // vertical,horizontal; 4 = top,right,bottom,left.
     if (!margin_str.empty()) {
         std::stringstream ss(margin_str);
         std::string value;
-        std::vector<int> margins;
+        std::vector<Options::Margin> margins;
         while (std::getline(ss, value, ',')) {
+            Options::Margin m;
+            std::string num_str = value;
+            if (!num_str.empty() && num_str.back() == '%') {
+                m.percent = true;
+                num_str.pop_back();
+            }
             try {
-                margins.push_back(std::stoi(value));
+                size_t consumed = 0;
+                m.value = std::stoi(num_str, &consumed);
+                if (consumed != num_str.size()) throw std::invalid_argument("trailing");
             } catch (...) {
                 std::cerr << "Invalid margin value: " << value << std::endl;
+                continue;
             }
+            margins.push_back(m);
         }
-        if (margins.size() == 4) {
+        if (margins.size() == 1) {
+            opts.margin_top = opts.margin_right = opts.margin_bottom = opts.margin_left = margins[0];
+        } else if (margins.size() == 2) {
+            opts.margin_top = opts.margin_bottom = margins[0];
+            opts.margin_right = opts.margin_left = margins[1];
+        } else if (margins.size() == 4) {
             opts.margin_top = margins[0];
             opts.margin_right = margins[1];
             opts.margin_bottom = margins[2];
             opts.margin_left = margins[3];
+        } else if (!margins.empty()) {
+            std::cerr << "Invalid --margin: expected 1, 2, or 4 values, got "
+                      << margins.size() << std::endl;
         }
     }
 
-    if (case_insensitive_flag) {
-        opts.case_mode = CaseMode::Ignore;
-    }
-    if (case_sensitive_flag) {
-        opts.case_mode = CaseMode::Respect;
+    // Case-mode: last occurrence among -i / +i / --case wins, in the order
+    // they appeared across FZF_DEFAULT_OPTS + argv (tracked while walking
+    // raw_args above), NOT a fixed -i-then-+i-then---case precedence.
+    if (case_mode_seen) {
+        opts.case_mode = last_case_mode;
     }
 
     if (no_multi_flag) {
         opts.multi = false;
-    }
-
-    if (!case_str.empty()) {
-        if (case_str == "smart") {
-            opts.case_mode = CaseMode::Smart;
-        } else if (case_str == "ignore") {
-            opts.case_mode = CaseMode::Ignore;
-        } else if (case_str == "respect") {
-            opts.case_mode = CaseMode::Respect;
-        }
     }
 
     if (!layout_str.empty()) {
@@ -470,33 +636,34 @@ Options parse_options(int argc, char* argv[]) {
     }
 
     if (!height_str.empty()) {
-        if (height_str.back() == '%') {
-            std::string num_str = height_str.substr(0, height_str.size() - 1);
-            try {
-                opts.height = std::stoi(num_str);
-                opts.height_is_percent = true;
-                if (opts.height < 0 || opts.height > 100) {
-                    std::cerr << "Warning: height percentage should be 0-100, got " << opts.height << "%" << std::endl;
-                    opts.height = std::clamp(opts.height, 0, 100);
-                }
-            } catch (...) {
-                std::cerr << "Invalid height value: " << height_str << std::endl;
+        // fzf's "adaptive height" prefix (--height=~40%): grow/shrink to fit
+        // content up to the given cap. This port has no adaptive-resize
+        // logic, so approximate by treating it as the same fixed size cap —
+        // silently (no warning), same as the rest of this tolerant parser.
+        std::string h = height_str;
+        if (!h.empty() && h.front() == '~') {
+            h.erase(0, 1);
+        }
+        bool is_percent = !h.empty() && h.back() == '%';
+        std::string num_str = is_percent ? h.substr(0, h.size() - 1) : h;
+        try {
+            if (num_str.empty()) throw std::invalid_argument("empty");
+            size_t consumed = 0;
+            int v = std::stoi(num_str, &consumed);
+            if (consumed != num_str.size()) throw std::invalid_argument("trailing");
+            opts.height = v;
+            opts.height_is_percent = is_percent;
+            if (is_percent) {
+                opts.height = std::clamp(opts.height, 0, 100);
+            } else if (opts.height < 0) {
                 opts.height = 0;
-                opts.height_is_percent = false;
             }
-        } else {
-            try {
-                opts.height = std::stoi(height_str);
-                opts.height_is_percent = false;
-                if (opts.height < 0) {
-                    std::cerr << "Warning: height must be non-negative, got " << opts.height << std::endl;
-                    opts.height = 0;
-                }
-            } catch (...) {
-                std::cerr << "Invalid height value: " << height_str << std::endl;
-                opts.height = 0;
-                opts.height_is_percent = false;
-            }
+        } catch (...) {
+            // Unparseable height: fall back to fullscreen cleanly, without
+            // printing a warning (would land in the alt screen / corrupt the
+            // TUI frame rather than reach a terminal the user can read).
+            opts.height = 0;
+            opts.height_is_percent = false;
         }
     }
 
@@ -506,44 +673,125 @@ Options parse_options(int argc, char* argv[]) {
         }
     }
 
-    // Parse --expect (comma-separated keys)
-    if (!expect_str.empty()) {
+    // Parse --expect: each occurrence is a comma-separated key list; fzf
+    // merges every occurrence (repeated --expect accumulates) rather than
+    // the last one replacing the others. Trim whitespace and dedupe while
+    // preserving first-seen order.
+    for (const auto& expect_str : expect_specs) {
         std::stringstream ss(expect_str);
         std::string key;
         while (std::getline(ss, key, ',')) {
-            opts.expect_keys.push_back(key);
+            size_t a = key.find_first_not_of(" \t");
+            size_t b = key.find_last_not_of(" \t");
+            if (a == std::string::npos) continue;
+            key = key.substr(a, b - a + 1);
+            if (key.empty()) continue;
+            if (std::find(opts.expect_keys.begin(), opts.expect_keys.end(), key) ==
+                opts.expect_keys.end()) {
+                opts.expect_keys.push_back(key);
+            }
         }
     }
 
-    // Process --preview-window
+    // Process --preview-window. fzf's classic syntax is actually
+    // colon-separated (e.g. "up:60%:wrap"), though this port has
+    // historically also accepted commas (e.g. the clifm-style
+    // "border-rounded,left,35%,wrap" yt-x passes) — tokenize on BOTH so
+    // either form (or a mix) works, matching real fzf's tolerance.
     if (!opts.preview_window.empty()) {
-        std::stringstream ss(opts.preview_window);
+        std::string spec = opts.preview_window;
+        // Normalize ':' to ',' then split once on ',', to avoid a second
+        // stringstream pass.
+        for (char& c : spec) {
+            if (c == ':') c = ',';
+        }
+        std::stringstream ss(spec);
         std::string part;
         while (std::getline(ss, part, ',')) {
+            if (part.empty()) continue;
             if (part == "left" || part == "right" || part == "up" || part == "down") {
                 opts.preview_position = part;
-            }
-            else if (!part.empty() && part.back() == '%') {
-                std::string num_str = part.substr(0, part.size() - 1);
-                try {
-                    opts.preview_size_percent = std::stoi(num_str);
-                    opts.preview_size_percent = std::clamp(opts.preview_size_percent, 0, 100);
-                } catch (...) {
-                    std::cerr << "Invalid preview size: " << part << std::endl;
-                }
             }
             else if (part == "wrap") {
                 opts.preview_wrap = true;
             }
+            else if (part == "nowrap") {
+                opts.preview_wrap = false;
+            }
+            else if (part == "hidden") {
+                opts.preview_hidden = true;
+            }
+            else if (part == "follow") {
+                opts.preview_follow = true;
+            }
+            else if (part == "nofollow") {
+                opts.preview_follow = false;
+            }
+            else if (part == "cycle") {
+                // No-op: this port has no separate preview-window cycle mode.
+            }
+            else if (part.compare(0, 7, "border-") == 0) {
+                // No-op: preview border style is not independently
+                // configurable from the main --border yet.
+            }
+            else if (part.back() == '%') {
+                std::string num_str = part.substr(0, part.size() - 1);
+                try {
+                    size_t consumed = 0;
+                    int v = std::stoi(num_str, &consumed);
+                    if (consumed != num_str.size()) throw std::invalid_argument("trailing");
+                    opts.preview_size_percent = std::clamp(v, 0, 100);
+                    opts.preview_size_is_percent = true;
+                } catch (...) {
+                    // Unknown/malformed token: skip silently, matching fzf's
+                    // tolerance of unrecognized --preview-window components.
+                }
+            }
+            else {
+                // Bare N: an absolute line/column count rather than a
+                // percentage (fzf: "--preview-window=up,10" == 10 lines).
+                try {
+                    size_t consumed = 0;
+                    int v = std::stoi(part, &consumed);
+                    if (consumed != part.size()) throw std::invalid_argument("trailing");
+                    opts.preview_size_percent = v;
+                    opts.preview_size_is_percent = false;
+                } catch (...) {
+                    // Unrecognized token (e.g. a future fzf keyword this
+                    // port doesn't implement yet): skip silently like fzf.
+                }
+            }
         }
     }
 
+    // Each --color argument is itself a comma-separated list of "name:value"
+    // pairs (e.g. "bg+:6,fg+:3"); split on commas first, then take the
+    // FIRST colon per pair (values may legitimately contain further colons
+    // in fzf's extended color specs). A bare scheme name with no colon
+    // (dark/light/16/16m/bw) is a recognized standalone token — record it
+    // under its own key so a future renderer can pick it up, rather than
+    // silently dropping it.
+    static const std::vector<std::string> color_schemes = {"dark", "light", "16", "16m", "bw"};
     for (const auto& spec : color_specs) {
-        size_t colon = spec.find(':');
-        if (colon != std::string::npos) {
-            std::string key = spec.substr(0, colon);
-            std::string value = spec.substr(colon + 1);
-            opts.colors[key] = value;
+        std::stringstream ss(spec);
+        std::string pair;
+        while (std::getline(ss, pair, ',')) {
+            if (pair.empty()) continue;
+            size_t colon = pair.find(':');
+            if (colon == std::string::npos) {
+                if (std::find(color_schemes.begin(), color_schemes.end(), pair) !=
+                    color_schemes.end()) {
+                    opts.colors["scheme"] = pair;
+                }
+                // Unknown bare token: skip silently, matching fzf's
+                // tolerance of unrecognized --color components.
+                continue;
+            }
+            std::string key = pair.substr(0, colon);
+            std::string value = pair.substr(colon + 1);
+            if (!key.empty()) {
+                opts.colors[key] = value;
+            }
         }
     }
 

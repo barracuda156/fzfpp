@@ -35,11 +35,17 @@ struct Options {
     bool no_mouse = false;
     bool no_unicode = false;   // Disable unicode characters
 
-    // Margins (clifm compatibility)
-    int margin_top = 0;
-    int margin_right = 0;
-    int margin_bottom = 0;
-    int margin_left = 0;
+    // Margins (clifm compatibility). fzf's --margin accepts 1, 2, or 4
+    // comma-separated values (1=all sides; 2=vertical,horizontal;
+    // 4=top,right,bottom,left) and each value may be a percentage.
+    struct Margin {
+        int value = 0;
+        bool percent = false;
+    };
+    Margin margin_top;
+    Margin margin_right;
+    Margin margin_bottom;
+    Margin margin_left;
 
     // Interaction options
     bool multi = false;        // Multi-select mode
@@ -92,7 +98,10 @@ struct Options {
     std::vector<std::string> expect_keys;
     std::string preview_position = "right";
     int preview_size_percent = 50;
+    bool preview_size_is_percent = true;   // false = preview_size_percent holds an absolute line/col count
     bool preview_wrap = false;
+    bool preview_hidden = false;           // --preview-window=hidden
+    bool preview_follow = false;           // --preview-window=follow
     std::map<std::string, std::string> colors;
     std::string border_style;
     std::string border_label;
