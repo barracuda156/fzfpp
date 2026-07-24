@@ -15,6 +15,8 @@
 #include <unordered_map>
 #include <list>
 #include <chrono>
+#include <cstdint>
+#include <sys/types.h>
 
 namespace fzf {
 
@@ -33,6 +35,14 @@ public:
 
     // Get matched expect key (empty if none matched)
     std::string get_matched_expect_key() const { return matched_expect_key_; }
+
+    // True if the interactive session ended by abort (esc/ctrl-c/ctrl-g) rather
+    // than accept. main uses this for fzf's exit-code contract (130 on abort).
+    bool was_aborted() const { return !accepted_; }
+
+    // The query as it stood when the session ended — what --print-query must
+    // print (fzf prints the live query, not the initial --query value).
+    const std::string& final_query() const { return current_query_; }
 
 private:
     // Update search results
@@ -82,6 +92,13 @@ private:
     // Preview support
     std::string substitute_placeholders(const std::string& cmd, size_t index);
 
+    // Item-anchored variant used by the preview worker: the item is captured
+    // once by the caller, so a concurrent results update can't swap which
+    // item's text gets substituted mid-command. display_index only feeds
+    // fzf's {n} placeholder fallback when item is null.
+    std::string substitute_placeholders_for_item(const std::string& cmd,
+                                                 const std::shared_ptr<Item>& item);
+
     // Run a shell command synchronously and return its stdout with a single
     // trailing newline trimmed (matching fzf's convention for transform-*
     // actions). Returns empty string if the command can't be started.
@@ -97,7 +114,11 @@ private:
     // and painted stale columns nobody cleared -- see render.cpp history).
     void calculate_column_layout(int content_cols, int& results_width,
                                   int& preview_cols, int& sep_col) const;
-    void set_preview_env_vars() const;  // Set FZF_PREVIEW_* environment variables
+
+    // FZF_PREVIEW_* variables for a preview child's environment. Returned as
+    // NAME=value strings for shell_popen's execve instead of setenv'd: the
+    // worker mutating environ while the main thread reads it is UB.
+    std::vector<std::string> preview_env_vars() const;
 
     // --- Rendering (direct-terminal backend, replaces FTXUI) ---
 
@@ -129,12 +150,29 @@ private:
     Reader& reader_;
     Matcher matcher_;
 
-    // UI state
+    // UI state. current_query_ and current_header_ are mutated only on the
+    // main thread, but the preview worker reads them ({q} substitution,
+    // header-row layout math) -- every write and every cross-thread read
+    // must hold preview_mutex_ (see set_current_query / set_current_header).
     std::string current_query_;
     std::u32string query_codepoints_;  // current_query_ decoded, for cursor math
     size_t query_cursor_;              // codepoint index into query_codepoints_
     std::string current_prompt_;  // Live prompt; starts at opts_.prompt, changed by change-prompt
     std::string current_header_;  // Live header; starts at opts_.header, changed by transform-header
+
+    // Rebuild current_query_ from query_codepoints_ under preview_mutex_.
+    void sync_query_from_codepoints();
+    void set_current_header(const std::string& header);
+
+    // Post a new preview target: bumps the generation (stopping any
+    // in-flight render's publish/cache) and signals the streaming child.
+    void supersede_preview();
+
+    // If the cursor moved to a new item, serve its preview from cache or
+    // post a render request to the worker. Returns true if the pane needs
+    // repainting. Called once before the event loop (a small finished input
+    // never wakes the loop) and after every dispatched batch.
+    bool maybe_request_preview();
     std::vector<MatchResult> current_results_;
     size_t cursor_pos_;           // Current cursor position
     size_t scroll_offset_;        // Scroll offset for results
@@ -174,12 +212,30 @@ private:
     size_t last_painted_scroll_ = SIZE_MAX;
     bool last_painted_valid_ = false;
 
-    // Async preview rendering
+    // Async preview rendering.
+    //
+    // Cancellation protocol: preview_generation_ increments every time the
+    // main thread posts a new target (and once at shutdown). The worker
+    // captures the generation together with the target; while streaming it
+    // compares against the live value and stops when superseded. The old
+    // scheme was a bool the main thread set and immediately cleared, which
+    // the worker essentially never observed -- superseded previews ran to
+    // completion and their output was cached under the *new* target's key
+    // (wrong-item cache poisoning). The worker must also capture
+    // preview_target_item_ at request-take time, never at completion time.
+    //
+    // preview_child_pid_ holds the process group of the currently-streaming
+    // preview command so the main thread can kill it on supersede/teardown
+    // instead of waiting for it to finish (or hang -- `--preview 'tail -f'`
+    // used to wedge the worker and then the whole process at join()).
     std::thread preview_thread_;
     std::atomic<bool> preview_pending_;
-    std::atomic<bool> preview_cancel_;
+    std::atomic<bool> preview_shutdown_;
+    std::atomic<uint64_t> preview_generation_;
+    std::atomic<pid_t> preview_child_pid_;
     std::atomic<size_t> preview_target_cursor_;
     std::string preview_target_item_;  // Item text for the target preview (protected by preview_mutex_)
+    std::shared_ptr<Item> preview_target_item_ptr_;  // The Item itself (protected by preview_mutex_)
 
     // Preview cache (LRU)
     std::unordered_map<std::string, std::string> preview_cache_;  // item_text -> preview_content

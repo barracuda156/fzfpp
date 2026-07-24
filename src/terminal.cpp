@@ -3,6 +3,7 @@
 #include "tty.hpp"
 #include "keyparser.hpp"
 #include "render.hpp"
+#include "shellcmd.hpp"
 #include <algorithm>
 #include <iostream>
 #include <sstream>
@@ -19,73 +20,43 @@ namespace fzf {
 
 namespace {
 
-// popen(3) always execs the *system* shell (/bin/sh), never the user's
-// $SHELL. Real fzf runs preview/execute commands under $SHELL (falling back
-// to "sh" if unset) -- on most Linux distros /bin/sh is dash, whose printf
-// builtin doesn't support bash's \xHH hex escapes and differs from bash in
-// other ways preview scripts routinely rely on, so a script that works under
-// interactive bash can silently misbehave when fzfpp runs it through dash.
-// This is a minimal popen(cmd, "r") replacement that execs $SHELL -c cmd
-// instead, keeping the same "read stdout, later reap the child" shape as the
-// call sites already use.
-struct ShellPipe {
-    FILE* stream = nullptr;
-    pid_t pid = -1;
-};
+// SIGTERM/SIGHUP land here: request a clean abort so the run loop restores
+// the terminal (alt screen, mouse reporting, cursor) before exiting. Only
+// async-signal-safe operations: set a flag, poke the self-pipe.
+volatile sig_atomic_t g_termination_requested = 0;
+int g_termination_wake_fd = -1;
 
-ShellPipe shell_popen(const std::string& cmd) {
-    ShellPipe result;
-
-    int fds[2];
-    if (pipe(fds) != 0) {
-        return result;
+void termination_handler(int) {
+    g_termination_requested = 1;
+    if (g_termination_wake_fd >= 0) {
+        int saved_errno = errno;
+        char byte = 1;
+        ssize_t w = write(g_termination_wake_fd, &byte, 1);
+        (void)w;
+        errno = saved_errno;
     }
+}
 
-    pid_t pid = fork();
-    if (pid < 0) {
-        close(fds[0]);
-        close(fds[1]);
-        return result;
-    }
-
-    if (pid == 0) {
-        // Child: stdout -> write end of the pipe, then exec the shell.
-        close(fds[0]);
-        dup2(fds[1], STDOUT_FILENO);
-        close(fds[1]);
-
-        const char* shell = getenv("SHELL");
-        if (!shell || shell[0] == '\0') {
-            shell = "/bin/sh";
+// Restores terminal modes even when the loop exits by exception -- an
+// uncaught throw used to strand the user's shell inside the alt screen
+// with the cursor hidden and mouse reporting on.
+struct ScreenGuard {
+    bool mouse;
+    explicit ScreenGuard(bool with_mouse) : mouse(with_mouse) {
+        enter_alt_screen(STDOUT_FILENO);
+        hide_cursor(STDOUT_FILENO);
+        if (mouse) {
+            enable_mouse(STDOUT_FILENO);
         }
-        execl(shell, shell, "-c", cmd.c_str(), static_cast<char*>(nullptr));
-        _exit(127);  // exec failed
     }
-
-    // Parent: stdin <- read end of the pipe.
-    close(fds[1]);
-    result.stream = fdopen(fds[0], "r");
-    if (!result.stream) {
-        close(fds[0]);
-        int status;
-        waitpid(pid, &status, 0);
-        return ShellPipe{};
+    ~ScreenGuard() {
+        if (mouse) {
+            disable_mouse(STDOUT_FILENO);
+        }
+        show_cursor(STDOUT_FILENO);
+        leave_alt_screen(STDOUT_FILENO);
     }
-    result.pid = pid;
-    return result;
-}
-
-void shell_pclose(ShellPipe& p) {
-    if (p.stream) {
-        fclose(p.stream);
-        p.stream = nullptr;
-    }
-    if (p.pid > 0) {
-        int status;
-        waitpid(p.pid, &status, 0);
-        p.pid = -1;
-    }
-}
+};
 
 }  // namespace
 
@@ -101,7 +72,7 @@ Terminal::Terminal(const Options& opts, Reader& reader)
       matched_expect_key_(""),
       visible_lines_(10),  // Default, will be updated
       wrap_lines_(opts.wrap),  // Initialize from options
-      preview_visible_(true),  // Preview visible by default (if preview_command set)
+      preview_visible_(!opts.preview_hidden),  // --preview-window=hidden starts it off
       last_click_time_(std::chrono::steady_clock::now()),
       last_click_x_(-1),
       last_click_y_(-1),
@@ -109,7 +80,9 @@ Terminal::Terminal(const Options& opts, Reader& reader)
       preview_scroll_offset_(0),  // Start at top of preview
       preview_total_lines_(0),    // No preview lines initially
       preview_pending_(false),
-      preview_cancel_(false),
+      preview_shutdown_(false),
+      preview_generation_(0),
+      preview_child_pid_(-1),
       preview_target_cursor_(SIZE_MAX),
       wake_read_fd_(-1),
       wake_write_fd_(-1),
@@ -121,13 +94,39 @@ Terminal::Terminal(const Options& opts, Reader& reader)
 }
 
 Terminal::~Terminal() {
-    // Signal preview thread to stop
-    preview_cancel_.store(true);
+    // Signal preview thread to stop, and kill any streaming preview command
+    // outright -- the worker may be blocked in fread() on a child that never
+    // exits (tail -f style previews), where no flag check can reach it.
+    preview_shutdown_.store(true);
+    preview_generation_.fetch_add(1);
     preview_pending_.store(false);
+    shell_kill(preview_child_pid_.load(), SIGKILL);
 
     if (preview_thread_.joinable()) {
         preview_thread_.join();
     }
+}
+
+void Terminal::supersede_preview() {
+    preview_generation_.fetch_add(1);
+    // A streaming render for the old target may sit in fread() indefinitely;
+    // terminate its process group so the worker gets EOF and moves on. The
+    // worker re-checks its generation before publishing, so even output that
+    // raced in before the signal can't be shown or cached.
+    shell_kill(preview_child_pid_.load(), SIGTERM);
+}
+
+void Terminal::sync_query_from_codepoints() {
+    std::string utf8_text;
+    utf8::utf32to8(query_codepoints_.begin(), query_codepoints_.end(),
+                   std::back_inserter(utf8_text));
+    std::lock_guard<std::mutex> lock(preview_mutex_);
+    current_query_ = std::move(utf8_text);
+}
+
+void Terminal::set_current_header(const std::string& header) {
+    std::lock_guard<std::mutex> lock(preview_mutex_);
+    current_header_ = header;
 }
 
 void Terminal::update_results(const std::string& query) {
@@ -413,10 +412,45 @@ bool Terminal::check_expect_key(const KeyEvent& event, std::string& matched_key)
 }
 
 std::string Terminal::event_to_bind_key(const KeyEvent& event) {
+    // Named special keys that only reach binds through this lookup (the
+    // navigation keys with default behaviors are dispatched before this).
+    if (event.type == KeyType::Special) {
+        switch (event.special) {
+            case SpecialKey::Insert: return "insert";
+            case SpecialKey::F1:  return "f1";
+            case SpecialKey::F2:  return "f2";
+            case SpecialKey::F3:  return "f3";
+            case SpecialKey::F4:  return "f4";
+            case SpecialKey::F5:  return "f5";
+            case SpecialKey::F6:  return "f6";
+            case SpecialKey::F7:  return "f7";
+            case SpecialKey::F8:  return "f8";
+            case SpecialKey::F9:  return "f9";
+            case SpecialKey::F10: return "f10";
+            case SpecialKey::F11: return "f11";
+            case SpecialKey::F12: return "f12";
+            default: break;
+        }
+    }
+
+    const std::string& input = event.input;
+
+    // Alt-modified keys arrive as "ESC <char>" (and alt-backspace as
+    // "ESC 0x7f"). fzf names them alt-<char> / alt-bs.
+    if (input.length() == 2 && input[0] == '\x1b') {
+        unsigned char c1 = static_cast<unsigned char>(input[1]);
+        if (c1 == 0x7f || c1 == 0x08) {
+            return "alt-bs";
+        }
+        if (c1 >= 0x20 && c1 < 0x7f) {
+            return std::string("alt-") + static_cast<char>(c1);
+        }
+        return "";
+    }
+
     // Control-character keys (ctrl-a..z, ctrl-space, ctrl-/, etc.) arrive as
     // Character events carrying a single control byte (see keyparser.cpp) —
     // check the raw input byte directly rather than any printability check.
-    const std::string& input = event.input;
     if (input.length() != 1) {
         return "";
     }
@@ -469,6 +503,80 @@ bool Terminal::extract_paren_arg(const std::string& action, size_t open_paren_po
 }
 
 bool Terminal::execute_bind_action(const std::string& action) {
+    // Wrap a fully-substituted command for --with-shell. The substitution
+    // injects single-quoted values, so the command itself must be re-escaped
+    // before being wrapped in another layer of single quotes -- a naive
+    // "'" + cmd + "'" terminated at the first inner quote and word-split the
+    // rest ({} containing "it's" broke every --with-shell invocation).
+    auto wrap_with_shell = [&](std::string cmd) -> std::string {
+        if (opts_.with_shell.empty()) {
+            return cmd;
+        }
+        std::string escaped;
+        escaped.reserve(cmd.size() + 2);
+        for (char c : cmd) {
+            if (c == '\'') {
+                escaped += "'\\''";
+            } else {
+                escaped += c;
+            }
+        }
+        return opts_.with_shell + " '" + escaped + "'";
+    };
+
+    auto current_cursor = [&]() -> size_t {
+        std::lock_guard<std::mutex> lock(results_mutex_);
+        return cursor_pos_;
+    };
+
+    auto run_transform_header = [&](const std::string& cmd_tpl) {
+        std::string final_cmd = wrap_with_shell(
+            substitute_placeholders(cmd_tpl, current_cursor()));
+        set_current_header(run_command_capture_output(final_cmd));
+    };
+
+    auto run_reload = [&](const std::string& cmd_tpl) {
+        std::string final_cmd = wrap_with_shell(
+            substitute_placeholders(cmd_tpl, current_cursor()));
+        reader_.load_from_command(final_cmd);
+
+        // The new list has fresh zero-based indices; cursor, scroll and any
+        // Tab-selections referring to the old set are all meaningless now
+        // (stale selected_ entries used to map onto arbitrary rows of the
+        // reloaded list and get emitted on accept).
+        {
+            std::lock_guard<std::mutex> lock(results_mutex_);
+            cursor_pos_ = 0;
+            scroll_offset_ = 0;
+        }
+        selected_.clear();
+        update_results(current_query_);
+    };
+
+    // fzf's trailing-colon syntax: "action-name:ARG" takes ARG verbatim to
+    // the END of the bind string -- commas, '+', parens are all literal.
+    // These must be recognized before the composite '+' split below.
+    {
+        struct ColonAction { const char* prefix; int kind; };
+        static const ColonAction kColonActions[] = {
+            {"transform-header:", 0},
+            {"reload:", 1},
+            {"reload-sync:", 1},
+            {"change-prompt:", 2},
+        };
+        for (const auto& ca : kColonActions) {
+            if (action.rfind(ca.prefix, 0) == 0) {
+                std::string arg = action.substr(std::strlen(ca.prefix));
+                switch (ca.kind) {
+                    case 0: run_transform_header(arg); break;
+                    case 1: run_reload(arg); break;
+                    case 2: current_prompt_ = arg; break;
+                }
+                return true;
+            }
+        }
+    }
+
     if (action.find("execute(") == 0) {
         // Find matching closing parenthesis by counting nesting level
         size_t start = 7;  // Position after "execute"
@@ -504,15 +612,7 @@ bool Terminal::execute_bind_action(const std::string& action) {
         }
 
         // Substitute placeholders (this function handles its own mutex locking)
-        std::string final_cmd = substitute_placeholders(cmd, cursor_idx);
-
-        // Use specified shell if provided
-        std::string shell_cmd;
-        if (!opts_.with_shell.empty()) {
-            shell_cmd = opts_.with_shell + " '" + final_cmd + "'";
-        } else {
-            shell_cmd = final_cmd;
-        }
+        std::string shell_cmd = wrap_with_shell(substitute_placeholders(cmd, cursor_idx));
 
         // Background the command so it doesn't block the UI loop.
         // The command will run asynchronously and write to /dev/tty
@@ -560,15 +660,28 @@ bool Terminal::execute_bind_action(const std::string& action) {
         return true;
     }
 
-    size_t plus_pos = action.find('+');
-    if (plus_pos != std::string::npos) {
-        std::string first = action.substr(0, plus_pos);
-        std::string rest = action.substr(plus_pos + 1);
-
-        execute_bind_action(first);
-        execute_bind_action(rest);
-
-        return true;
+    // Composite actions: split on '+' at paren depth 0 only, so an argument
+    // like reload(date +%s) or execute(echo a+b) stays intact and falls
+    // through to its own handler below.
+    {
+        int depth = 0;
+        size_t plus_pos = std::string::npos;
+        for (size_t i = 0; i < action.size(); ++i) {
+            char c = action[i];
+            if (c == '(') {
+                depth++;
+            } else if (c == ')') {
+                if (depth > 0) depth--;
+            } else if (c == '+' && depth == 0) {
+                plus_pos = i;
+                break;
+            }
+        }
+        if (plus_pos != std::string::npos) {
+            execute_bind_action(action.substr(0, plus_pos));
+            execute_bind_action(action.substr(plus_pos + 1));
+            return true;
+        }
     }
 
     if (action == "select-all") {
@@ -662,8 +775,15 @@ bool Terminal::execute_bind_action(const std::string& action) {
         return true;
     }
 
+    // preview_total_lines_ reflects the last painted frame; clamping here
+    // (not only after the paint) keeps the offset from running past the end,
+    // which used to paint an empty pane and then latch it via the
+    // painted-state cache (pane stayed blank until the content changed).
     if (action == "preview-down") {
-        preview_scroll_offset_++;
+        if (preview_total_lines_ == 0 ||
+            preview_scroll_offset_ + 1 < preview_total_lines_) {
+            preview_scroll_offset_++;
+        }
         return true;
     }
 
@@ -677,7 +797,11 @@ bool Terminal::execute_bind_action(const std::string& action) {
     }
 
     if (action == "preview-page-down") {
-        preview_scroll_offset_ += visible_lines_;
+        size_t next = preview_scroll_offset_ + visible_lines_;
+        if (preview_total_lines_ > 0 && next >= preview_total_lines_) {
+            next = preview_total_lines_ - 1;
+        }
+        preview_scroll_offset_ = next;
         return true;
     }
 
@@ -686,10 +810,112 @@ bool Terminal::execute_bind_action(const std::string& action) {
     }
 
     if (action == "clear-query") {
-        current_query_.clear();
         query_codepoints_.clear();
         query_cursor_ = 0;
+        sync_query_from_codepoints();
         update_results(current_query_);
+        return true;
+    }
+
+    // --- Query-line editing (fzf's readline-style default keymap) ---
+
+    if (action == "beginning-of-line") {
+        query_cursor_ = 0;
+        return true;
+    }
+
+    if (action == "end-of-line") {
+        query_cursor_ = query_codepoints_.size();
+        return true;
+    }
+
+    if (action == "backward-char") {
+        query_move_left();
+        return true;
+    }
+
+    if (action == "forward-char") {
+        query_move_right();
+        return true;
+    }
+
+    if (action == "delete-char") {
+        query_delete();
+        return true;
+    }
+
+    if (action == "backward-delete-char") {
+        query_backspace();
+        return true;
+    }
+
+    if (action == "delete-char/eof") {
+        if (query_codepoints_.empty()) {
+            selected_.clear();
+            accepted_ = false;
+            running_ = false;
+            return false;
+        }
+        query_delete();
+        return true;
+    }
+
+    if (action == "unix-line-discard") {
+        if (query_cursor_ > 0) {
+            query_codepoints_.erase(0, query_cursor_);
+            query_cursor_ = 0;
+            sync_query_from_codepoints();
+        }
+        return true;
+    }
+
+    if (action == "kill-line") {
+        if (query_cursor_ < query_codepoints_.size()) {
+            query_codepoints_.erase(query_cursor_);
+            sync_query_from_codepoints();
+        }
+        return true;
+    }
+
+    if (action == "unix-word-rubout" || action == "backward-kill-word") {
+        // Delete back over trailing blanks, then over the word before the
+        // cursor. (fzf distinguishes the two by word charset; blank-delimited
+        // covers the default keymap uses.)
+        size_t end = query_cursor_;
+        size_t pos = end;
+        while (pos > 0 && query_codepoints_[pos - 1] == U' ') pos--;
+        while (pos > 0 && query_codepoints_[pos - 1] != U' ') pos--;
+        if (pos < end) {
+            query_codepoints_.erase(pos, end - pos);
+            query_cursor_ = pos;
+            sync_query_from_codepoints();
+        }
+        return true;
+    }
+
+    if (action == "kill-word") {
+        size_t start = query_cursor_;
+        size_t pos = start;
+        size_t n = query_codepoints_.size();
+        while (pos < n && query_codepoints_[pos] == U' ') pos++;
+        while (pos < n && query_codepoints_[pos] != U' ') pos++;
+        if (pos > start) {
+            query_codepoints_.erase(start, pos - start);
+            sync_query_from_codepoints();
+        }
+        return true;
+    }
+
+    if (action == "backward-word") {
+        while (query_cursor_ > 0 && query_codepoints_[query_cursor_ - 1] == U' ') query_cursor_--;
+        while (query_cursor_ > 0 && query_codepoints_[query_cursor_ - 1] != U' ') query_cursor_--;
+        return true;
+    }
+
+    if (action == "forward-word") {
+        size_t n = query_codepoints_.size();
+        while (query_cursor_ < n && query_codepoints_[query_cursor_] == U' ') query_cursor_++;
+        while (query_cursor_ < n && query_codepoints_[query_cursor_] != U' ') query_cursor_++;
         return true;
     }
 
@@ -707,25 +933,7 @@ bool Terminal::execute_bind_action(const std::string& action) {
             return false;
         }
 
-        size_t cursor_idx;
-        {
-            std::lock_guard<std::mutex> lock(results_mutex_);
-            cursor_idx = cursor_pos_;
-        }
-        std::string final_cmd = substitute_placeholders(cmd, cursor_idx);
-        if (!opts_.with_shell.empty()) {
-            final_cmd = opts_.with_shell + " '" + final_cmd + "'";
-        }
-
-        reader_.load_from_command(final_cmd);
-
-        // Reset cursor/scroll to the top for the fresh item set, then re-filter.
-        {
-            std::lock_guard<std::mutex> lock(results_mutex_);
-            cursor_pos_ = 0;
-            scroll_offset_ = 0;
-        }
-        update_results(current_query_);
+        run_reload(cmd);
 
         // Honor a composite action chained after reload(...)+...
         if (end + 1 < action.length() && action[end + 1] == '+') {
@@ -738,10 +946,10 @@ bool Terminal::execute_bind_action(const std::string& action) {
         return true;  // Stub: change-preview not implemented
     }
 
-    // transform-header supports both transform-header(CMD) and the colon form
-    // transform-header:CMD (fzf's "extends to end of bind string" syntax, used
-    // when CMD needs multiple lines or unbalanced parens, e.g. a shell `case`).
-    // Try the paren form first since it's unambiguous when present.
+    // transform-header(CMD) paren form; the colon form transform-header:CMD
+    // (fzf's "extends to end of bind string" syntax, needed when CMD has
+    // unbalanced parens, e.g. a shell `case`) is handled at the top of this
+    // function, before the composite '+' split.
     if (action.find("transform-header(") == 0) {
         size_t open = action.find('(');
         std::string cmd;
@@ -750,36 +958,11 @@ bool Terminal::execute_bind_action(const std::string& action) {
             return false;
         }
 
-        size_t cursor_idx;
-        {
-            std::lock_guard<std::mutex> lock(results_mutex_);
-            cursor_idx = cursor_pos_;
-        }
-        std::string final_cmd = substitute_placeholders(cmd, cursor_idx);
-        if (!opts_.with_shell.empty()) {
-            final_cmd = opts_.with_shell + " '" + final_cmd + "'";
-        }
-        current_header_ = run_command_capture_output(final_cmd);
+        run_transform_header(cmd);
 
         if (end + 1 < action.length() && action[end + 1] == '+') {
             execute_bind_action(action.substr(end + 2));
         }
-        return true;
-    }
-
-    if (action.find("transform-header:") == 0) {
-        std::string cmd = action.substr(std::string("transform-header:").length());
-
-        size_t cursor_idx;
-        {
-            std::lock_guard<std::mutex> lock(results_mutex_);
-            cursor_idx = cursor_pos_;
-        }
-        std::string final_cmd = substitute_placeholders(cmd, cursor_idx);
-        if (!opts_.with_shell.empty()) {
-            final_cmd = opts_.with_shell + " '" + final_cmd + "'";
-        }
-        current_header_ = run_command_capture_output(final_cmd);
         return true;
     }
 
@@ -796,7 +979,15 @@ void Terminal::get_terminal_size(int& rows, int& cols) const {
 
 void Terminal::calculate_column_layout(int content_cols, int& results_width,
                                        int& preview_cols, int& sep_col) const {
-    int preview_width = (content_cols * opts_.preview_size_percent) / 100;
+    int preview_width = opts_.preview_size_is_percent
+        ? (content_cols * opts_.preview_size_percent) / 100
+        : opts_.preview_size_percent;  // absolute column count
+    if (preview_width > content_cols - 2) {
+        preview_width = content_cols - 2;  // always leave room for results
+    }
+    if (preview_width < 1) {
+        preview_width = 1;
+    }
     preview_cols = preview_width;
     results_width = content_cols - preview_width - 1; // -1 for separator
     if (results_width < 1) results_width = 1;
@@ -834,68 +1025,87 @@ void Terminal::calculate_preview_position(int& top, int& left, int& lines, int& 
     // Row 3+: Content area
     // Bottom: Separator (1 row) + Input (1 row)
 
-    int info_rows = opts_.info_hidden ? 0 : 1;
-    int header_rows = current_header_.empty() ? 0 : 1;
-    int top_ui_rows = info_rows + header_rows + 1; // info + header + separator
-    int bottom_ui_rows = 2; // separator + input
-    int content_rows = term_rows - top_ui_rows - bottom_ui_rows;
-    if (opts_.border) {
-        top_ui_rows += 1;
-        bottom_ui_rows += 1;
-        content_rows = term_rows - top_ui_rows - bottom_ui_rows;
+    // Called from the preview worker too (via preview_env_vars):
+    // current_header_ and visible_lines_ are main-thread state, so snapshot
+    // them under the shared lock.
+    bool header_present;
+    int band_lines;
+    {
+        std::lock_guard<std::mutex> lock(preview_mutex_);
+        header_present = !current_header_.empty();
+        band_lines = static_cast<int>(visible_lines_);
     }
 
-    // Preview starts after top UI elements
+    int info_rows = opts_.info_hidden ? 0 : 1;
+    int header_rows = header_present ? 1 : 0;
+    int top_ui_rows = info_rows + header_rows + 1; // info + header + separator
+    if (opts_.border) {
+        top_ui_rows += 1;
+    }
+
+    // Preview starts after top UI elements and spans exactly the results
+    // band repaint() draws (visible_lines_). Deriving the height from
+    // term_rows here while repaint honored --height meant the pane could
+    // overshoot the bottom separator and prompt whenever they differed.
     top = top_ui_rows;
     if (opts_.preview_position == "left") {
         left = margin; // Preview starts at the content area's left edge
     } else {
         left = margin + sep_col + 1; // After results + separator
     }
-    lines = content_rows;
+    lines = band_lines;
     cols = preview_cols;
 }
 
-void Terminal::set_preview_env_vars() const {
-    // Calculate preview window position and set environment variables
+std::vector<std::string> Terminal::preview_env_vars() const {
+    // Passed to the preview child via execve (see shell_popen) rather than
+    // setenv: the worker calling setenv while the main thread walks environ
+    // (getenv in shell_popen, system() for execute binds) is a glibc UB race.
     int preview_top, preview_left, preview_lines, preview_cols;
     calculate_preview_position(preview_top, preview_left, preview_lines, preview_cols);
 
-    std::string top_str = std::to_string(preview_top);
-    std::string left_str = std::to_string(preview_left);
-    std::string lines_str = std::to_string(preview_lines);
-    std::string cols_str = std::to_string(preview_cols);
-
-    setenv("FZF_PREVIEW_TOP", top_str.c_str(), 1);
-    setenv("FZF_PREVIEW_LEFT", left_str.c_str(), 1);
-    setenv("FZF_PREVIEW_LINES", lines_str.c_str(), 1);
-    setenv("FZF_PREVIEW_COLUMNS", cols_str.c_str(), 1);
+    return {
+        "FZF_PREVIEW_TOP=" + std::to_string(preview_top),
+        "FZF_PREVIEW_LEFT=" + std::to_string(preview_left),
+        "FZF_PREVIEW_LINES=" + std::to_string(preview_lines),
+        "FZF_PREVIEW_COLUMNS=" + std::to_string(preview_cols),
+    };
 }
 
 std::string Terminal::substitute_placeholders(const std::string& cmd, size_t index) {
-    std::string result = cmd;
-
-    // Get the current line and item if we have results
-    std::string line_text;
     std::shared_ptr<Item> item;
     {
         std::lock_guard<std::mutex> lock(results_mutex_);
         if (index < current_results_.size()) {
             item = current_results_[index].item;
-            line_text = item->text();
         }
     }
+    return substitute_placeholders_for_item(cmd, item);
+}
 
-    // Replace {n} with 0-based index
+std::string Terminal::substitute_placeholders_for_item(const std::string& cmd,
+                                                       const std::shared_ptr<Item>& item) {
+    std::string result = cmd;
+    std::string line_text = item ? item->text() : "";
+
+    // Replace {n} with the item's zero-based input index (fzf semantics --
+    // the ordinal in the original input stream, not the position in the
+    // filtered list, which changes with every keystroke).
+    size_t n_value = item ? item->index() : 0;
     size_t pos = 0;
     while ((pos = result.find("{n}", pos)) != std::string::npos) {
-        result.replace(pos, 3, std::to_string(index));
-        pos += std::to_string(index).length();
+        result.replace(pos, 3, std::to_string(n_value));
+        pos += std::to_string(n_value).length();
     }
 
-    // Replace {q} with current query
+    // Replace {q} with current query (copied under the lock the preview
+    // worker shares with the main thread's per-keystroke reassignment).
     pos = 0;
-    std::string escaped_query = current_query_;
+    std::string escaped_query;
+    {
+        std::lock_guard<std::mutex> lock(preview_mutex_);
+        escaped_query = current_query_;
+    }
     size_t qpos = 0;
     while ((qpos = escaped_query.find("'", qpos)) != std::string::npos) {
         escaped_query.replace(qpos, 1, "'\\''");
@@ -1007,16 +1217,22 @@ void Terminal::cache_preview(const std::string& item_text, const std::string& co
 }
 
 void Terminal::populate_prefetch_queue() {
-    // Populate prefetch queue with all current results (excluding already cached items)
+    // Prefetch only around the visible window. Queueing EVERY result spawned
+    // one $SHELL per item in the list (thousands on a big pipe), rebuilt on
+    // every keystroke, and with a 50-entry cache most of that work was
+    // evicted before it could ever be served. fzf itself renders only the
+    // focused item; a window of the on-screen items plus one page below is
+    // already more speculative than that.
     std::lock_guard<std::mutex> prefetch_lock(prefetch_mutex_);
     std::lock_guard<std::mutex> cache_lock(cache_mutex_);
     std::lock_guard<std::mutex> results_lock(results_mutex_);
 
     prefetch_queue_.clear();
 
-    // Add all results to prefetch queue, skipping items already in cache
-    for (const auto& result : current_results_) {
-        std::string item_text = result.item->text();
+    size_t start = scroll_offset_;
+    size_t end = std::min(current_results_.size(), start + 2 * visible_lines_);
+    for (size_t i = start; i < end; ++i) {
+        std::string item_text = current_results_[i].item->text();
 
         // Skip if already cached
         if (preview_cache_.find(item_text) != preview_cache_.end()) {
@@ -1028,94 +1244,107 @@ void Terminal::populate_prefetch_queue() {
 }
 
 void Terminal::preview_worker() {
-    // Background thread for async preview rendering with streaming and prefetching
+    // Background thread for async preview rendering with streaming and
+    // prefetching. Cancellation protocol: the main thread bumps
+    // preview_generation_ whenever it posts a new target (and at shutdown);
+    // we capture the generation with each request and stop publishing or
+    // caching the moment it goes stale. The streaming child's pid is
+    // published in preview_child_pid_ so the main thread can kill its
+    // process group -- fread() here can block indefinitely on a command
+    // that never exits (tail -f style), where no flag check would run.
+    //
+    // preview_scroll_offset_ is main-thread state now: the main thread
+    // resets it when it posts a target. The worker resetting it per chunk
+    // used to snap the user's scroll position back to the top while a
+    // preview was still streaming.
     while (true) {
+        if (preview_shutdown_.load()) {
+            return;
+        }
         // PRIORITY 1: Check for high-priority preview request (cursor moved)
         if (preview_pending_.load()) {
-            // User moved cursor - handle immediately (highest priority)
-            size_t target_cursor = preview_target_cursor_.load();
             preview_pending_.store(false);
 
-            // Execute preview command with streaming output
+            uint64_t my_generation = preview_generation_.load();
+            std::string target_text;
+            std::shared_ptr<Item> target_item;
+            {
+                // Captured together with the request. Reading the live
+                // target again at completion time used to cache a
+                // superseded render's output under the NEW target's key --
+                // wrong-item cache poisoning that persisted until eviction.
+                std::lock_guard<std::mutex> lock(preview_mutex_);
+                target_text = preview_target_item_;
+                target_item = preview_target_item_ptr_;
+            }
+
             try {
                 if (opts_.preview_command.empty()) {
                     continue;
                 }
 
-                // Substitute placeholders
-                std::string cmd = substitute_placeholders(opts_.preview_command, target_cursor);
+                std::string cmd = substitute_placeholders_for_item(
+                    opts_.preview_command, target_item);
                 if (cmd.empty()) {
                     std::lock_guard<std::mutex> lock(preview_mutex_);
                     preview_content_ = "Error: Preview command is empty";
-                    preview_scroll_offset_ = 0;  // Reset scroll on content change
                     continue;
                 }
 
-                // Set environment variables for preview command
-                set_preview_env_vars();
-
-                // Execute command and stream output
-                ShellPipe pipe = shell_popen(cmd);
+                ShellPipe pipe = shell_popen(cmd, preview_env_vars());
                 if (!pipe.stream) {
                     std::lock_guard<std::mutex> lock(preview_mutex_);
                     preview_content_ = "Error: Could not execute preview command";
-                    preview_scroll_offset_ = 0;  // Reset scroll on content change
                     continue;
                 }
+                preview_child_pid_.store(pipe.pid);
 
-                // Stream output, updating preview immediately for instant text display
                 std::array<char, 4096> buffer;
                 std::string accumulated_output;
                 size_t bytes_read;
 
-                while (!preview_cancel_.load() && (bytes_read = fread(buffer.data(), 1, buffer.size(), pipe.stream)) > 0) {
+                bool stale = false;
+                while ((bytes_read = fread(buffer.data(), 1, buffer.size(), pipe.stream)) > 0) {
+                    if (preview_generation_.load() != my_generation) {
+                        stale = true;
+                        break;
+                    }
                     accumulated_output.append(buffer.data(), bytes_read);
 
-                    // Update preview immediately - text needs to appear instantly
+                    // Publish incrementally - text should appear as it streams
                     {
                         std::lock_guard<std::mutex> lock(preview_mutex_);
                         preview_content_ = accumulated_output;
-                        preview_scroll_offset_ = 0;  // Reset scroll on content change
                     }
                     wake_pipe(wake_write_fd_);
-
-                    // Very small yield to prevent mutex starvation (1ms)
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                if (preview_generation_.load() != my_generation) {
+                    stale = true;
                 }
 
+                preview_child_pid_.store(-1);
                 shell_pclose(pipe);
 
-                // Final update if not cancelled
-                if (!preview_cancel_.load()) {
-                    std::string item_text_for_cache;
+                if (!stale) {
                     {
                         std::lock_guard<std::mutex> lock(preview_mutex_);
                         preview_content_ = accumulated_output;
-                        preview_scroll_offset_ = 0;  // Reset scroll on content change
-                        item_text_for_cache = preview_target_item_;  // Get item text for caching
                     }
                     wake_pipe(wake_write_fd_);
 
-                    // Cache the preview result for instant display on next visit
-                    if (!item_text_for_cache.empty() && !accumulated_output.empty()) {
-                        cache_preview(item_text_for_cache, accumulated_output);
+                    if (!target_text.empty() && !accumulated_output.empty()) {
+                        cache_preview(target_text, accumulated_output);
                     }
                 }
 
             } catch (...) {
+                preview_child_pid_.store(-1);
                 std::lock_guard<std::mutex> lock(preview_mutex_);
                 preview_content_ = "Error: Preview command exception";
-                preview_scroll_offset_ = 0;  // Reset scroll on content change
             }
         }
         // If no priority request was processed, handle PRIORITY 2: prefetch queue
         else {
-            // Check if we should exit
-            if (preview_cancel_.load() && !preview_pending_.load()) {
-                return;  // Exit thread
-            }
-
-            // PRIORITY 2: Process prefetch queue when idle
             std::string item_to_prefetch;
             {
                 std::lock_guard<std::mutex> lock(prefetch_mutex_);
@@ -1128,66 +1357,64 @@ void Terminal::preview_worker() {
             if (!item_to_prefetch.empty()) {
                 // Check if still not in cache (might have been added by user navigation)
                 if (get_cached_preview(item_to_prefetch).empty()) {
-                    // Find the index of this item in current results
-                    size_t item_index = SIZE_MAX;
+                    // Capture the Item while scanning: substituting by index
+                    // after releasing the lock used to race a results update
+                    // and cache a different item's output under this key.
+                    std::shared_ptr<Item> prefetch_item;
                     {
                         std::lock_guard<std::mutex> lock(results_mutex_);
-                        for (size_t i = 0; i < current_results_.size(); ++i) {
-                            if (current_results_[i].item->text() == item_to_prefetch) {
-                                item_index = i;
+                        for (const auto& r : current_results_) {
+                            if (r.item->text() == item_to_prefetch) {
+                                prefetch_item = r.item;
                                 break;
                             }
                         }
                     }
 
-                    if (item_index != SIZE_MAX) {
-                        // Execute preview command for prefetch
+                    if (prefetch_item && !opts_.preview_command.empty()) {
                         try {
-                            if (!opts_.preview_command.empty()) {
-                                std::string cmd = substitute_placeholders(opts_.preview_command, item_index);
+                            std::string cmd = substitute_placeholders_for_item(
+                                opts_.preview_command, prefetch_item);
 
-                                if (!cmd.empty()) {
-                                    // Set environment variables
-                                    set_preview_env_vars();
+                            if (!cmd.empty()) {
+                                ShellPipe pipe = shell_popen(cmd, preview_env_vars());
+                                if (pipe.stream) {
+                                    preview_child_pid_.store(pipe.pid);
+                                    std::array<char, 4096> buffer;
+                                    std::string accumulated_output;
+                                    size_t bytes_read;
 
-                                    ShellPipe pipe = shell_popen(cmd);
-                                    if (pipe.stream) {
-                                        std::array<char, 4096> buffer;
-                                        std::string accumulated_output;
-                                        size_t bytes_read;
-
-                                        // Stream output, but check for priority requests frequently
-                                        bool interrupted = false;
-                                        while (true) {
-                                            if (preview_pending_.load()) {
-                                                interrupted = true;
-                                                break;
-                                            }
-                                            bytes_read = fread(buffer.data(), 1, buffer.size(), pipe.stream);
-                                            if (bytes_read == 0) break;  // clean EOF
-                                            accumulated_output.append(buffer.data(), bytes_read);
-                                            // Small yield to allow priority requests to interrupt
-                                            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                                    // Stream output, but check for priority requests frequently
+                                    bool interrupted = false;
+                                    while (true) {
+                                        if (preview_pending_.load() || preview_shutdown_.load()) {
+                                            interrupted = true;
+                                            break;
                                         }
+                                        bytes_read = fread(buffer.data(), 1, buffer.size(), pipe.stream);
+                                        if (bytes_read == 0) break;  // clean EOF
+                                        accumulated_output.append(buffer.data(), bytes_read);
+                                    }
 
-                                        shell_pclose(pipe);
+                                    preview_child_pid_.store(-1);
+                                    shell_pclose(pipe);
 
-                                        // Only cache a COMPLETE capture. If we broke out because a
-                                        // priority request arrived, accumulated_output is truncated —
-                                        // possibly mid-image-sequence (sixel/iTerm2/kitty). Caching that
-                                        // partial blob means the next scroll to this item serves a
-                                        // truncated escape sequence to the terminal, which renders as
-                                        // garbage. The old code re-checked preview_pending_ here, but
-                                        // that flag can flip back to false once the foreground handler
-                                        // consumes it, letting a truncated blob through. Track the exit
-                                        // reason explicitly instead.
-                                        if (!interrupted && !accumulated_output.empty()) {
-                                            cache_preview(item_to_prefetch, accumulated_output);
-                                        }
+                                    // Only cache a COMPLETE capture. If we broke out because a
+                                    // priority request arrived, accumulated_output is truncated —
+                                    // possibly mid-image-sequence (sixel/iTerm2/kitty). Caching that
+                                    // partial blob means the next scroll to this item serves a
+                                    // truncated escape sequence to the terminal, which renders as
+                                    // garbage. The old code re-checked preview_pending_ here, but
+                                    // that flag can flip back to false once the foreground handler
+                                    // consumes it, letting a truncated blob through. Track the exit
+                                    // reason explicitly instead.
+                                    if (!interrupted && !accumulated_output.empty()) {
+                                        cache_preview(item_to_prefetch, accumulated_output);
                                     }
                                 }
                             }
                         } catch (...) {
+                            preview_child_pid_.store(-1);
                             // Silently ignore prefetch errors
                         }
                     }
@@ -1257,8 +1484,12 @@ bool Terminal::handle_mouse_event(const KeyEvent& event) {
 
         // Calculate clicked result index
         int click_offset = mouse.y - results_start_y;
-        if (click_offset < 0) {
-            return true;  // Click above results area
+        if (click_offset < 0 ||
+            static_cast<size_t>(click_offset) >= visible_lines_) {
+            // Above the list, or on the bottom separator/prompt rows --
+            // without the upper bound a click there computed an index past
+            // the visible band and yanked the cursor to an off-screen item.
+            return true;
         }
 
         size_t clicked_index = scroll_offset_ + click_offset;
@@ -1303,10 +1534,7 @@ bool Terminal::handle_mouse_event(const KeyEvent& event) {
 void Terminal::query_insert_codepoints(const std::u32string& codepoints) {
     query_codepoints_.insert(query_cursor_, codepoints);
     query_cursor_ += codepoints.size();
-
-    std::string utf8_text;
-    utf8::utf32to8(query_codepoints_.begin(), query_codepoints_.end(), std::back_inserter(utf8_text));
-    current_query_ = utf8_text;
+    sync_query_from_codepoints();
 }
 
 void Terminal::query_backspace() {
@@ -1315,10 +1543,7 @@ void Terminal::query_backspace() {
     }
     query_codepoints_.erase(query_cursor_ - 1, 1);
     query_cursor_--;
-
-    std::string utf8_text;
-    utf8::utf32to8(query_codepoints_.begin(), query_codepoints_.end(), std::back_inserter(utf8_text));
-    current_query_ = utf8_text;
+    sync_query_from_codepoints();
 }
 
 void Terminal::query_delete() {
@@ -1326,10 +1551,7 @@ void Terminal::query_delete() {
         return;
     }
     query_codepoints_.erase(query_cursor_, 1);
-
-    std::string utf8_text;
-    utf8::utf32to8(query_codepoints_.begin(), query_codepoints_.end(), std::back_inserter(utf8_text));
-    current_query_ = utf8_text;
+    sync_query_from_codepoints();
 }
 
 void Terminal::query_move_left() {
@@ -1347,33 +1569,38 @@ void Terminal::query_move_right() {
 // --- Rendering ---
 
 void Terminal::recompute_visible_lines() {
+    int term_rows, term_cols;
+    get_terminal_size(term_rows, term_cols);
+
+    int info_rows = opts_.info_hidden ? 0 : 1;
+    int header_rows = current_header_.empty() ? 0 : 1;
+    int ui_overhead = info_rows + header_rows + 1 + 1 + 1;  // info + header + sep + sep + input
+    if (opts_.border) {
+        ui_overhead += 2;
+    }
+
+    // The chrome (separators, prompt) must always fit below the results
+    // band: whatever --height asks for, cap at what the terminal leaves
+    // after the overhead. --height=100% used to compute prompt_row >=
+    // term_rows and silently drop the query line entirely.
+    int max_lines = term_rows - ui_overhead;
+    if (max_lines < 1) max_lines = 1;
+
+    int computed;
     if (opts_.height > 0) {
         if (opts_.height_is_percent) {
-            int term_rows, term_cols;
-            get_terminal_size(term_rows, term_cols);
-            visible_lines_ = static_cast<size_t>((term_rows * opts_.height) / 100);
-            if (visible_lines_ < 5) {
-                visible_lines_ = 5;
-            }
+            computed = (term_rows * opts_.height) / 100 - ui_overhead;
         } else {
-            visible_lines_ = static_cast<size_t>(opts_.height);
+            computed = opts_.height - ui_overhead;
         }
     } else {
-        int term_rows, term_cols;
-        get_terminal_size(term_rows, term_cols);
-
-        int info_rows = opts_.info_hidden ? 0 : 1;
-        int header_rows = current_header_.empty() ? 0 : 1;
-        int ui_overhead = info_rows + header_rows + 1 + 1 + 1;  // info + header + sep + sep + input
-        int computed = term_rows - ui_overhead;
-        if (opts_.border) {
-            computed -= 2;
-        }
-        visible_lines_ = computed > 0 ? static_cast<size_t>(computed) : 0;
-        if (visible_lines_ < 5) {
-            visible_lines_ = 5;
-        }
+        computed = max_lines;
     }
+    if (computed > max_lines) computed = max_lines;
+    if (computed < 1) computed = 1;
+
+    std::lock_guard<std::mutex> lock(preview_mutex_);
+    visible_lines_ = static_cast<size_t>(computed);
 }
 
 void Terminal::repaint(bool preview_dirty) {
@@ -1385,9 +1612,6 @@ void Terminal::repaint(bool preview_dirty) {
     if (content_cols < 1) content_cols = 1;
 
     FrameRenderer frame(term_rows, term_cols);
-    if (opts_.border) {
-        frame.draw_border();
-    }
 
     int row = margin;
 
@@ -1424,7 +1648,7 @@ void Terminal::repaint(bool preview_dirty) {
         draw_header_line();
     }
 
-    frame.draw_separator(row++);
+    frame.draw_separator(row++, margin, opts_.border ? content_cols : 0);
 
     // Results area (and preview pane, if enabled) share this vertical band.
     int content_top = row;
@@ -1550,7 +1774,7 @@ void Terminal::repaint(bool preview_dirty) {
 
     int bottom_row = content_top + static_cast<int>(visible_lines_);
     if (bottom_row < term_rows) {
-        frame.draw_separator(bottom_row);
+        frame.draw_separator(bottom_row, margin, opts_.border ? content_cols : 0);
     }
 
     int prompt_row = bottom_row + 1;
@@ -1559,16 +1783,25 @@ void Terminal::repaint(bool preview_dirty) {
         frame.draw_text(prompt_row, margin, prompt_line, Style{}, content_cols);
     }
 
-    ssize_t written = write(STDOUT_FILENO, frame.bytes().data(), frame.bytes().size());
-    (void)written;
+    // Border last so content writes can't overwrite its verticals
+    // (render.hpp documents this ordering requirement).
+    if (opts_.border) {
+        frame.draw_border();
+    }
 
-    // Move the real cursor to the query-editing position.
-    size_t prompt_display_width = visible_width(current_prompt_);
-    int cursor_col = margin + static_cast<int>(prompt_display_width + query_cursor_);
+    write_all(STDOUT_FILENO, frame.bytes().data(), frame.bytes().size());
+
+    // Move the real cursor to the query-editing position, measured in
+    // display columns (a CJK/emoji query is wider than its codepoint count).
+    std::string query_before_cursor;
+    utf8::utf32to8(query_codepoints_.begin(),
+                   query_codepoints_.begin() + static_cast<long>(query_cursor_),
+                   std::back_inserter(query_before_cursor));
+    int cursor_col = margin + static_cast<int>(visible_width(current_prompt_) +
+                                               visible_width(query_before_cursor));
     std::string cursor_seq = "\x1b[" + std::to_string(prompt_row + 1) + ";" +
                               std::to_string(cursor_col + 1) + "H";
-    ssize_t written2 = write(STDOUT_FILENO, cursor_seq.data(), cursor_seq.size());
-    (void)written2;
+    write_all(STDOUT_FILENO, cursor_seq);
 
     if (show_preview && preview_dirty) {
         std::string preview_text;
@@ -1590,6 +1823,15 @@ void Terminal::repaint(bool preview_dirty) {
         // only to its own budget), so leaving the pane untouched is safe.
         // A resize clears last_painted_valid_ (see the SIGWINCH branch) so the
         // pane is always fully repainted when geometry changes.
+        // Clamp the scroll offset against the last known line count BEFORE
+        // painting. Painting with an out-of-range offset drew an empty pane
+        // and then latched it: the post-paint clamp changed the offset to a
+        // value recorded as "already painted", so every later repaint was
+        // skipped and the pane stayed blank until the content changed.
+        if (preview_total_lines_ > 0 && preview_scroll_offset_ >= preview_total_lines_) {
+            preview_scroll_offset_ = preview_total_lines_ - 1;
+        }
+
         if (last_painted_valid_ && preview_text == last_painted_preview_ &&
             preview_scroll_offset_ == last_painted_scroll_) {
             // Nothing to do — recompute the line count for scroll bookkeeping
@@ -1600,8 +1842,7 @@ void Terminal::repaint(bool preview_dirty) {
             {
                 FrameRenderer clear_frame(term_rows, term_cols);
                 clear_frame.clear_region(preview_top, preview_left, preview_lines, preview_cols);
-                ssize_t w = write(STDOUT_FILENO, clear_frame.bytes().data(), clear_frame.bytes().size());
-                (void)w;
+                write_all(STDOUT_FILENO, clear_frame.bytes().data(), clear_frame.bytes().size());
             }
 
             // Stream the whole preview blob into the pane (see
@@ -1612,16 +1853,21 @@ void Terminal::repaint(bool preview_dirty) {
             // mid-image) is held back so an incomplete escape never reaches the
             // terminal. The leading ESC[H ESC[J from scripts like ytsurf's is
             // still stripped so it can't wipe the results list.
+            size_t painted_scroll = preview_scroll_offset_;
             size_t total = 0;
             write_preview_content(STDOUT_FILENO, preview_top, preview_left,
-                                  preview_text, preview_scroll_offset_,
+                                  preview_text, painted_scroll,
                                   preview_lines, preview_cols, total);
             preview_total_lines_ = total;
             if (preview_total_lines_ > 0 && preview_scroll_offset_ >= preview_total_lines_) {
                 preview_scroll_offset_ = preview_total_lines_ - 1;
             }
             last_painted_preview_ = preview_text;
-            last_painted_scroll_ = preview_scroll_offset_;
+            // Record the offset the pane was actually painted with; if the
+            // clamp above just moved preview_scroll_offset_, the mismatch
+            // forces one more repaint at the corrected position instead of
+            // latching a blank pane.
+            last_painted_scroll_ = painted_scroll;
             last_painted_valid_ = true;
         }
     }
@@ -1649,6 +1895,12 @@ bool Terminal::dispatch_event(const KeyEvent& event) {
     }
 
     if (event.type == KeyType::Special && event.special == SpecialKey::Escape) {
+        auto bind_it = opts_.bindings.find("esc");
+        if (bind_it != opts_.bindings.end()) {
+            execute_bind_action(bind_it->second);
+            return running_;
+        }
+        accepted_ = false;
         running_ = false;
         return false;
     }
@@ -1659,6 +1911,19 @@ bool Terminal::dispatch_event(const KeyEvent& event) {
             execute_bind_action(bind_it->second);
         } else if (opts_.multi) {
             toggle_selection();
+        }
+        return running_;
+    }
+
+    if (event.type == KeyType::Special && event.special == SpecialKey::BackTab) {
+        auto bind_it = opts_.bindings.find("btab");
+        if (bind_it != opts_.bindings.end()) {
+            execute_bind_action(bind_it->second);
+        } else if (opts_.multi) {
+            // fzf default: toggle the current item, then move up.
+            toggle_selection();   // auto-advances down...
+            move_cursor_up();     // ...undo that...
+            move_cursor_up();     // ...and go one above the toggled item.
         }
         return running_;
     }
@@ -1704,12 +1969,22 @@ bool Terminal::dispatch_event(const KeyEvent& event) {
     }
 
     if (event.type == KeyType::Special && event.special == SpecialKey::PageUp) {
-        move_cursor_page_up();
+        auto bind_it = opts_.bindings.find("page-up");
+        if (bind_it != opts_.bindings.end()) {
+            execute_bind_action(bind_it->second);
+        } else {
+            move_cursor_page_up();
+        }
         return running_;
     }
 
     if (event.type == KeyType::Special && event.special == SpecialKey::PageDown) {
-        move_cursor_page_down();
+        auto bind_it = opts_.bindings.find("page-down");
+        if (bind_it != opts_.bindings.end()) {
+            execute_bind_action(bind_it->second);
+        } else {
+            move_cursor_page_down();
+        }
         return running_;
     }
 
@@ -1734,6 +2009,13 @@ bool Terminal::dispatch_event(const KeyEvent& event) {
     }
 
     if (!opts_.no_mouse && event.type == KeyType::Mouse) {
+        // Drag/motion reports (?1002 mode) are not clicks: without this,
+        // holding the button across one cell decoded as a second "press"
+        // within the double-click window and instantly accepted whatever
+        // was under the cursor.
+        if (event.mouse.motion == MouseInfo::Motion::Moved) {
+            return running_;
+        }
         if (event.mouse.button == MouseInfo::Button::Left &&
             event.mouse.motion == MouseInfo::Motion::Pressed) {
             auto now = std::chrono::steady_clock::now();
@@ -1789,14 +2071,55 @@ bool Terminal::dispatch_event(const KeyEvent& event) {
     return running_;
 }
 
+bool Terminal::maybe_request_preview() {
+    if (opts_.preview_command.empty()) {
+        return false;
+    }
+
+    std::string current_item_text;
+    std::shared_ptr<Item> current_item;
+    {
+        std::lock_guard<std::mutex> lock(results_mutex_);
+        if (current_results_.empty() || cursor_pos_ == last_preview_cursor_) {
+            return false;
+        }
+        last_preview_cursor_ = cursor_pos_;
+        if (cursor_pos_ < current_results_.size()) {
+            current_item = current_results_[cursor_pos_].item;
+            current_item_text = current_item->text();
+        }
+    }
+
+    std::string cached_content = get_cached_preview(current_item_text);
+    if (!cached_content.empty()) {
+        std::lock_guard<std::mutex> lock(preview_mutex_);
+        preview_content_ = cached_content;
+        preview_scroll_offset_ = 0;
+    } else {
+        // Bump the generation FIRST so an in-flight render for the previous
+        // target goes stale before the new target is visible, then publish
+        // the target, then raise the pending flag last -- the worker reads
+        // them in the opposite order, so it can never pair the new flag with
+        // the old target.
+        supersede_preview();
+        {
+            std::lock_guard<std::mutex> lock(preview_mutex_);
+            preview_content_ = "Loading preview...";
+            preview_scroll_offset_ = 0;
+            preview_target_item_ = current_item_text;
+            preview_target_item_ptr_ = current_item;
+        }
+        preview_target_cursor_.store(cursor_pos_);
+        preview_pending_.store(true);
+    }
+    return true;
+}
+
 std::vector<std::string> Terminal::run() {
     RawMode raw(STDIN_FILENO);
+    ScreenGuard screen(!opts_.no_mouse);
 
-    enter_alt_screen(STDOUT_FILENO);
-    hide_cursor(STDOUT_FILENO);
-    if (!opts_.no_mouse) {
-        enable_mouse(STDOUT_FILENO);
-    }
+    set_tabstop(opts_.tabstop);
 
     if (!make_self_pipe(winch_read_fd_, winch_write_fd_)) {
         winch_read_fd_ = winch_write_fd_ = -1;
@@ -1808,16 +2131,27 @@ std::vector<std::string> Terminal::run() {
         install_sigwinch_handler(winch_write_fd_);
     }
 
+    // SIGTERM/SIGHUP: abort cleanly (restore the terminal, exit 130-style)
+    // instead of dying mid-alt-screen with the tty in raw mode.
+    g_termination_requested = 0;
+    g_termination_wake_fd = winch_write_fd_;
+    struct sigaction term_sa {};
+    term_sa.sa_handler = termination_handler;
+    sigemptyset(&term_sa.sa_mask);
+    struct sigaction old_term_sa {}, old_hup_sa {};
+    sigaction(SIGTERM, &term_sa, &old_term_sa);
+    sigaction(SIGHUP, &term_sa, &old_hup_sa);
+
     reader_.set_wake_callback([this]() { wake_pipe(wake_write_fd_); });
 
     // Initialize query
-    current_query_ = opts_.query;
     try {
-        utf8::utf8to32(current_query_.begin(), current_query_.end(), std::back_inserter(query_codepoints_));
+        utf8::utf8to32(opts_.query.begin(), opts_.query.end(), std::back_inserter(query_codepoints_));
     } catch (...) {
         query_codepoints_.clear();
     }
     query_cursor_ = query_codepoints_.size();
+    sync_query_from_codepoints();
     update_results(current_query_);
 
     // Fire the start: event binding once (e.g. start:reload(...)), letting an
@@ -1843,22 +2177,54 @@ std::vector<std::string> Terminal::run() {
     KeyParser parser;
 
     running_ = true;
+    // Request the initial preview before the first select(): with a small,
+    // already-finished input nothing ever wakes the loop, so a trigger that
+    // only ran inside it left the pane on "no preview" until a keystroke.
+    maybe_request_preview();
     repaint(/*preview_dirty=*/true);
 
-    int max_fd = std::max({STDIN_FILENO, winch_read_fd_, wake_read_fd_});
+    int max_fd = STDIN_FILENO;
+    if (winch_read_fd_ >= 0) max_fd = std::max(max_fd, winch_read_fd_);
+    if (wake_read_fd_ >= 0) max_fd = std::max(max_fd, wake_read_fd_);
+
+    // Escape-sequence timeout as an absolute deadline. Keying it off
+    // "select() returned 0" starved it whenever any other fd was busy: the
+    // streaming preview worker wakes the pipe on every chunk, so a bare ESC
+    // pressed during a stream wasn't resolved until the stream ended.
+    // The deadline is re-armed on every feed() that leaves bytes pending,
+    // preserving the parser's "one full window of silence" contract.
+    auto esc_deadline = std::chrono::steady_clock::now();
+    bool esc_deadline_armed = false;
 
     while (running_) {
+        if (g_termination_requested) {
+            selected_.clear();
+            accepted_ = false;
+            break;
+        }
+
         fd_set read_fds;
         FD_ZERO(&read_fds);
         FD_SET(STDIN_FILENO, &read_fds);
-        FD_SET(winch_read_fd_, &read_fds);
-        FD_SET(wake_read_fd_, &read_fds);
+        if (winch_read_fd_ >= 0) FD_SET(winch_read_fd_, &read_fds);
+        if (wake_read_fd_ >= 0) FD_SET(wake_read_fd_, &read_fds);
 
-        bool has_timeout = parser.has_pending();
+        if (parser.has_pending() && !esc_deadline_armed) {
+            esc_deadline_armed = true;
+            esc_deadline = std::chrono::steady_clock::now() +
+                           std::chrono::milliseconds(KeyParser::kEscapeTimeoutMs);
+        } else if (!parser.has_pending()) {
+            esc_deadline_armed = false;
+        }
+
         struct timeval tv;
+        bool has_timeout = esc_deadline_armed;
         if (has_timeout) {
-            tv.tv_sec = KeyParser::kEscapeTimeoutMs / 1000;
-            tv.tv_usec = (KeyParser::kEscapeTimeoutMs % 1000) * 1000;
+            auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
+                esc_deadline - std::chrono::steady_clock::now()).count();
+            if (remaining < 0) remaining = 0;
+            tv.tv_sec = static_cast<time_t>(remaining / 1000000);
+            tv.tv_usec = static_cast<suseconds_t>(remaining % 1000000);
         }
 
         int n = select(max_fd + 1, &read_fds, nullptr, nullptr, has_timeout ? &tv : nullptr);
@@ -1870,7 +2236,9 @@ std::vector<std::string> Terminal::run() {
             continue;  // EINTR or similar; loop and re-check state
         }
 
-        if (n == 0 && parser.has_pending()) {
+        if (esc_deadline_armed && parser.has_pending() &&
+            std::chrono::steady_clock::now() >= esc_deadline) {
+            esc_deadline_armed = false;
             auto events = parser.timeout_tick(KeyParser::kEscapeTimeoutMs);
             for (const auto& ev : events) {
                 if (!dispatch_event(ev)) break;
@@ -1878,18 +2246,33 @@ std::vector<std::string> Terminal::run() {
             }
         }
 
-        if (FD_ISSET(winch_read_fd_, &read_fds)) {
+        if (winch_read_fd_ >= 0 && FD_ISSET(winch_read_fd_, &read_fds)) {
             drain_pipe(winch_read_fd_);
+            if (g_termination_requested) {
+                continue;  // handled at loop top
+            }
             recompute_visible_lines();
             needs_repaint = true;
             preview_dirty = true;  // stale image geometry; force re-render
             last_painted_valid_ = false;  // geometry changed; force full repaint
-            if (!opts_.preview_command.empty() && !current_results_.empty()) {
+            if (!opts_.preview_command.empty()) {
+                // Cached previews were rendered at the old FZF_PREVIEW_COLUMNS/
+                // LINES; serving them into the new pane paints a wrong-size
+                // image. The cache is keyed by item text only, so flush it.
+                {
+                    std::lock_guard<std::mutex> lock(cache_mutex_);
+                    preview_cache_.clear();
+                    preview_lru_.clear();
+                }
+                {
+                    std::lock_guard<std::mutex> lock(prefetch_mutex_);
+                    prefetch_queue_.clear();
+                }
                 last_preview_cursor_ = SIZE_MAX;  // force preview re-invocation
             }
         }
 
-        if (FD_ISSET(wake_read_fd_, &read_fds)) {
+        if (wake_read_fd_ >= 0 && FD_ISSET(wake_read_fd_, &read_fds)) {
             drain_pipe(wake_read_fd_);
             size_t current_item_count = reader_.item_count();
             if (current_item_count != last_item_count) {
@@ -1903,7 +2286,19 @@ std::vector<std::string> Terminal::run() {
         if (FD_ISSET(STDIN_FILENO, &read_fds)) {
             char buf[256];
             ssize_t r = read(STDIN_FILENO, buf, sizeof(buf));
+            if (r == 0) {
+                // EOF on the tty (hangup with no SIGHUP delivered): treat as
+                // abort. Ignoring it left select() reporting the fd readable
+                // forever -- a 100% CPU spin until externally killed.
+                selected_.clear();
+                accepted_ = false;
+                running_ = false;
+                break;
+            }
             if (r > 0) {
+                // New bytes re-arm the escape-timeout window: the parser's
+                // contract is a full window of *silence* since the last feed.
+                esc_deadline_armed = false;
                 auto events = parser.feed(std::string(buf, static_cast<size_t>(r)));
                 for (const auto& ev : events) {
                     bool changes_query = ev.is_character() || (ev.type == KeyType::Special &&
@@ -1962,35 +2357,9 @@ std::vector<std::string> Terminal::run() {
         }
 
         // Trigger async preview update if cursor position changed.
-        if (!opts_.preview_command.empty() && !current_results_.empty()) {
-            if (cursor_pos_ != last_preview_cursor_) {
-                last_preview_cursor_ = cursor_pos_;
-
-                std::string current_item_text;
-                if (cursor_pos_ < current_results_.size()) {
-                    current_item_text = current_results_[cursor_pos_].item->text();
-                }
-
-                std::string cached_content = get_cached_preview(current_item_text);
-                if (!cached_content.empty()) {
-                    std::lock_guard<std::mutex> lock(preview_mutex_);
-                    preview_content_ = cached_content;
-                    preview_scroll_offset_ = 0;
-                } else {
-                    preview_cancel_.store(true);
-                    {
-                        std::lock_guard<std::mutex> lock(preview_mutex_);
-                        preview_content_ = "Loading preview...";
-                        preview_scroll_offset_ = 0;
-                        preview_target_item_ = current_item_text;
-                    }
-                    preview_target_cursor_.store(cursor_pos_);
-                    preview_pending_.store(true);
-                    preview_cancel_.store(false);
-                }
-                preview_dirty = true;
-                needs_repaint = true;
-            }
+        if (maybe_request_preview()) {
+            preview_dirty = true;
+            needs_repaint = true;
         }
 
         if (needs_repaint) {
@@ -1998,19 +2367,20 @@ std::vector<std::string> Terminal::run() {
         }
     }
 
-    // Teardown, matching the RawMode/alt-screen/mouse setup at the top.
-    if (!opts_.no_mouse) {
-        disable_mouse(STDOUT_FILENO);
-    }
-    show_cursor(STDOUT_FILENO);
-    leave_alt_screen(STDOUT_FILENO);
+    // Teardown. Screen/raw-mode restore happens via the RAII guards on
+    // return (exception-safe); everything else is explicit.
+    sigaction(SIGTERM, &old_term_sa, nullptr);
+    sigaction(SIGHUP, &old_hup_sa, nullptr);
+    g_termination_wake_fd = -1;
     if (winch_write_fd_ >= 0) {
         restore_sigwinch_handler();
     }
     reader_.set_wake_callback(nullptr);
 
-    preview_cancel_.store(true);
+    preview_shutdown_.store(true);
+    preview_generation_.fetch_add(1);
     preview_pending_.store(false);
+    shell_kill(preview_child_pid_.load(), SIGKILL);
     if (preview_thread_.joinable()) {
         preview_thread_.join();
     }
