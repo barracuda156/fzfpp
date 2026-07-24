@@ -236,7 +236,14 @@ struct MatchResult {
         if (score != other.score) {
             return score > other.score;  // Descending by score
         }
-        // Tie-breaker: original index (stable sort)
+        // fzf's default tiebreak chain is score, then length, then input
+        // order -- equal-score short items (often exact hits) must rank
+        // above longer ones that merely contain the same run.
+        size_t len_a = item->code_points().size();
+        size_t len_b = other.item->code_points().size();
+        if (len_a != len_b) {
+            return len_a < len_b;
+        }
         return item->index() < other.item->index();
     }
 };
