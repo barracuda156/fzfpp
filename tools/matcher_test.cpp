@@ -309,6 +309,35 @@ int main() {
               "utf8 pattern matches utf8 text");
     }
 
+    // ---- A6 latin normalization: accented text matches plain-ASCII query
+    // and vice versa, in both V1 and V2, independent of case sensitivity.
+    {
+        Matcher mm;
+        CHECK(mm.match(mk("caf\xC3\xA9"), "cafe").item != nullptr,
+              "cafe matches caf\xC3\xA9 (V2, case-insensitive)");
+        CHECK(mm.match(mk("\xC3\x84rzte"), "arzte").item != nullptr,
+              "arzte matches \xC3\x84rzte (leading capital-accent)");
+        CHECK(mm.match(mk("resume"), "r\xC3\xA9sum\xC3\xA9").item != nullptr,
+              "accented pattern matches plain text");
+        CHECK(mm.match(mk("na\xC3\xAFve"), "naive").item != nullptr,
+              "naive matches na\xC3\xAFve");
+
+        // Accent stripping is independent of case sensitivity: an uppercase
+        // (case-sensitive, per smart-case) query still folds the accent.
+        CHECK(mm.match(mk("CAF\xC3\x89"), "CAFE").item != nullptr,
+              "smart-case-sensitive query still strips accents");
+        CHECK(mm.match(mk("CAF\xC3\x89"), "cafe").item != nullptr,
+              "lowercase query still matches accented+cased text");
+
+        Matcher v1(CaseMode::Smart, AlgoType::FuzzyV1);
+        CHECK(v1.match(mk("caf\xC3\xA9"), "cafe").item != nullptr,
+              "cafe matches caf\xC3\xA9 (V1)");
+
+        // Non-letter / unrelated codepoints outside the table pass through.
+        CHECK(mm.match(mk("日本語"), "日本").item != nullptr,
+              "non-latin text unaffected by normalize table");
+    }
+
     // ---- V1 basic + same extended plumbing
     {
         Matcher v1(CaseMode::Smart, AlgoType::FuzzyV1);

@@ -58,21 +58,47 @@ size_t trailing_whitespaces(const std::vector<CodePoint>& text) {
     return n;
 }
 
-} // namespace
+// Latin-script diacritic table, ported verbatim from fzf's
+// src/algo/normalize.go (`normalized` map). Sorted by key for binary search.
+// Maps precomposed/combining Latin letters and fullwidth/halfwidth forms to
+// their plain ASCII base letter, so e.g. "cafe" matches "café".
+constexpr std::pair<CodePoint, CodePoint> kNormalizeTable[] = {
+#include "normalize_table.inc"
+};
 
-CodePoint Matcher::normalize_char(CodePoint c) const {
-    // ASCII-only lowercasing; full Unicode case folding would need ICU.
-    if (c >= 'A' && c <= 'Z') {
-        return c + ('a' - 'A');
+CodePoint strip_accent(CodePoint c) {
+    // fzf's fast-path range check before the table lookup.
+    if (c < 0x00C0 || c > 0xFF61) {
+        return c;
+    }
+    auto it = std::lower_bound(
+        std::begin(kNormalizeTable), std::end(kNormalizeTable), c,
+        [](const std::pair<CodePoint, CodePoint>& kv, CodePoint key) {
+            return kv.first < key;
+        });
+    if (it != std::end(kNormalizeTable) && it->first == c) {
+        return it->second;
     }
     return c;
 }
 
+} // namespace
+
+CodePoint Matcher::normalize_char(CodePoint c) const {
+    return strip_accent(c);
+}
+
 bool Matcher::char_equal(CodePoint a, CodePoint b, bool case_sensitive) const {
+    // Accent stripping (fzf's `normalize`) is independent of case
+    // sensitivity: `--case-sensitive cafe` still matches "café".
+    a = strip_accent(a);
+    b = strip_accent(b);
     if (case_sensitive) {
         return a == b;
     }
-    return normalize_char(a) == normalize_char(b);
+    if (a >= 'A' && a <= 'Z') a += ('a' - 'A');
+    if (b >= 'A' && b <= 'Z') b += ('a' - 'A');
+    return a == b;
 }
 
 // Determine character class for bonus calculation (fzf's charClassOf; the
@@ -154,10 +180,17 @@ int32_t Matcher::calculate_score(const std::vector<CodePoint>& text,
     for (size_t idx = sidx; idx < eidx; ++idx) {
         CodePoint c = text[idx];
         CharClass klass = char_class_of(c);
+        // Accent stripping applies regardless of case sensitivity; the
+        // pattern is compared through the same transform (char_equal does
+        // this for every other match path -- mirrored here since this loop
+        // compares codepoints directly for scoring/positions).
+        c = strip_accent(c);
+        CodePoint p = pidx < pattern.size() ? strip_accent(pattern[pidx]) : 0;
         if (!case_sensitive) {
-            c = normalize_char(c);
+            if (c >= 'A' && c <= 'Z') c += ('a' - 'A');
+            if (p >= 'A' && p <= 'Z') p += ('a' - 'A');
         }
-        if (pidx < pattern.size() && c == pattern[pidx]) {
+        if (pidx < pattern.size() && c == p) {
             if (positions) {
                 positions->push_back({static_cast<uint32_t>(idx),
                                       static_cast<uint32_t>(idx + 1)});
