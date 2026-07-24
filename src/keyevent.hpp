@@ -29,6 +29,20 @@ enum class SpecialKey {
     PageDown,
     Home,
     End,
+    BackTab,
+    Insert,
+    F1,
+    F2,
+    F3,
+    F4,
+    F5,
+    F6,
+    F7,
+    F8,
+    F9,
+    F10,
+    F11,
+    F12,
     ShiftArrowUp,
     ShiftArrowDown,
     ShiftArrowLeft,
@@ -45,7 +59,7 @@ enum class SpecialKey {
 
 struct MouseInfo {
     enum class Button { Left, Middle, Right, WheelUp, WheelDown, None };
-    enum class Motion { Pressed, Released };
+    enum class Motion { Pressed, Released, Moved };
 
     Button button = Button::None;
     Motion motion = Motion::Pressed;

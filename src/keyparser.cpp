@@ -1,5 +1,7 @@
 #include "keyparser.hpp"
 
+#include <algorithm>
+
 #include <utf8.h>
 
 namespace fzf {
@@ -26,16 +28,35 @@ const CsiEntry kCsiTable[] = {
     {"F", false, SpecialKey::End},
     {"1~", false, SpecialKey::Home},
     {"4~", false, SpecialKey::End},
+    {"7~", false, SpecialKey::Home},       // urxvt Home
+    {"8~", false, SpecialKey::End},        // urxvt End
+    {"2~", false, SpecialKey::Insert},
     {"3~", false, SpecialKey::Delete},
     {"5~", false, SpecialKey::PageUp},
     {"6~", false, SpecialKey::PageDown},
-    {"Z", false, SpecialKey::Tab},        // shift-tab (CSI Z, no modifier param)
+    {"Z", false, SpecialKey::BackTab},    // shift-tab (CSI Z, no modifier param)
+    {"11~", false, SpecialKey::F1},
+    {"12~", false, SpecialKey::F2},
+    {"13~", false, SpecialKey::F3},
+    {"14~", false, SpecialKey::F4},
+    {"15~", false, SpecialKey::F5},
+    {"17~", false, SpecialKey::F6},
+    {"18~", false, SpecialKey::F7},
+    {"19~", false, SpecialKey::F8},
+    {"20~", false, SpecialKey::F9},
+    {"21~", false, SpecialKey::F10},
+    {"23~", false, SpecialKey::F11},
+    {"24~", false, SpecialKey::F12},
     {"A", true,  SpecialKey::ArrowUp},     // SS3 application-mode variants
     {"B", true,  SpecialKey::ArrowDown},
     {"C", true,  SpecialKey::ArrowRight},
     {"D", true,  SpecialKey::ArrowLeft},
     {"H", true,  SpecialKey::Home},
     {"F", true,  SpecialKey::End},
+    {"P", true,  SpecialKey::F1},
+    {"Q", true,  SpecialKey::F2},
+    {"R", true,  SpecialKey::F3},
+    {"S", true,  SpecialKey::F4},
 };
 // clang-format on
 
@@ -173,7 +194,33 @@ bool KeyParser::try_decode_one(std::vector<KeyEvent>& out, bool force_resolve) {
                 pending_.clear();
                 return true;
             }
+            // Guard against unbounded growth: a malicious or malformed source
+            // could keep sending bytes with no terminator forever, growing
+            // pending_ without limit while every byte still arrives before a
+            // timeout (so force_resolve above never triggers). Once the
+            // buffered string sequence alone would exceed 64 KiB, give up on
+            // it and drop what's buffered so far — keeps the parser's memory
+            // bounded and it stays functional for whatever input follows.
+            constexpr size_t kMaxPending = 64 * 1024;
+            if (pending_.size() > kMaxPending) {
+                pending_.clear();
+                return true;
+            }
             return false;  // wait for more bytes to complete the sequence
+        }
+
+        // Double-ESC: a second ESC right after the first (autorepeat / a burst
+        // of Esc presses landing in one read). Falling into the generic
+        // Alt+letter path below would consume "ESC ESC" as one bogus
+        // alt-ESC character event, silently swallowing both keypresses (Esc
+        // autorepeat then looks dead). Consume just the first ESC as a plain
+        // Escape special and let the second ESC be re-examined on the next
+        // try_decode_one call — so "\x1b\x1b\x1b[A" resolves to Escape, Up
+        // rather than eating the arrow's introducer too.
+        if (c1 == 0x1b) {
+            out.push_back(KeyEvent::make_special(SpecialKey::Escape, pending_.substr(0, 1)));
+            pending_.erase(0, 1);
+            return true;
         }
 
         // Alt+letter: ESC followed by a single printable byte, not '[' or 'O'.
@@ -181,6 +228,34 @@ bool KeyParser::try_decode_one(std::vector<KeyEvent>& out, bool force_resolve) {
         // "\x1b" + letter check) is to carry both bytes on one event rather
         // than splitting ESC and the following key into two events.
         if (c1 != '[' && c1 != 'O') {
+            unsigned char uc1 = static_cast<unsigned char>(c1);
+            int need = utf8_sequence_length(uc1);
+            if (need > 1) {
+                // Alt + a multibyte UTF-8 character (e.g. Alt+ü = ESC C3 BC):
+                // wait for the full codepoint rather than always slicing off
+                // exactly 2 bytes, which used to truncate the sequence after
+                // the lead byte and leak the stray continuation byte(s) as
+                // separate garbage characters.
+                if (static_cast<int>(pending_.size()) < 1 + need) {
+                    if (force_resolve) {
+                        // Nothing more coming; decode whatever's buffered
+                        // (falls back to Latin-1 per byte for invalid UTF-8),
+                        // same convention as the plain-character path.
+                        KeyEvent ev = decode_utf8_or_latin1(pending_.substr(1));
+                        ev.input = pending_;
+                        out.push_back(ev);
+                        pending_.clear();
+                        return true;
+                    }
+                    return false;  // wait for the rest of the codepoint
+                }
+                std::string seq = pending_.substr(0, 1 + need);
+                KeyEvent ev = decode_utf8_or_latin1(seq.substr(1));
+                ev.input = seq;
+                out.push_back(ev);
+                pending_.erase(0, 1 + need);
+                return true;
+            }
             out.push_back(KeyEvent::make_character(pending_.substr(0, 2), U""));
             pending_.erase(0, 2);
             return true;
@@ -190,7 +265,12 @@ bool KeyParser::try_decode_one(std::vector<KeyEvent>& out, bool force_resolve) {
         if (c1 == 'O') {
             if (pending_.size() < 3) {
                 if (force_resolve) {
-                    out.push_back(KeyEvent::make_special(SpecialKey::Escape, pending_));
+                    // A pending "ESC O" with no third byte is an incomplete
+                    // machine sequence (an SS3-mode arrow whose final byte
+                    // hasn't arrived), NOT a real keypress — a human typing
+                    // Alt+Shift+O sends the same two bytes and must not have
+                    // it misinterpreted as Escape. Discard silently, same as
+                    // the incomplete-CSI rule below.
                     pending_.clear();
                     return true;
                 }
@@ -254,7 +334,10 @@ bool KeyParser::try_decode_one(std::vector<KeyEvent>& out, bool force_resolve) {
             bool any_digit = false;
             for (char pc : params_str) {
                 if (pc >= '0' && pc <= '9') {
-                    cur = cur * 10 + (pc - '0');
+                    // Clamp accumulation so a hostile/garbled run of digits
+                    // (or a stress test) can't overflow `cur` (signed overflow
+                    // is UB); no real terminal report needs a param this large.
+                    cur = std::min(cur * 10 + (pc - '0'), 65535);
                     any_digit = true;
                 } else if (pc == ';') {
                     params.push_back(cur);
@@ -265,6 +348,63 @@ bool KeyParser::try_decode_one(std::vector<KeyEvent>& out, bool force_resolve) {
             if (any_digit || !params_str.empty()) {
                 params.push_back(cur);
             }
+        }
+
+        // X10 mouse encoding: CSI M (no '<', no params) is followed by three
+        // raw payload bytes (button+32, x+32, y+32) rather than ';'-separated
+        // decimal params — the older ?1000/?1002 reporting mode terminals fall
+        // back to when SGR (?1006) isn't supported (older screen/PuTTY/
+        // Terminal.app). The generic terminator scan above stops at 'M' itself
+        // (0x40-0x7e) since there's nothing after "ESC [" but the mode flag, so
+        // this must be special-cased before the SGR/table lookups below —
+        // otherwise the 3 payload bytes get consumed as literal characters
+        // right after an "unrecognized CSI" drops just "ESC [ M".
+        if (!sgr_mouse && terminator == 'M' && params_str.empty()) {
+            // Need 3 more bytes after "ESC [ M" for the payload.
+            if (pending_.size() < i + 1 + 3) {
+                if (force_resolve) {
+                    // Incomplete X10 mouse report with nothing more coming;
+                    // discard silently, same as any other stalled machine
+                    // sequence (its payload bytes must never leak as text).
+                    pending_.clear();
+                    return true;
+                }
+                return false;  // wait for the 3 payload bytes
+            }
+            unsigned char b = static_cast<unsigned char>(pending_[i + 1]);
+            unsigned char xb = static_cast<unsigned char>(pending_[i + 2]);
+            unsigned char yb = static_cast<unsigned char>(pending_[i + 3]);
+            // The button byte itself is offset by +32 (to keep it printable
+            // on the wire, same reason the coordinate bytes are); the actual
+            // button/modifier/motion code (comparable to SGR's decimal
+            // "code") is the byte with that offset removed.
+            int code = static_cast<int>(b) - 32;
+            MouseInfo m;
+            int btn_bits = (code & 3) + ((code & 64) >> 4);
+            switch (btn_bits) {
+                case 0: m.button = MouseInfo::Button::Left; break;
+                case 1: m.button = MouseInfo::Button::Middle; break;
+                case 2: m.button = MouseInfo::Button::Right; break;
+                case 3: m.button = MouseInfo::Button::None; break;
+                case 4: m.button = MouseInfo::Button::WheelUp; break;
+                case 5: m.button = MouseInfo::Button::WheelDown; break;
+                default: m.button = MouseInfo::Button::None; break;
+            }
+            m.motion = (code & 32) ? MouseInfo::Motion::Moved : MouseInfo::Motion::Pressed;
+            m.shift = (code & 4) != 0;
+            m.alt = (code & 8) != 0;
+            m.ctrl = (code & 16) != 0;
+            // X10 coordinates are 1-based and offset by 32 (and can't represent
+            // values past 223 — 255 - 32 — so anything below the offset clamps
+            // to 0 rather than wrapping negative). Match the SGR path's 0-based
+            // frame-coordinate convention.
+            int x1 = xb >= 32 ? xb - 32 : 0;
+            int y1 = yb >= 32 ? yb - 32 : 0;
+            m.x = x1 > 0 ? x1 - 1 : 0;
+            m.y = y1 > 0 ? y1 - 1 : 0;
+            out.push_back(KeyEvent::make_mouse(m));
+            pending_.erase(0, i + 1 + 3);
+            return true;
         }
 
         if (sgr_mouse && (terminator == 'M' || terminator == 'm')) {
@@ -281,8 +421,19 @@ bool KeyParser::try_decode_one(std::vector<KeyEvent>& out, bool force_resolve) {
                     case 5: m.button = MouseInfo::Button::WheelDown; break;
                     default: m.button = MouseInfo::Button::None; break;
                 }
-                m.motion = (terminator == 'M') ? MouseInfo::Motion::Pressed
-                                                : MouseInfo::Motion::Released;
+                // Bit 32 marks a motion/drag report (?1002 mode) rather than a
+                // fresh press — without this a drag decodes as repeated Left
+                // presses, and terminal.cpp's double-click detector (press twice
+                // within 600ms/2 cells) fires on a sloppy click + 1px wiggle,
+                // accepting whatever's under the cursor. Release (lowercase 'm')
+                // always wins over the motion bit.
+                if (terminator == 'm') {
+                    m.motion = MouseInfo::Motion::Released;
+                } else if (code & 32) {
+                    m.motion = MouseInfo::Motion::Moved;
+                } else {
+                    m.motion = MouseInfo::Motion::Pressed;
+                }
                 m.shift = (code & 4) != 0;
                 m.alt = (code & 8) != 0;
                 m.ctrl = (code & 16) != 0;
@@ -347,8 +498,12 @@ bool KeyParser::try_decode_one(std::vector<KeyEvent>& out, bool force_resolve) {
         return true;
     }
 
-    // Enter: \r (0x0d) is the common case; also accept \n (0x0a).
-    if (c0 == 0x0d || c0 == 0x0a) {
+    // Enter: \r (0x0d) only. 0x0a (ctrl-j / LF) is deliberately NOT mapped here
+    // — it falls through to the generic C0 control-byte branch below and
+    // surfaces as a Character event carrying the raw byte, same as ctrl-a..z,
+    // so the dispatch layer can bind it to "ctrl-j" (fzf's default is
+    // down-in-list, not accept) instead of it silently acting as Return.
+    if (c0 == 0x0d) {
         out.push_back(KeyEvent::make_special(SpecialKey::Return, pending_.substr(0, 1)));
         pending_.erase(0, 1);
         return true;
