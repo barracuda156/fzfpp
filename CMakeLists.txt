@@ -121,8 +121,16 @@ add_executable(keyparser_test tools/keyparser_test.cpp src/keyparser.cpp)
 target_include_directories(keyparser_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(keyparser_test PRIVATE utf8cpp)
 
+# Unit + randomized stress tests for src/matcher.cpp — extended-search
+# parsing, fzf score parity, and the V1/V2 subsequence/position invariants
+# (200k iterations per algorithm).
+add_executable(matcher_test tools/matcher_test.cpp src/matcher.cpp)
+target_include_directories(matcher_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(matcher_test PRIVATE utf8cpp)
+
 enable_testing()
 add_test(NAME keyparser_test COMMAND keyparser_test)
+add_test(NAME matcher_test COMMAND matcher_test)
 
 # Standalone visual smoke test for src/render.hpp — prints a fake frame to
 # the real terminal for manual eyeballing (no automated pixel comparison).
