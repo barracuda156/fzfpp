@@ -560,7 +560,7 @@ Options parse_options(int argc, char* argv[]) {
     }
 
     if (version) {
-        std::cout << "fzf++ version 0.2.0 (C++20 implementation)" << std::endl;
+        std::cout << "fzf++ version 0.2.1 (C++20 implementation)" << std::endl;
         std::cout << "Compatible with fzf" << std::endl;
         std::exit(0);
     }
