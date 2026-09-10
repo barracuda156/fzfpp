@@ -1393,22 +1393,6 @@ void legacy_split_binds(Options& opts) {
     for (const auto& [key, action] : default_binds) opts.bindings.emplace(key, action);
 }
 
-std::vector<FieldRange> legacy_ranges(const std::string& expr) {
-    std::vector<FieldRange> out;
-    static const std::regex ranges_re("^[0-9,.-]+$");
-    if (expr.empty() || !std::regex_match(expr, ranges_re)) return out;
-    for (const Range& r : parse_nth(expr)) {
-        FieldRange f;
-        f.open_begin = (r.begin == kRangeEllipsis);
-        f.open_end = (r.end == kRangeEllipsis);
-        f.begin = f.open_begin ? 1 : r.begin;
-        f.end = f.open_end ? -1 : r.end;
-        // fzf collapses "1..N" to "..N"; a single field N is {N, N}.
-        out.push_back(f);
-    }
-    return out;
-}
-
 void derive_legacy_fields(Options& opts) {
     opts.disabled = opts.phony;
     if (opts.filter) opts.query = *opts.filter;
@@ -1439,8 +1423,6 @@ void derive_legacy_fields(Options& opts) {
     opts.preview_follow = opts.preview.follow;
 
     opts.legacy_delimiter = opts.delimiter.awk ? "" : opts.delimiter.pattern;
-    opts.with_nth = legacy_ranges(opts.with_nth_expr);
-    opts.accept_nth = legacy_ranges(opts.accept_nth_expr);
 
     opts.bindings.clear();
     legacy_split_binds(opts);

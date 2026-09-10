@@ -50,17 +50,8 @@ const std::regex* delimiter_regex(const std::string& pattern) {
     return valid ? &cached_re : nullptr;
 }
 
-// unicode.IsSpace, which fzf's StripLastDelimiter uses for the awk delimiter.
-bool is_unicode_space(char32_t r) {
-    switch (r) {
-        case U'\t': case U'\n': case U'\v': case U'\f': case U'\r': case U' ':
-        case 0x85: case 0xA0: case 0x1680: case 0x2028: case 0x2029:
-        case 0x202F: case 0x205F: case 0x3000:
-            return true;
-        default:
-            return r >= 0x2000 && r <= 0x200A;
-    }
-}
+// unicode.IsSpace (fzf's StripLastDelimiter uses it for the awk delimiter)
+// is fzf::is_unicode_space from item.hpp.
 
 // Decodes the codepoint ending at `end` (exclusive). Returns false if the
 // bytes there are not a well-formed sequence, in which case nothing is
@@ -334,6 +325,26 @@ std::vector<Transformed> transform(const std::vector<Token>& tokens,
         out.push_back(std::move(t));
     }
     return out;
+}
+
+void transform_spans(const std::vector<Token>& tokens,
+                     const std::vector<Range>& ranges,
+                     std::vector<RuneRange>& out) {
+    out.clear();
+    out.reserve(ranges.size());
+    for (const Range& r : ranges) {
+        uint32_t runes = 0;
+        uint32_t start = transform_range(tokens, r, [&](int i) {
+            for (char c : tokens[static_cast<size_t>(i)].text) {
+                if (!is_continuation(c)) ++runes;
+            }
+        });
+        out.push_back(RuneRange{start, runes});
+    }
+}
+
+size_t trim_trailing_whitespace(std::string_view s) {
+    return trim_right_space(s);
 }
 
 // fzf: JoinTokens(Transform(tokens, ranges))

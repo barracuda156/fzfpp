@@ -42,7 +42,8 @@ bool is_space_cp(CodePoint c) {
            c == '\v' || c == '\f';
 }
 
-size_t leading_whitespaces(const std::vector<CodePoint>& text) {
+template <class Text>
+size_t leading_whitespaces(const Text& text) {
     size_t n = 0;
     while (n < text.size() && is_space_cp(text[n])) {
         ++n;
@@ -50,7 +51,8 @@ size_t leading_whitespaces(const std::vector<CodePoint>& text) {
     return n;
 }
 
-size_t trailing_whitespaces(const std::vector<CodePoint>& text) {
+template <class Text>
+size_t trailing_whitespaces(const Text& text) {
     size_t n = 0;
     while (n < text.size() && is_space_cp(text[text.size() - 1 - n])) {
         ++n;
@@ -82,17 +84,66 @@ CodePoint strip_accent(CodePoint c) {
     return c;
 }
 
+// Per-thread scratch memory: nothing is allocated per match in steady
+// state (fzf uses a per-thread slab for the same reason).
+struct Scratch {
+    std::vector<CodePoint> runes;     // decoded non-ASCII text
+    std::vector<int32_t> bonus;
+    std::vector<int32_t> M;
+    std::vector<int32_t> run;
+    std::vector<int32_t> from;
+    std::vector<uint32_t> term_positions;
+};
+
+Scratch& scratch() {
+    thread_local Scratch s;
+    return s;
+}
+
+// Decode UTF-8 into the scratch rune buffer (invalid bytes as Latin-1).
+void decode_runes(std::string_view text, std::vector<CodePoint>& out) {
+    out.clear();
+    out.reserve(text.size());
+    const char* p = text.data();
+    const char* end = p + text.size();
+    while (p < end) {
+        unsigned char c = static_cast<unsigned char>(*p);
+        if (c < 0x80) { out.push_back(c); ++p; continue; }
+        try {
+            const char* q = p;
+            CodePoint cp = utf8::next(q, end);
+            out.push_back(cp);
+            p = q;
+        } catch (...) {
+            out.push_back(c);
+            ++p;
+        }
+    }
+}
+
+// A sub-range view used for --nth restriction.
+template <class Text>
+struct SubText {
+    Text base;
+    size_t offset;
+    size_t n;
+    size_t size() const { return n; }
+    CodePoint operator[](size_t i) const { return base[offset + i]; }
+};
+
 } // namespace
 
 CodePoint Matcher::normalize_char(CodePoint c) const {
-    return strip_accent(c);
+    return normalize_ ? strip_accent(c) : c;
 }
 
 bool Matcher::char_equal(CodePoint a, CodePoint b, bool case_sensitive) const {
     // Accent stripping (fzf's `normalize`) is independent of case
     // sensitivity: `--case-sensitive cafe` still matches "café".
-    a = strip_accent(a);
-    b = strip_accent(b);
+    if (normalize_) {
+        a = strip_accent(a);
+        b = strip_accent(b);
+    }
     if (case_sensitive) {
         return a == b;
     }
@@ -103,7 +154,7 @@ bool Matcher::char_equal(CodePoint a, CodePoint b, bool case_sensitive) const {
 
 // Determine character class for bonus calculation (fzf's charClassOf; the
 // delimiter set is fzf's default-scheme delimiterChars "/,:;|").
-CharClass Matcher::char_class_of(CodePoint c) const {
+CharClass Matcher::char_class_of(CodePoint c) {
     if (c <= 0x7F) {  // ASCII fast path
         if (c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
             c == '\v' || c == '\f') {
@@ -129,7 +180,7 @@ CharClass Matcher::char_class_of(CodePoint c) const {
 }
 
 // Calculate bonus for a character position (fzf's bonusFor, default scheme).
-int32_t Matcher::bonus_for(CharClass prev, CharClass curr) const {
+int32_t Matcher::bonus_for(CharClass prev, CharClass curr) {
     if (curr != CharClass::CharWhite) {
         if (prev == CharClass::CharWhite) {
             return BONUS_BOUNDARY_WHITE;  // word boundary after whitespace
@@ -154,7 +205,8 @@ int32_t Matcher::bonus_for(CharClass prev, CharClass curr) const {
     return 0;
 }
 
-int32_t Matcher::bonus_at(const std::vector<CodePoint>& text, size_t idx) const {
+template <class Text>
+int32_t Matcher::bonus_at(const Text& text, size_t idx) const {
     if (idx == 0) {
         return BONUS_BOUNDARY_WHITE;
     }
@@ -164,10 +216,11 @@ int32_t Matcher::bonus_at(const std::vector<CodePoint>& text, size_t idx) const 
 // fzf's calculateScore: walk a known match region and accumulate the same
 // bonuses/penalties V2 would assign, so exact/prefix/suffix results rank
 // comparably against fuzzy ones.
-int32_t Matcher::calculate_score(const std::vector<CodePoint>& text,
+template <class Text>
+int32_t Matcher::calculate_score(const Text& text,
                                  const std::vector<CodePoint>& pattern,
                                  size_t sidx, size_t eidx, bool case_sensitive,
-                                 std::vector<MatchPos>* positions) const {
+                                 std::vector<uint32_t>* positions) const {
     size_t pidx = 0;
     int32_t score = 0;
     bool in_gap = false;
@@ -184,16 +237,15 @@ int32_t Matcher::calculate_score(const std::vector<CodePoint>& text,
         // pattern is compared through the same transform (char_equal does
         // this for every other match path -- mirrored here since this loop
         // compares codepoints directly for scoring/positions).
-        c = strip_accent(c);
-        CodePoint p = pidx < pattern.size() ? strip_accent(pattern[pidx]) : 0;
+        c = normalize_char(c);
+        CodePoint p = pidx < pattern.size() ? normalize_char(pattern[pidx]) : 0;
         if (!case_sensitive) {
             if (c >= 'A' && c <= 'Z') c += ('a' - 'A');
             if (p >= 'A' && p <= 'Z') p += ('a' - 'A');
         }
         if (pidx < pattern.size() && c == p) {
             if (positions) {
-                positions->push_back({static_cast<uint32_t>(idx),
-                                      static_cast<uint32_t>(idx + 1)});
+                positions->push_back(static_cast<uint32_t>(idx));
             }
             score += SCORE_MATCH;
             int32_t bonus = bonus_for(prev_class, klass);
@@ -225,19 +277,36 @@ int32_t Matcher::calculate_score(const std::vector<CodePoint>& text,
     return score;
 }
 
+namespace {
+MatchResult found(int32_t score, size_t sidx, size_t eidx) {
+    MatchResult r;
+    r.matched = true;
+    r.score = score;
+    r.begin = static_cast<int32_t>(sidx);
+    r.end = static_cast<int32_t>(eidx);
+    return r;
+}
+MatchResult empty_match() {
+    MatchResult r;
+    r.matched = true;
+    return r;
+}
+} // namespace
+
 // Greedy fuzzy matching algorithm (V1) - fzf's FuzzyMatchV1: forward scan to
 // find the first subsequence, backward scan to shrink its window, then
 // calculateScore over the window.
-MatchResult Matcher::fuzzy_match_v1(
-    const std::shared_ptr<Item>& item,
-    const std::vector<CodePoint>& pattern, bool case_sensitive)
+template <class Text>
+MatchResult Matcher::fuzzy_match_v1(const Text& text,
+                                    const std::vector<CodePoint>& pattern,
+                                    bool case_sensitive,
+                                    std::vector<uint32_t>* positions) const
 {
-    const auto& text = item->code_points();
     size_t pattern_len = pattern.size();
     size_t text_len = text.size();
 
     if (pattern_len == 0) {
-        return MatchResult(item, 0);
+        return empty_match();
     }
     if (text_len == 0 || pattern_len > text_len) {
         return MatchResult();  // No match
@@ -275,11 +344,10 @@ MatchResult Matcher::fuzzy_match_v1(
         }
     }
 
-    std::vector<MatchPos> positions;
     int32_t score = calculate_score(text, pattern, static_cast<size_t>(sidx),
                                     static_cast<size_t>(eidx), case_sensitive,
-                                    &positions);
-    return MatchResult(item, score, std::move(positions));
+                                    positions);
+    return found(score, static_cast<size_t>(sidx), static_cast<size_t>(eidx));
 }
 
 // Optimal fuzzy matching (V2) - a port of fzf's FuzzyMatchV2 recurrence.
@@ -290,8 +358,7 @@ MatchResult Matcher::fuzzy_match_v1(
 // subsequence into a non-match; every match scores >= SCORE_MATCH.
 //
 // Cell semantics (full-matrix form of fzf's rolling rows, kept so that
-// backtracking can follow explicit predecessor links -- see the from[]
-// invariants in the project memory):
+// backtracking can follow explicit predecessor links):
 //   M[i][j]    fzf's s1: score of aligning pattern[0..i] with pattern[i]
 //              matched exactly at text[j] (0 if infeasible / chars differ).
 //   run[i][j]  fzf's C: consecutive-run length at that cell (0 when the gap
@@ -303,65 +370,86 @@ MatchResult Matcher::fuzzy_match_v1(
 // column, with fzf's gap decay: -3 for the first gap column, -1 for each
 // further one, floored at 0) is reconstructed as a running carry while
 // sweeping row i, so no H matrix is stored.
-MatchResult Matcher::fuzzy_match_v2(
-    const std::shared_ptr<Item>& item,
-    const std::vector<CodePoint>& pattern, bool case_sensitive)
+template <class Text>
+MatchResult Matcher::fuzzy_match_v2(const Text& text,
+                                    const std::vector<CodePoint>& pattern,
+                                    bool case_sensitive,
+                                    std::vector<uint32_t>* positions) const
 {
-    const auto& text = item->code_points();
     size_t pattern_len = pattern.size();
     size_t text_len = text.size();
 
     if (pattern_len == 0) {
-        return MatchResult(item, 0);
+        return empty_match();
     }
     if (text_len == 0 || pattern_len > text_len) {
         return MatchResult();  // No match
     }
 
     // Feasibility: the pattern must appear as a subsequence. This alone
-    // decides match/no-match, like fzf's phase-2 pidx check.
+    // decides match/no-match, like fzf's phase-2 pidx check. It also gives
+    // the first possible column of the first pattern char and the last
+    // possible column of the last one, which bounds the DP sweep.
+    size_t first_col = 0;
+    size_t last_col = text_len;
     {
         size_t text_idx = 0;
         for (size_t pat_idx = 0; pat_idx < pattern_len; ++pat_idx) {
-            bool found = false;
+            bool found_c = false;
             while (text_idx < text_len) {
                 if (char_equal(text[text_idx], pattern[pat_idx], case_sensitive)) {
-                    found = true;
+                    if (pat_idx == 0) first_col = text_idx;
+                    found_c = true;
                     text_idx++;
                     break;
                 }
                 text_idx++;
             }
-            if (!found) {
+            if (!found_c) {
                 return MatchResult();  // No match
+            }
+        }
+        // Backward scan for the last possible end column.
+        size_t pidx = pattern_len;
+        for (size_t j = text_len; j > first_col && pidx > 0; --j) {
+            if (char_equal(text[j - 1], pattern[pidx - 1], case_sensitive)) {
+                if (pidx == pattern_len) last_col = j;
+                --pidx;
             }
         }
     }
 
+    // Work on the window [first_col, last_col) only; offsets are added back
+    // when reporting positions.
+    SubText<Text> win{text, first_col, last_col - first_col};
+    size_t wlen = win.size();
+
+    Scratch& sc = scratch();
     // Per-position boundary bonuses.
-    std::vector<int32_t> bonus(text_len);
-    CharClass prev_class = CharClass::CharWhite;
-    for (size_t i = 0; i < text_len; ++i) {
-        CharClass curr_class = char_class_of(text[i]);
-        bonus[i] = bonus_for(prev_class, curr_class);
+    sc.bonus.resize(wlen);
+    CharClass prev_class = first_col > 0 ? char_class_of(text[first_col - 1]) : CharClass::CharWhite;
+    for (size_t i = 0; i < wlen; ++i) {
+        CharClass curr_class = char_class_of(win[i]);
+        sc.bonus[i] = bonus_for(prev_class, curr_class);
         prev_class = curr_class;
     }
 
-    // Flat matrices; row i starts at i * text_len. M/run only ever need the
-    // previous row during the sweep, but run's diagonal read makes a simple
-    // two-row scheme error-prone; from[] genuinely needs full history for
-    // backtracking. Keep all three full -- clarity over the last few bytes.
-    std::vector<int32_t> M(pattern_len * text_len, 0);
-    std::vector<int32_t> run(pattern_len * text_len, 0);
-    std::vector<int32_t> from(pattern_len * text_len, -1);
-    auto at = [text_len](size_t i, size_t j) { return i * text_len + j; };
+    size_t cells = pattern_len * wlen;
+    sc.M.assign(cells, 0);
+    sc.run.assign(cells, 0);
+    sc.from.assign(cells, -1);
+    int32_t* M = sc.M.data();
+    int32_t* run = sc.run.data();
+    int32_t* from = sc.from.data();
+    const int32_t* bonus = sc.bonus.data();
+    auto at = [wlen](size_t i, size_t j) { return i * wlen + j; };
 
     int32_t max_score = 0;
     size_t max_score_pos = 0;
 
     // Row 0: every match of pattern[0] seeds a run; first-char bonus doubled.
-    for (size_t j = 0; j < text_len; ++j) {
-        if (char_equal(pattern[0], text[j], case_sensitive)) {
+    for (size_t j = 0; j < wlen; ++j) {
+        if (char_equal(pattern[0], win[j], case_sensitive)) {
             M[at(0, j)] = SCORE_MATCH + bonus[j] * BONUS_FIRST_CHAR_MULTIPLIER;
             run[at(0, j)] = 1;
             if (pattern_len == 1 && M[at(0, j)] > max_score) {
@@ -388,7 +476,7 @@ MatchResult Matcher::fuzzy_match_v2(
         int32_t hcur = 0;
         bool cur_in_gap = false;
 
-        for (size_t j = 0; j < text_len; ++j) {
+        for (size_t j = 0; j < wlen; ++j) {
             int32_t s2 = hcur + (cur_in_gap ? SCORE_GAP_EXTENSION : SCORE_GAP_START);
             int32_t s1 = 0;
             int32_t consecutive = 0;
@@ -397,7 +485,7 @@ MatchResult Matcher::fuzzy_match_v2(
             // exists strictly to the left (hprev_col >= 0) -- the full-sweep
             // equivalent of fzf starting row i at F[i].
             if (hprev_col >= 0 &&
-                char_equal(pattern_char, text[j], case_sensitive)) {
+                char_equal(pattern_char, win[j], case_sensitive)) {
                 s1 = hprev + SCORE_MATCH;
                 int32_t b = bonus[j];
                 consecutive = (j > 0 ? run[at(i - 1, j - 1)] : 0) + 1;
@@ -453,37 +541,41 @@ MatchResult Matcher::fuzzy_match_v2(
     // cell and max_score >= SCORE_MATCH: a found subsequence is ALWAYS a
     // match (scores only rank, they never disqualify).
 
-    // Backtrack along the recorded predecessor columns.
-    std::vector<MatchPos> positions;
+    // Backtrack along the recorded predecessor columns to find the start
+    // (and the positions if requested).
     long i = static_cast<long>(pattern_len) - 1;
     long j = static_cast<long>(max_score_pos);
+    long start = j;
+    size_t pos_begin = positions ? positions->size() : 0;
     while (i >= 0 && j >= 0) {
-        positions.push_back({static_cast<uint32_t>(j),
-                             static_cast<uint32_t>(j + 1)});
+        if (positions) positions->push_back(static_cast<uint32_t>(j + first_col));
+        start = j;
         j = from[at(static_cast<size_t>(i), static_cast<size_t>(j))];
         --i;
     }
+    if (positions) {
+        std::reverse(positions->begin() + static_cast<long>(pos_begin), positions->end());
+    }
 
-    std::reverse(positions.begin(), positions.end());
-
-    return MatchResult(item, max_score, std::move(positions));
+    return found(max_score, static_cast<size_t>(start) + first_col,
+                 max_score_pos + 1 + first_col);
 }
 
 // fzf's ExactMatchNaive / ExactMatchBoundary: the whole pattern as one
 // contiguous run; among all occurrences keep the one whose FIRST character
 // has the highest boundary bonus (earliest such occurrence wins; the scan
 // stops early once a boundary-quality occurrence is found).
-MatchResult Matcher::exact_match_naive(
-    const std::shared_ptr<Item>& item,
-    const std::vector<CodePoint>& pattern, bool case_sensitive,
-    bool boundary_check)
+template <class Text>
+MatchResult Matcher::exact_match_naive(const Text& text,
+                                       const std::vector<CodePoint>& pattern,
+                                       bool case_sensitive, bool boundary_check,
+                                       std::vector<uint32_t>* positions) const
 {
-    const auto& text = item->code_points();
     size_t pattern_len = pattern.size();
     size_t text_len = text.size();
 
     if (pattern_len == 0) {
-        return MatchResult(item, 0);
+        return empty_match();
     }
     if (text_len < pattern_len) {
         return MatchResult();  // No match
@@ -562,22 +654,20 @@ MatchResult Matcher::exact_match_naive(
                                 nullptr);
     }
 
-    std::vector<MatchPos> positions;
-    positions.reserve(pattern_len);
-    for (size_t k = sidx; k < eidx; ++k) {
-        positions.push_back({static_cast<uint32_t>(k),
-                             static_cast<uint32_t>(k + 1)});
+    if (positions) {
+        for (size_t k = sidx; k < eidx; ++k) positions->push_back(static_cast<uint32_t>(k));
     }
-    return MatchResult(item, score, std::move(positions));
+    return found(score, sidx, eidx);
 }
 
-MatchResult Matcher::prefix_match(const std::shared_ptr<Item>& item,
+template <class Text>
+MatchResult Matcher::prefix_match(const Text& text,
                                   const std::vector<CodePoint>& pattern,
-                                  bool case_sensitive)
+                                  bool case_sensitive,
+                                  std::vector<uint32_t>* positions) const
 {
-    const auto& text = item->code_points();
     if (pattern.empty()) {
-        return MatchResult(item, 0);
+        return empty_match();
     }
     // fzf skips the item's leading whitespace unless the pattern itself
     // starts with whitespace.
@@ -591,24 +681,22 @@ MatchResult Matcher::prefix_match(const std::shared_ptr<Item>& item,
         }
     }
     size_t sidx = trimmed, eidx = trimmed + pattern.size();
-    std::vector<MatchPos> positions;
-    positions.reserve(pattern.size());
-    for (size_t k = sidx; k < eidx; ++k) {
-        positions.push_back({static_cast<uint32_t>(k),
-                             static_cast<uint32_t>(k + 1)});
+    if (positions) {
+        for (size_t k = sidx; k < eidx; ++k) positions->push_back(static_cast<uint32_t>(k));
     }
     int32_t score = calculate_score(text, pattern, sidx, eidx, case_sensitive,
                                     nullptr);
-    return MatchResult(item, score, std::move(positions));
+    return found(score, sidx, eidx);
 }
 
-MatchResult Matcher::suffix_match(const std::shared_ptr<Item>& item,
+template <class Text>
+MatchResult Matcher::suffix_match(const Text& text,
                                   const std::vector<CodePoint>& pattern,
-                                  bool case_sensitive)
+                                  bool case_sensitive,
+                                  std::vector<uint32_t>* positions) const
 {
-    const auto& text = item->code_points();
     if (pattern.empty()) {
-        return MatchResult(item, 0);
+        return empty_match();
     }
     // fzf ignores the item's trailing whitespace unless the pattern itself
     // ends with whitespace.
@@ -626,22 +714,20 @@ MatchResult Matcher::suffix_match(const std::shared_ptr<Item>& item,
         }
     }
     size_t sidx = diff, eidx = trimmed_len;
-    std::vector<MatchPos> positions;
-    positions.reserve(pattern.size());
-    for (size_t k = sidx; k < eidx; ++k) {
-        positions.push_back({static_cast<uint32_t>(k),
-                             static_cast<uint32_t>(k + 1)});
+    if (positions) {
+        for (size_t k = sidx; k < eidx; ++k) positions->push_back(static_cast<uint32_t>(k));
     }
     int32_t score = calculate_score(text, pattern, sidx, eidx, case_sensitive,
                                     nullptr);
-    return MatchResult(item, score, std::move(positions));
+    return found(score, sidx, eidx);
 }
 
-MatchResult Matcher::equal_match(const std::shared_ptr<Item>& item,
+template <class Text>
+MatchResult Matcher::equal_match(const Text& text,
                                  const std::vector<CodePoint>& pattern,
-                                 bool case_sensitive)
+                                 bool case_sensitive,
+                                 std::vector<uint32_t>* positions) const
 {
-    const auto& text = item->code_points();
     if (pattern.empty()) {
         return MatchResult();
     }
@@ -660,13 +746,10 @@ MatchResult Matcher::equal_match(const std::shared_ptr<Item>& item,
     int32_t n = static_cast<int32_t>(pattern.size());
     int32_t score = (SCORE_MATCH + BONUS_BOUNDARY_WHITE) * n +
                     (BONUS_FIRST_CHAR_MULTIPLIER - 1) * BONUS_BOUNDARY_WHITE;
-    std::vector<MatchPos> positions;
-    positions.reserve(pattern.size());
-    for (size_t k = lead; k < lead + pattern.size(); ++k) {
-        positions.push_back({static_cast<uint32_t>(k),
-                             static_cast<uint32_t>(k + 1)});
+    if (positions) {
+        for (size_t k = lead; k < lead + pattern.size(); ++k) positions->push_back(static_cast<uint32_t>(k));
     }
-    return MatchResult(item, score, std::move(positions));
+    return found(score, lead, lead + pattern.size());
 }
 
 // Parse a raw query into extended-search term sets: fzf's parseTerms.
@@ -728,12 +811,9 @@ std::vector<TermSet> Matcher::parse_terms(const std::string& pattern) const {
         // Smart case is decided per term, on the token as typed (before
         // stripping the syntax characters -- they're symbols, so this
         // matches deciding on the stripped text like fzf does).
-        std::string lower = ascii_lower(text);
-        bool term_case_sensitive =
-            case_mode_ == CaseMode::Respect ||
-            (case_mode_ == CaseMode::Smart && text != lower);
+        bool term_case_sensitive = Matcher::term_case_sensitive(case_mode_, text);
         if (!term_case_sensitive) {
-            text = lower;
+            text = ascii_lower(text);
         }
 
         PatternTerm::Type typ =
@@ -795,23 +875,48 @@ std::vector<TermSet> Matcher::parse_terms(const std::string& pattern) const {
     return sets;
 }
 
-MatchResult Matcher::match_term(const std::shared_ptr<Item>& item,
-                                const PatternTerm& term) {
+bool Matcher::term_case_sensitive(CaseMode mode, const std::string& text) {
+    return mode == CaseMode::Respect ||
+           (mode == CaseMode::Smart && text != ascii_lower(text));
+}
+
+void Matcher::set_pattern(const std::string& pattern) {
+    pattern_ = pattern;
+    set_terms(parse_terms(pattern));
+}
+
+void Matcher::set_terms(std::vector<TermSet> sets) {
+    sets_ = std::move(sets);
+    sortable_ = false;
+    for (const auto& set : sets_) {
+        for (const auto& term : set) {
+            if (!term.inverse) sortable_ = true;
+        }
+    }
+}
+
+const std::vector<CodePoint>& Matcher::scratch_runes() {
+    return scratch().runes;
+}
+
+template <class Text>
+MatchResult Matcher::match_term(const Text& text, const PatternTerm& term,
+                                std::vector<uint32_t>* positions) const {
     switch (term.type) {
         case PatternTerm::Type::Fuzzy:
             return algo_ == AlgoType::FuzzyV1
-                       ? fuzzy_match_v1(item, term.text, term.case_sensitive)
-                       : fuzzy_match_v2(item, term.text, term.case_sensitive);
+                       ? fuzzy_match_v1(text, term.text, term.case_sensitive, positions)
+                       : fuzzy_match_v2(text, term.text, term.case_sensitive, positions);
         case PatternTerm::Type::Exact:
-            return exact_match_naive(item, term.text, term.case_sensitive, false);
+            return exact_match_naive(text, term.text, term.case_sensitive, false, positions);
         case PatternTerm::Type::ExactBoundary:
-            return exact_match_naive(item, term.text, term.case_sensitive, true);
+            return exact_match_naive(text, term.text, term.case_sensitive, true, positions);
         case PatternTerm::Type::Prefix:
-            return prefix_match(item, term.text, term.case_sensitive);
+            return prefix_match(text, term.text, term.case_sensitive, positions);
         case PatternTerm::Type::Suffix:
-            return suffix_match(item, term.text, term.case_sensitive);
+            return suffix_match(text, term.text, term.case_sensitive, positions);
         case PatternTerm::Type::Equal:
-            return equal_match(item, term.text, term.case_sensitive);
+            return equal_match(text, term.text, term.case_sensitive, positions);
     }
     return MatchResult();
 }
@@ -819,108 +924,121 @@ MatchResult Matcher::match_term(const std::shared_ptr<Item>& item,
 // Main match function: extended-search semantics (fzf's extendedMatch).
 // Every term set must be satisfied (AND); within a set, alternatives are
 // tried in order (OR). An inverse term satisfies its set by NOT matching.
-MatchResult Matcher::match(const std::shared_ptr<Item>& item,
-                           const std::string& pattern)
-{
-    if (pattern.empty()) {
-        return MatchResult(item, 0);
-    }
+// `base` is added to reported positions/bounds (for --nth sub-ranges).
+template <class Text>
+MatchResult Matcher::match_text(const Text& text, uint32_t base,
+                                std::vector<uint32_t>* positions) const {
+    MatchResult total;
+    total.matched = true;
+    total.score = 0;
+    int32_t min_begin = -1, max_end = -1, min_end = -1;
 
-    if (!cached_valid_ || cached_pattern_ != pattern) {
-        cached_sets_ = parse_terms(pattern);
-        cached_pattern_ = pattern;
-        cached_valid_ = true;
-    }
-    const auto& sets = cached_sets_;
-
-    if (sets.empty()) {
-        return MatchResult(item, 0);  // whitespace-only query matches all
-    }
-
-    int32_t total_score = 0;
-    std::vector<MatchPos> all_positions;
-
-    for (const auto& set : sets) {
+    Scratch& sc = scratch();
+    for (const auto& set : sets_) {
         bool matched = false;
-        int32_t current_score = 0;
-        std::vector<MatchPos> current_positions;
-
+        MatchResult chosen;
+        size_t pos_mark = positions ? positions->size() : 0;
         for (const auto& term : set) {
-            MatchResult r = match_term(item, term);
-            if (r.item) {
+            if (positions) positions->resize(pos_mark);
+            MatchResult r = match_term(text, term, positions);
+            if (r.matched) {
                 if (term.inverse) {
                     // The forbidden text IS present: this alternative fails.
+                    if (positions) positions->resize(pos_mark);
                     continue;
                 }
-                current_score = r.score;
-                current_positions = std::move(r.positions);
+                chosen = r;
                 matched = true;
                 break;
             } else if (term.inverse) {
                 // Absent as required. Keep trying later alternatives -- a
                 // positive one can still contribute score/highlights.
-                current_score = 0;
-                current_positions.clear();
+                chosen = MatchResult();
+                chosen.matched = true;
                 matched = true;
                 continue;
             }
         }
-
         if (!matched) {
+            if (positions) positions->resize(pos_mark);
             return MatchResult();  // an AND clause failed
         }
-        total_score += current_score;
-        all_positions.insert(all_positions.end(), current_positions.begin(),
-                             current_positions.end());
+        total.score += chosen.score;
+        // fzf: buildResult only counts offsets with begin < end.
+        if (chosen.begin >= 0 && chosen.begin < chosen.end) {
+            if (min_begin < 0 || chosen.begin < min_begin) min_begin = chosen.begin;
+            if (min_end < 0 || chosen.end < min_end) min_end = chosen.end;
+            if (chosen.end > max_end) max_end = chosen.end;
+        }
     }
-
-    std::sort(all_positions.begin(), all_positions.end(),
-              [](const MatchPos& a, const MatchPos& b) { return a.start < b.start; });
-
-    return MatchResult(item, total_score, std::move(all_positions));
+    (void)sc;
+    if (min_begin >= 0) {
+        total.begin = min_begin + static_cast<int32_t>(base);
+        total.end = max_end + static_cast<int32_t>(base);
+        total.min_end = min_end + static_cast<int32_t>(base);
+    }
+    if (positions && base > 0) {
+        for (auto& p : *positions) p += base;
+    }
+    return total;
 }
 
-// Match multiple items
-std::vector<MatchResult> Matcher::match_items(
-    const std::vector<std::shared_ptr<Item>>& items,
-    const std::string& pattern)
-{
-    std::vector<MatchResult> results;
-    results.reserve(items.size());
+MatchResult Matcher::match(std::string_view text, bool ascii,
+                           const RuneRange* nth, size_t nth_count,
+                           std::vector<uint32_t>* positions) const {
+    if (positions) positions->clear();
+    if (sets_.empty()) {
+        return empty_match();   // empty / whitespace-only query matches all
+    }
 
-    for (const auto& item : items) {
-        auto result = match(item, pattern);
-        // A returned item IS a match -- do not filter on score. Scores only
-        // rank (fuzzy matches are always positive, but an inverse-only query
-        // like "!foo" legitimately matches with score 0).
-        if (result.item) {
-            results.push_back(std::move(result));
+    // fzf: with --nth, try each transformed part in order; first hit wins.
+    if (ascii) {
+        AsciiText t{text.data(), text.size()};
+        if (nth_count == 0) {
+            MatchResult r = match_text(t, 0, positions);
+            if (positions) std::sort(positions->begin(), positions->end());
+            return r;
         }
-    }
-
-    // fzf's sortable flag: a query with no positive term (empty, whitespace-
-    // only, or all-!negations) keeps input order -- every score is 0 and a
-    // score/length sort would scramble the list.
-    if (!cached_valid_ || cached_pattern_ != pattern) {
-        cached_sets_ = parse_terms(pattern);
-        cached_pattern_ = pattern;
-        cached_valid_ = true;
-    }
-    bool sortable = false;
-    for (const auto& set : cached_sets_) {
-        for (const auto& term : set) {
-            if (!term.inverse) {
-                sortable = true;
+        for (size_t k = 0; k < nth_count; ++k) {
+            size_t start = std::min<size_t>(nth[k].start, t.size());
+            size_t len = std::min<size_t>(nth[k].len, t.size() - start);
+            AsciiText sub{t.p + start, len};
+            MatchResult r = match_text(sub, static_cast<uint32_t>(start), positions);
+            if (r.matched) {
+                if (positions) std::sort(positions->begin(), positions->end());
+                return r;
             }
         }
+        return MatchResult();
     }
 
-    // Sort by score (descending), then fzf's default tiebreak.
-    if (sortable) {
-        std::sort(results.begin(), results.end());
+    Scratch& sc = scratch();
+    decode_runes(text, sc.runes);
+    RuneText t{sc.runes.data(), sc.runes.size()};
+    if (nth_count == 0) {
+        MatchResult r = match_text(t, 0, positions);
+        if (positions) std::sort(positions->begin(), positions->end());
+        return r;
     }
+    for (size_t k = 0; k < nth_count; ++k) {
+        size_t start = std::min<size_t>(nth[k].start, t.size());
+        size_t len = std::min<size_t>(nth[k].len, t.size() - start);
+        RuneText sub{t.p + start, len};
+        MatchResult r = match_text(sub, static_cast<uint32_t>(start), positions);
+        if (r.matched) {
+            if (positions) std::sort(positions->begin(), positions->end());
+            return r;
+        }
+    }
+    return MatchResult();
+}
 
-    return results;
+MatchResult Matcher::match(std::string_view text, std::vector<uint32_t>* positions) const {
+    bool ascii = true;
+    for (unsigned char c : text) {
+        if (c >= 0x80) { ascii = false; break; }
+    }
+    return match(text, ascii, nullptr, 0, positions);
 }
 
 } // namespace fzf

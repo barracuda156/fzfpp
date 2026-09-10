@@ -762,8 +762,7 @@ def test_accept_nth(fzf):
         fzf, ["-f", "a", "--accept-nth", "2"], b"a b c\n", [], timeout=2.0)
     check("nth/accept-nth-without-delimiter", out.strip() == b"b",
           f"stdout was {out!r}, expected b'b\\n' (--accept-nth 2 with the "
-          f"default AWK-style whitespace delimiter)",
-          xfail="T1.3")
+          f"default AWK-style whitespace delimiter)")
 
 
 def test_tab_delimiter(fzf):
@@ -781,8 +780,7 @@ def test_tab_delimiter(fzf):
     check("nth/tab-delimiter-regex", ok,
           f"query 'b' --nth 2 -d '\\t' on 'a<TAB>b' -> {out_match!r} "
           f"(expected the whole line); query 'a' --nth 2 -d '\\t' -> "
-          f"{out_nomatch!r} (expected no match)",
-          xfail="T1.3")
+          f"{out_nomatch!r} (expected no match)")
 
 
 def test_nth_restricts_match(fzf):
@@ -792,8 +790,7 @@ def test_nth_restricts_match(fzf):
     check("nth/--nth-restricts-match", out.strip() == b"bar foo",
           f"stdout was {out!r}, expected b'bar foo\\n' -- field 2 of "
           f"'foo bar' is 'bar' (doesn't match ^foo), field 2 of 'bar foo' "
-          f"is 'foo' (matches)",
-          xfail="T1.5")
+          f"is 'foo' (matches)")
 
 
 def test_tac(fzf):
@@ -801,8 +798,7 @@ def test_tac(fzf):
                                            b"a\nb\nc\n", [], timeout=2.0)
     check("sort/--tac", out == b"c\nb\na\n",
           f"stdout was {out!r}, expected b'c\\nb\\na\\n' (--tac reverses "
-          f"input order before matching)",
-          xfail="T1.5")
+          f"input order before matching)")
 
 
 def test_plus_s_keeps_input_order(fzf):
@@ -812,8 +808,7 @@ def test_plus_s_keeps_input_order(fzf):
     check("sort/+s-keeps-input-order", first_line == b"xxab",
           f"first line of stdout was {first_line!r}, expected b'xxab' -- "
           f"+s disables sorting, so input order (xxab before ab) is kept "
-          f"even though 'ab' would score higher",
-          xfail="T1.5")
+          f"even though 'ab' would score higher")
 
 
 def test_print0(fzf):
@@ -844,8 +839,7 @@ def test_header_lines_excluded(fzf):
         [(0.3, ENTER)])
     check("header/--header-lines-excluded-from-output", out.strip() == b"body",
           f"stdout was {out!r}, expected b'body\\n' -- the header line "
-          f"must not be selectable/printable",
-          xfail="T1.4")
+          f"must not be selectable/printable")
 
 
 def test_multiline_header(fzf):
@@ -859,8 +853,7 @@ def test_multiline_header(fzf):
     check("header/multiline-header-two-rows", ok,
           f"'line1' on row {row1}, 'line2' on row {row2} of the captured "
           f"frame -- expected both present on two distinct rows\n"
-          + "\n".join(f"       {i:2d}|{r}" for i, r in enumerate(rows_list) if r),
-          xfail="T2.2")
+          + "\n".join(f"       {i:2d}|{r}" for i, r in enumerate(rows_list) if r))
 
 
 def test_become(fzf):
@@ -1000,8 +993,7 @@ def test_reload_does_not_block_on_streaming_stdin(fzf):
           seen is not None and seen < 1.0,
           f"RELOADED appeared after {seen_desc} (expected < 1.0s) -- "
           f"start:reload must not wait for the "
-          f"still-streaming stdin producer to finish/EOF",
-          xfail="T1.4")
+          f"still-streaming stdin producer to finish/EOF")
     try:
         os.write(master, b"\x03")
     except OSError:

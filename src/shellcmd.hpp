@@ -5,6 +5,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <fcntl.h>
 #include <signal.h>
 #include <unistd.h>
 #include <sys/wait.h>
@@ -30,13 +31,24 @@ struct ShellPipe {
     pid_t pid = -1;
 };
 
-// extra_env: "NAME=value" strings appended to the child's environment
-// (overriding inherited values by coming later in the array). Passed via
-// execve rather than setenv so a multithreaded parent never mutates its own
-// environ (setenv racing getenv on another thread is UB in glibc).
-inline ShellPipe shell_popen(const std::string& cmd,
-                             const std::vector<std::string>& extra_env = {}) {
-    ShellPipe result;
+// A command started with shell_spawn: the read end of its stdout pipe and
+// its pid (which is also its process group id).
+struct SpawnedCommand {
+    int fd = -1;
+    pid_t pid = -1;
+};
+
+// fork + execve `$SHELL -c cmd` with stdout piped to the returned fd, in its
+// own process group. extra_env: "NAME=value" strings appended to the child's
+// environment (overriding inherited values by coming later in the array),
+// passed via execve rather than setenv so a multithreaded parent never
+// mutates its own environ (setenv racing getenv on another thread is UB).
+// `null_stdin` redirects the child's stdin from /dev/null (fzf runs reload
+// commands that way: Go's exec gives a nil Stdin the null device).
+inline SpawnedCommand shell_spawn(const std::string& cmd,
+                                  const std::vector<std::string>& extra_env = {},
+                                  bool null_stdin = false) {
+    SpawnedCommand result;
 
     int fds[2];
     if (pipe(fds) != 0) {
@@ -62,10 +74,16 @@ inline ShellPipe shell_popen(const std::string& cmd,
 
     const char* argv[4] = {shell, "-c", cmd.c_str(), nullptr};
 
+    int devnull = -1;
+    if (null_stdin) {
+        devnull = open("/dev/null", O_RDONLY);
+    }
+
     pid_t pid = fork();
     if (pid < 0) {
         close(fds[0]);
         close(fds[1]);
+        if (devnull >= 0) close(devnull);
         return result;
     }
 
@@ -75,19 +93,37 @@ inline ShellPipe shell_popen(const std::string& cmd,
         close(fds[0]);
         dup2(fds[1], STDOUT_FILENO);
         close(fds[1]);
+        if (devnull >= 0) {
+            dup2(devnull, STDIN_FILENO);
+            close(devnull);
+        }
         execve(shell, const_cast<char* const*>(argv), envp.data());
         _exit(127);  // exec failed
     }
 
     close(fds[1]);
-    result.stream = fdopen(fds[0], "r");
+    if (devnull >= 0) close(devnull);
+    result.fd = fds[0];
+    result.pid = pid;
+    return result;
+}
+
+// popen-shaped wrapper over shell_spawn (see above for the rationale).
+inline ShellPipe shell_popen(const std::string& cmd,
+                             const std::vector<std::string>& extra_env = {}) {
+    SpawnedCommand sp = shell_spawn(cmd, extra_env);
+    ShellPipe result;
+    if (sp.fd < 0) {
+        return result;
+    }
+    result.stream = fdopen(sp.fd, "r");
     if (!result.stream) {
-        close(fds[0]);
+        close(sp.fd);
         int status;
-        waitpid(pid, &status, 0);
+        waitpid(sp.pid, &status, 0);
         return ShellPipe{};
     }
-    result.pid = pid;
+    result.pid = sp.pid;
     return result;
 }
 

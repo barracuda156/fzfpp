@@ -1,222 +1,316 @@
 #include "reader.hpp"
-#include "util.hpp"
+
+#include "ansi.hpp"
 #include "shellcmd.hpp"
-#include <iostream>
-#include <fstream>
-#include <sstream>
-#include <cstdio>
+#include "tty.hpp"
+
+#include <cerrno>
+#include <cstring>
+
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/select.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 namespace fzf {
 
-void Reader::add_item(std::string line, bool trim_newline) {
-    if (trim_newline) {
-        // fzf semantics: trim exactly one trailing \n and at most one \r
-        // before it — not a strip-all-trailing-CR/LF loop ("data\r\r\n"
-        // becomes "data\r\r", not "data").
-        if (!line.empty() && line.back() == '\n') {
-            line.pop_back();
+namespace {
+
+constexpr size_t kReadBufferSize = 64 * 1024;   // fzf: readerBufferSize
+
+// Codepoint count and ASCII-ness of a UTF-8 string in one pass.
+uint32_t count_runes(std::string_view s, bool& ascii) {
+    uint32_t n = 0;
+    ascii = true;
+    for (unsigned char c : s) {
+        if (c >= 0x80) {
+            ascii = false;
+            if ((c & 0xC0) == 0x80) continue;
         }
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
-        }
+        ++n;
     }
-    // --read0 records (trim_newline == false) are kept verbatim (minus the
-    // \0 delimiter) — NUL-delimited input exists precisely to carry
-    // embedded/trailing newlines.
-
-    // Keep all lines like fzf does (including empty lines)
-    {
-        std::lock_guard<std::mutex> lock(items_mutex_);
-        size_t index = items_.size();
-        auto item = std::make_shared<Item>(std::move(line), index);
-
-        // Parse fields if delimiter is set
-        if (!delimiter_.empty()) {
-            item->parse_fields(delimiter_);
-        }
-
-        items_.push_back(item);
-        item_count_.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    std::function<void()> callback;
-    {
-        std::lock_guard<std::mutex> lock(wake_mutex_);
-        callback = wake_callback_;
-    }
-    if (callback) {
-        callback();
-    }
+    return n;
 }
 
-void Reader::read_from_stdin() {
-    if (read_zero_) {
-        // Read null-delimited input
-        std::string line;
-        char ch;
-        while (std::cin.get(ch)) {
-            if (ch == '\0') {
-                add_item(std::move(line), /*trim_newline=*/false);
-                line.clear();
-            } else {
-                line += ch;
-            }
-        }
-        // Add last item if any
-        if (!line.empty()) {
-            add_item(std::move(line), /*trim_newline=*/false);
+} // namespace
+
+// ---------------------------------------------------------------------------
+// ItemBuilder
+// ---------------------------------------------------------------------------
+
+ItemBuilder::ItemBuilder(const Options& opts)
+    : ansi_(opts.ansi), delimiter_(opts.delimiter), tokenizer_(opts.delimiter), nth_(opts.nth) {
+    if (!opts.with_nth_expr.empty()) with_nth_ = std::make_unique<NthTransformer>(opts.with_nth_expr);
+    if (!opts.accept_nth_expr.empty()) accept_nth_ = std::make_unique<NthTransformer>(opts.accept_nth_expr);
+    with_aux_ = ansi_ || !nth_.empty() || with_nth_ != nullptr;
+}
+
+// fzf: core.go -- the ChunkList's ItemBuilder closure. With --ansi the
+// escapes are stripped and the SGR runs recorded; with --with-nth the
+// display text is the transformed line (fzf: transformItem, then
+// TrimTrailingWhitespaces) and the original line is kept for output; with
+// --nth the codepoint spans of the selected fields are recorded so the
+// matcher only looks there (fzf: Pattern.transformInput, done lazily
+// there, eagerly here).
+const ItemSpec& ItemBuilder::build(std::string_view raw, uint32_t index) {
+    spec_ = ItemSpec{};
+    std::string_view text = raw;
+    bool ascii = true;
+    uint32_t runes = 0;
+
+    if (ansi_ && has_escape(raw)) {
+        runes = extract_color(raw, stripped_, colors_, ascii);
+        text = stripped_;
+        if (!colors_.empty()) {
+            spec_.colors = colors_.data();
+            spec_.color_count = static_cast<uint32_t>(colors_.size());
         }
     } else {
-        // Read newline-delimited input (default)
-        std::string line;
-        while (std::getline(std::cin, line)) {
-            add_item(std::move(line), /*trim_newline=*/true);
+        runes = count_runes(text, ascii);
+    }
+
+    if (with_nth_) {
+        tokenizer_.tokenize(text, tokens_);
+        transformed_ = with_nth_->apply_raw(tokens_, static_cast<int32_t>(index), delimiter_);
+        transformed_.resize(trim_trailing_whitespace(transformed_));
+        spec_.has_orig = true;
+        spec_.orig = raw;
+        text = transformed_;
+        runes = count_runes(text, ascii);
+        // Colors were recorded for the untransformed text; they do not map
+        // onto the transformed one (fzf re-runs its ANSI processor on the
+        // transformed line; Tier 2 can do the same when --ansi rendering
+        // lands). Drop them.
+        spec_.colors = nullptr;
+        spec_.color_count = 0;
+    }
+
+    if (!nth_.empty()) {
+        tokenizer_.tokenize(text, tokens_);
+        transform_spans(tokens_, nth_, nth_ranges_);
+        spec_.nth = nth_ranges_.data();
+        spec_.nth_count = static_cast<uint32_t>(nth_ranges_.size());
+    }
+
+    spec_.text = text;
+    spec_.rune_len = runes;
+    spec_.ascii = ascii;
+    return spec_;
+}
+
+// fzf: Item.AsString(stripAnsi)
+std::string ItemBuilder::original_text(const ItemRef& ref) const {
+    std::string_view orig = ref.orig_text();
+    if (ansi_ && (ref.item().flags & kItemHasOrig)) {
+        return strip_ansi(orig);
+    }
+    return std::string(orig);
+}
+
+std::string ItemBuilder::output_text(const ItemRef& ref) const {
+    std::string s = original_text(ref);
+    if (!accept_nth_) return s;
+    std::vector<Token> tokens = tokenizer_.tokenize(s);
+    return accept_nth_->apply(tokens, static_cast<int32_t>(ref.index()), delimiter_);
+}
+
+std::string ItemBuilder::field_text(const ItemRef& ref, int field) const {
+    if (field < 1) return std::string();
+    std::string s = original_text(ref);
+    std::vector<Token> tokens = tokenizer_.tokenize(s);
+    if (static_cast<size_t>(field) > tokens.size()) return std::string();
+    return strip_last_delimiter(std::string(tokens[static_cast<size_t>(field) - 1].text), delimiter_);
+}
+
+// ---------------------------------------------------------------------------
+// Reader
+// ---------------------------------------------------------------------------
+
+Reader::Reader(const Options& opts, ItemBuilder& builder) : opts_(opts), builder_(builder) {
+    if (!make_self_pipe(cancel_r_, cancel_w_)) {
+        cancel_r_ = cancel_w_ = -1;
+    }
+}
+
+Reader::~Reader() {
+    cancel();
+    if (cancel_r_ >= 0) close(cancel_r_);
+    if (cancel_w_ >= 0) close(cancel_w_);
+}
+
+void Reader::set_wake_callback(std::function<void()> cb) {
+    std::lock_guard<std::mutex> lock(wake_mu_);
+    wake_cb_ = std::move(cb);
+}
+
+void Reader::wake() {
+    std::function<void()> cb;
+    {
+        std::lock_guard<std::mutex> lock(wake_mu_);
+        cb = wake_cb_;
+    }
+    if (!cb) return;
+    // One wake per consumer round trip: a fast producer generates a
+    // handful of wakes, not one per line (DESIGN section 7).
+    if (!wake_pending_.exchange(true, std::memory_order_acq_rel)) {
+        cb();
+    }
+}
+
+std::shared_ptr<ChunkList> Reader::list() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return list_;
+}
+
+bool Reader::finished() const {
+    auto l = list();
+    return !l || l->finished();
+}
+
+std::vector<std::string> Reader::header_lines() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return header_;
+}
+
+std::shared_ptr<ChunkList> Reader::start_fd(int fd) {
+    return start(fd, -1);
+}
+
+std::shared_ptr<ChunkList> Reader::start_command(const std::string& command,
+                                                 const std::vector<std::string>& env) {
+    SpawnedCommand sp = shell_spawn(command, env, /*null_stdin=*/true);
+    if (sp.fd < 0) {
+        // Nothing to read: an empty, finished generation.
+        cancel();
+        auto l = std::make_shared<ChunkList>(builder_.with_aux(),
+                                             static_cast<uint32_t>(opts_.header_lines));
+        l->finish();
+        std::lock_guard<std::mutex> lock(mu_);
+        list_ = l;
+        header_.clear();
+        return l;
+    }
+    return start(sp.fd, sp.pid);
+}
+
+std::shared_ptr<ChunkList> Reader::start(int fd, pid_t pid) {
+    cancel();
+    auto l = std::make_shared<ChunkList>(builder_.with_aux(),
+                                         static_cast<uint32_t>(opts_.header_lines));
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        list_ = l;
+        header_.clear();
+    }
+    child_pid_.store(pid);
+    thread_ = std::thread(&Reader::run, this, fd, pid, l);
+    return l;
+}
+
+void Reader::cancel() {
+    if (!thread_.joinable()) return;
+    if (cancel_w_ >= 0) wake_pipe(cancel_w_);
+    pid_t pid = child_pid_.load();
+    if (pid > 0) kill(-pid, SIGKILL);
+    thread_.join();
+    if (cancel_r_ >= 0) drain_pipe(cancel_r_);
+}
+
+void Reader::wait() {
+    if (thread_.joinable()) thread_.join();
+}
+
+// fzf: Reader.feed
+void Reader::run(int fd, pid_t pid, std::shared_ptr<ChunkList> list) {
+    std::vector<char> buf(kReadBufferSize);
+    std::string leftover;
+    const char delim = opts_.read_zero ? '\0' : '\n';
+    const uint32_t header_lines = static_cast<uint32_t>(opts_.header_lines);
+    uint32_t seen = 0;
+    bool cancelled = false;
+
+    auto push = [&](std::string_view rec, bool delimited) {
+        // One trailing \r before the newline is trimmed (DESIGN section 7);
+        // --read0 records are kept verbatim.
+        if (delimited && delim == '\n' && !rec.empty() && rec.back() == '\r') {
+            rec.remove_suffix(1);
         }
-    }
-    read_finished_.store(true, std::memory_order_release);
-}
-
-bool Reader::read_from_file(const std::string& filename) {
-    std::ifstream file(filename);
-    if (!file.is_open()) {
-        return false;
-    }
-
-    std::string line;
-    while (std::getline(file, line)) {
-        add_item(std::move(line), /*trim_newline=*/true);
-    }
-
-    read_finished_.store(true, std::memory_order_release);
-    return true;
-}
-
-void Reader::read_from_string(const std::string& content) {
-    std::istringstream stream(content);
-    std::string line;
-    while (std::getline(stream, line)) {
-        add_item(std::move(line), /*trim_newline=*/true);
-    }
-    read_finished_.store(true, std::memory_order_release);
-}
-
-std::vector<std::shared_ptr<Item>> Reader::get_items() const {
-    std::lock_guard<std::mutex> lock(items_mutex_);
-    return items_;
-}
-
-void Reader::start_async_stdin() {
-    read_thread_ = std::thread([this]() {
-        read_from_stdin();
-    });
-}
-
-void Reader::start_async_fd(int fd) {
-    read_thread_ = std::thread([this, fd]() {
-        // Read from the provided file descriptor
-        FILE* fp = fdopen(fd, "r");
-        if (!fp) {
-            close(fd);
-            read_finished_.store(true, std::memory_order_release);
+        if (seen < header_lines) {
+            {
+                std::lock_guard<std::mutex> lock(mu_);
+                header_.emplace_back(rec);
+            }
+            ++seen;
+            wake();
             return;
         }
+        ++seen;
+        const ItemSpec& spec = builder_.build(rec, list->first_index() + list->count());
+        list->append(spec);
+        wake();
+    };
 
-        if (read_zero_) {
-            // Read null-delimited input
-            std::string line;
-            int ch;
-            while ((ch = fgetc(fp)) != EOF) {
-                if (ch == '\0') {
-                    add_item(std::move(line), /*trim_newline=*/false);
-                    line.clear();
-                } else {
-                    line += static_cast<char>(ch);
-                }
-            }
-            // Add last item if any
-            if (!line.empty()) {
-                add_item(std::move(line), /*trim_newline=*/false);
-            }
-        } else {
-            // Read newline-delimited input (default)
-            char* line = nullptr;
-            size_t len = 0;
-            ssize_t nread;
-
-            while ((nread = getline(&line, &len, fp)) != -1) {
-                // Construct with the known length rather than from the
-                // char* — strlen() would truncate at an embedded NUL.
-                add_item(std::string(line, static_cast<size_t>(nread)), /*trim_newline=*/true);
-            }
-
-            free(line);
+    for (;;) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+        int max_fd = fd;
+        if (cancel_r_ >= 0) {
+            FD_SET(cancel_r_, &rfds);
+            if (cancel_r_ > max_fd) max_fd = cancel_r_;
         }
+        int n = select(max_fd + 1, &rfds, nullptr, nullptr, nullptr);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (cancel_r_ >= 0 && FD_ISSET(cancel_r_, &rfds)) {
+            cancelled = true;
+            break;
+        }
+        if (!FD_ISSET(fd, &rfds)) continue;
 
-        fclose(fp);
-        read_finished_.store(true, std::memory_order_release);
-    });
-}
+        ssize_t r = read(fd, buf.data(), buf.size());
+        if (r < 0) {
+            if (errno == EINTR || errno == EAGAIN) continue;
+            break;
+        }
+        if (r == 0) break;   // EOF
 
-void Reader::load_from_command(const std::string& command) {
-    // Cancel any in-flight streaming read before swapping the item set, so the
-    // background thread can't append stale items after we clear.
-    if (read_thread_.joinable()) {
-        read_thread_.join();
-    }
-
-    // Reset state for the fresh item set.
-    {
-        std::lock_guard<std::mutex> lock(items_mutex_);
-        items_.clear();
-        item_count_.store(0, std::memory_order_relaxed);
-    }
-    read_finished_.store(false, std::memory_order_release);
-
-    // Run reload commands under $SHELL like preview/execute do (shell_popen);
-    // libc popen hardcodes /bin/sh, which broke bashisms in reload() specs
-    // the same way it once broke preview scripts (commit cbd93cd).
-    ShellPipe pipe = shell_popen(command);
-    FILE* fp = pipe.stream;
-    if (!fp) {
-        read_finished_.store(true, std::memory_order_release);
-        return;
-    }
-
-    if (read_zero_) {
-        std::string line;
-        int ch;
-        while ((ch = fgetc(fp)) != EOF) {
-            if (ch == '\0') {
-                add_item(std::move(line), /*trim_newline=*/false);
-                line.clear();
+        size_t pos = 0;
+        const size_t len = static_cast<size_t>(r);
+        while (pos < len) {
+            const char* hit = static_cast<const char*>(std::memchr(buf.data() + pos, delim, len - pos));
+            if (!hit) {
+                leftover.append(buf.data() + pos, len - pos);
+                break;
+            }
+            size_t end = static_cast<size_t>(hit - buf.data());
+            if (leftover.empty()) {
+                push(std::string_view(buf.data() + pos, end - pos), true);
             } else {
-                line += static_cast<char>(ch);
+                leftover.append(buf.data() + pos, end - pos);
+                push(leftover, true);
+                leftover.clear();
             }
+            pos = end + 1;
         }
-        if (!line.empty()) {
-            add_item(std::move(line), /*trim_newline=*/false);
-        }
-    } else {
-        char* line = nullptr;
-        size_t len = 0;
-        ssize_t nread;
-        while ((nread = getline(&line, &len, fp)) != -1) {
-            // Construct with the known length rather than from the char* —
-            // strlen() would truncate at an embedded NUL.
-            add_item(std::string(line, static_cast<size_t>(nread)), /*trim_newline=*/true);
-        }
-        free(line);
     }
 
-    shell_pclose(pipe);
-    read_finished_.store(true, std::memory_order_release);
-}
-
-void Reader::wait_for_finish() {
-    if (read_thread_.joinable()) {
-        read_thread_.join();
+    if (!cancelled && !leftover.empty()) {
+        push(leftover, false);
     }
+
+    list->finish();
+    close(fd);
+    if (pid > 0) {
+        if (cancelled) kill(-pid, SIGKILL);
+        int status;
+        while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+        child_pid_.store(-1);
+    }
+    wake();
 }
 
 } // namespace fzf

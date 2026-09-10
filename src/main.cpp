@@ -1,5 +1,6 @@
 #include "options.hpp"
 #include "reader.hpp"
+#include "search.hpp"
 #include "terminal.hpp"
 #include <iostream>
 #include <cstdlib>
@@ -11,19 +12,33 @@
 namespace {
 
 // Flush/sync stdout and terminate immediately, without running static/thread
-// destructors. Once Reader::start_async_fd() has kicked off the background
-// reader thread, ~Reader (stack-allocated in main) joins it -- and that
-// thread only ever exits at producer EOF. For `find / | fzf`, accepting a
-// result would otherwise leave the process (and the pipe's writer) alive
-// and draining stdin long after the user got their answer. Real fzf exits
-// immediately and lets the producer take SIGPIPE. Every return point in
-// main() that executes after start_async_fd() must funnel through here
+// destructors. The reader thread may still be draining a producer that
+// never closes its end (`find / | fzf`): real fzf exits immediately and
+// lets the producer take SIGPIPE, and so do we. Every return point in
+// main() that executes after the reader started must funnel through here
 // instead of `return`; points before the thread starts may still `return`
 // normally.
 [[noreturn]] void finish(int code) {
     fflush(stdout);
     fsync(STDOUT_FILENO);
     _exit(code);
+}
+
+// Non-interactive match of the whole input (fzf: core.go's filtering
+// branch, also used for --select-1/--exit-0): waits for EOF, scans once on
+// this thread, and returns the output text of every match in order.
+std::vector<std::string> filter_results(const fzf::Options& opts, fzf::ItemBuilder& builder,
+                                        fzf::Reader& reader, const std::string& query) {
+    reader.wait();
+    fzf::Searcher searcher(opts, /*interactive=*/false);
+    auto list = reader.list();
+    auto merger = searcher.scan_sync(list->snapshot(), query, /*final=*/true, opts.sort > 0);
+    std::vector<std::string> out;
+    out.reserve(merger->size());
+    for (uint32_t i = 0; i < merger->size(); ++i) {
+        out.push_back(builder.output_text(merger->get(i)));
+    }
+    return out;
 }
 
 } // namespace
@@ -40,15 +55,17 @@ int main(int argc, char* argv[]) {
     try {
         auto opts = fzf::parse_options(argc, argv);
 
-        fzf::Reader reader;
-
-        if (!opts.legacy_delimiter.empty()) {
-            reader.set_delimiter(opts.legacy_delimiter);
+        // --with-nth / --accept-nth templates are validated here, like
+        // fzf's option parser does (exit 2 with the same message).
+        std::unique_ptr<fzf::ItemBuilder> builder_ptr;
+        try {
+            builder_ptr = std::make_unique<fzf::ItemBuilder>(opts);
+        } catch (const fzf::OptionError& e) {
+            std::cerr << e.message << std::endl;
+            return 2;
         }
-
-        if (opts.read_zero) {
-            reader.set_read_zero(true);
-        }
+        fzf::ItemBuilder& builder = *builder_ptr;
+        fzf::Reader reader(opts, builder);
 
         bool stdin_is_tty = isatty(STDIN_FILENO);
 
@@ -70,10 +87,8 @@ int main(int argc, char* argv[]) {
                 return 2;
             }
 
-            reader.start_async_fd(filter_fd);
-
-            fzf::Terminal terminal(opts, reader);
-            auto results = terminal.run_filter(opts.query);
+            reader.start_fd(filter_fd);
+            auto results = filter_results(opts, builder, reader, opts.query);
 
             if (opts.print_query) {
                 std::cout << opts.query << std::endl;
@@ -112,20 +127,11 @@ int main(int argc, char* argv[]) {
         }
         close(tty_fd);
 
-        reader.start_async_fd(pipe_fd);
+        reader.start_fd(pipe_fd);
 
-        const size_t initial_items_target = 25;
-        const int max_wait_ms = 500;
-        const int poll_interval_ms = 10;
-        int waited_ms = 0;
-
-        while (waited_ms < max_wait_ms) {
-            size_t item_count = reader.item_count();
-            if (item_count >= initial_items_target || reader.is_finished()) {
-                break;
-            }
-            usleep(poll_interval_ms * 1000);
-            waited_ms += poll_interval_ms;
+        // --sync: wait for EOF before the first frame.
+        if (opts.sync) {
+            reader.wait();
         }
 
         int stdout_copy = dup(STDOUT_FILENO);
@@ -150,8 +156,7 @@ int main(int argc, char* argv[]) {
         close(tty_out);
 
         if (opts.select_1 || opts.exit_0) {
-            fzf::Terminal terminal(opts, reader);
-            auto results = terminal.run_filter(opts.query);
+            auto results = filter_results(opts, builder, reader, opts.query);
 
             if (opts.select_1 && results.size() == 1) {
                 dup2(stdout_copy, STDOUT_FILENO);
@@ -181,7 +186,7 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        fzf::Terminal terminal(opts, reader);
+        fzf::Terminal terminal(opts, builder, reader);
         auto results = terminal.run();
 
         fflush(stdout);

@@ -1,5 +1,6 @@
 #include "terminal.hpp"
 #include "util.hpp"
+#include "search.hpp"
 #include "tty.hpp"
 #include "keyparser.hpp"
 #include "render.hpp"
@@ -60,11 +61,14 @@ struct ScreenGuard {
 
 }  // namespace
 
-Terminal::Terminal(const Options& opts, Reader& reader)
+Terminal::Terminal(const Options& opts, ItemBuilder& builder, Reader& reader)
     : opts_(opts),
+      builder_(builder),
       reader_(reader),
-      matcher_(opts.case_mode, opts.algo, !opts.fuzzy),
+      searcher_(opts, /*interactive=*/true),
       query_cursor_(0),
+      merger_(std::make_shared<Merger>()),
+      sort_(opts.sort > 0),
       cursor_pos_(0),
       scroll_offset_(0),
       running_(false),
@@ -90,7 +94,10 @@ Terminal::Terminal(const Options& opts, Reader& reader)
       winch_write_fd_(-1)
 {
     current_prompt_ = opts_.prompt;
-    current_header_ = opts_.legacy_header;
+    for (size_t i = 0; i < opts_.header.size(); ++i) {
+        if (i > 0) current_header_ += '\n';
+        current_header_ += opts_.header[i];
+    }
 }
 
 Terminal::~Terminal() {
@@ -130,30 +137,38 @@ void Terminal::set_current_header(const std::string& header) {
 }
 
 void Terminal::update_results(const std::string& query) {
-    // Get current items
-    auto items = reader_.get_items();
+    // --disabled: the query never filters; an external reload command does.
+    std::string q = opts_.disabled ? std::string() : query;
+    auto list = reader_.list();
+    searcher_.request(list->snapshot(), q, list->finished(), sort_);
+    last_request_time_ = std::chrono::steady_clock::now();
+    request_pending_ = false;
+}
 
-    std::vector<MatchResult> new_results;
+void Terminal::update_results_sync(const std::string& query) {
+    std::string q = opts_.disabled ? std::string() : query;
+    auto list = reader_.list();
+    install_merger(searcher_.scan_sync(list->snapshot(), q, list->finished(), sort_));
+    last_request_time_ = std::chrono::steady_clock::now();
+    request_pending_ = false;
+}
 
-    if (query.empty() || opts_.disabled) {
-        // No query (or --disabled: the query never filters, an external
-        // reload command does): show all items in their current order.
-        for (const auto& item : items) {
-            new_results.emplace_back(item, 0);
-        }
-    } else {
-        // Perform matching
-        new_results = matcher_.match_items(items, query);
+void Terminal::flush_pending_request() {
+    if (request_pending_ && std::chrono::steady_clock::now() >= request_deadline_) {
+        update_results(current_query_);
     }
+}
 
-    // Update results (thread-safe)
+void Terminal::install_merger(std::shared_ptr<Merger> merger) {
+    if (!merger) return;
     {
         std::lock_guard<std::mutex> lock(results_mutex_);
-        current_results_ = std::move(new_results);
+        merger_ = std::move(merger);
 
-        // Reset cursor if out of bounds
-        if (cursor_pos_ >= current_results_.size()) {
-            cursor_pos_ = current_results_.empty() ? 0 : current_results_.size() - 1;
+        // Keep the cursor position, clamped to the new list (fzf keeps cy).
+        size_t count = merger_->size();
+        if (cursor_pos_ >= count) {
+            cursor_pos_ = count == 0 ? 0 : count - 1;
         }
 
         // Adjust scroll offset
@@ -170,30 +185,14 @@ void Terminal::update_results(const std::string& query) {
     }
 }
 
-std::vector<MatchResult> Terminal::get_visible_results() const {
-    std::lock_guard<std::mutex> lock(results_mutex_);
-
-    if (current_results_.empty()) {
-        return {};
-    }
-
-    size_t start = scroll_offset_;
-    size_t end = std::min(start + visible_lines_, current_results_.size());
-
-    return std::vector<MatchResult>(
-        current_results_.begin() + start,
-        current_results_.begin() + end
-    );
-}
-
 void Terminal::move_cursor_up() {
     if (cursor_pos_ > 0) {
         cursor_pos_--;
         if (cursor_pos_ < scroll_offset_) {
             scroll_offset_ = cursor_pos_;
         }
-    } else if (opts_.cycle && !current_results_.empty()) {
-        cursor_pos_ = current_results_.size() - 1;
+    } else if (opts_.cycle && result_count() > 0) {
+        cursor_pos_ = result_count() - 1;
         scroll_offset_ = cursor_pos_ >= visible_lines_
                         ? cursor_pos_ - visible_lines_ + 1
                         : 0;
@@ -201,12 +200,12 @@ void Terminal::move_cursor_up() {
 }
 
 void Terminal::move_cursor_down() {
-    if (cursor_pos_ + 1 < current_results_.size()) {
+    if (cursor_pos_ + 1 < result_count()) {
         cursor_pos_++;
         if (cursor_pos_ >= scroll_offset_ + visible_lines_) {
             scroll_offset_ = cursor_pos_ - visible_lines_ + 1;
         }
-    } else if (opts_.cycle && !current_results_.empty()) {
+    } else if (opts_.cycle && result_count() > 0) {
         cursor_pos_ = 0;
         scroll_offset_ = 0;
     }
@@ -222,22 +221,22 @@ void Terminal::move_cursor_page_up() {
 }
 
 void Terminal::move_cursor_page_down() {
-    if (current_results_.empty()) {
+    if (result_count() == 0) {
         return;
     }
     cursor_pos_ = std::min(cursor_pos_ + visible_lines_,
-                          current_results_.size() - 1);
+                          result_count() - 1);
     if (cursor_pos_ >= scroll_offset_ + visible_lines_) {
         scroll_offset_ = cursor_pos_ - visible_lines_ + 1;
     }
 }
 
 void Terminal::toggle_selection() {
-    if (!opts_.multi || current_results_.empty()) {
+    if (!opts_.multi || result_count() == 0) {
         return;
     }
 
-    size_t item_idx = current_results_[cursor_pos_].item->index();
+    size_t item_idx = merger_->get(cursor_pos_).index();
 
     if (selected_.count(item_idx)) {
         selected_.erase(item_idx);
@@ -255,8 +254,8 @@ void Terminal::select_all() {
     }
 
     std::lock_guard<std::mutex> lock(results_mutex_);
-    for (const auto& result : current_results_) {
-        selected_.insert(result.item->index());
+    for (size_t i = 0, n = merger_->size(); i < n; ++i) {
+        selected_.insert(merger_->get(static_cast<uint32_t>(i)).index());
     }
 }
 
@@ -270,8 +269,8 @@ void Terminal::toggle_all() {
     }
 
     std::lock_guard<std::mutex> lock(results_mutex_);
-    for (const auto& result : current_results_) {
-        size_t item_idx = result.item->index();
+    for (size_t i = 0, n = merger_->size(); i < n; ++i) {
+        size_t item_idx = merger_->get(static_cast<uint32_t>(i)).index();
         if (selected_.count(item_idx)) {
             selected_.erase(item_idx);
         } else {
@@ -538,7 +537,13 @@ bool Terminal::execute_bind_action(const std::string& action) {
     auto run_reload = [&](const std::string& cmd_tpl) {
         std::string final_cmd = wrap_with_shell(
             substitute_placeholders(cmd_tpl, current_cursor()));
-        reader_.load_from_command(final_cmd);
+        // A fresh list generation: the reader cancels the read in flight
+        // (never waiting for a streaming producer's EOF) and the cached
+        // chunk bitmaps of the old list are dropped.
+        reader_.start_command(final_cmd);
+        searcher_.clear_cache();
+        last_item_count_ = SIZE_MAX;
+        read_ticks_ = 0;
 
         // The new list has fresh zero-based indices; cursor, scroll and any
         // Tab-selections referring to the old set are all meaningless now
@@ -733,8 +738,8 @@ bool Terminal::execute_bind_action(const std::string& action) {
 
     if (action == "bottom" || action == "last") {
         std::lock_guard<std::mutex> lock(results_mutex_);
-        if (!current_results_.empty()) {
-            cursor_pos_ = current_results_.size() - 1;
+        if (result_count() > 0) {
+            cursor_pos_ = result_count() - 1;
             if (cursor_pos_ >= visible_lines_) {
                 scroll_offset_ = cursor_pos_ - visible_lines_ + 1;
             }
@@ -1028,16 +1033,15 @@ void Terminal::calculate_preview_position(int& top, int& left, int& lines, int& 
     // Called from the preview worker too (via preview_env_vars):
     // current_header_ and visible_lines_ are main-thread state, so snapshot
     // them under the shared lock.
-    bool header_present;
+    int header_rows;
     int band_lines;
     {
         std::lock_guard<std::mutex> lock(preview_mutex_);
-        header_present = !current_header_.empty();
+        header_rows = static_cast<int>(header_rows_locked().size());
         band_lines = static_cast<int>(visible_lines_);
     }
 
     int info_rows = opts_.info_hidden ? 0 : 1;
-    int header_rows = header_present ? 1 : 0;
     int top_ui_rows = info_rows + header_rows + 1; // info + header + separator
     if (opts_.border) {
         top_ui_rows += 1;
@@ -1073,25 +1077,25 @@ std::vector<std::string> Terminal::preview_env_vars() const {
 }
 
 std::string Terminal::substitute_placeholders(const std::string& cmd, size_t index) {
-    std::shared_ptr<Item> item;
+    ItemRef item;
     {
         std::lock_guard<std::mutex> lock(results_mutex_);
-        if (index < current_results_.size()) {
-            item = current_results_[index].item;
+        if (index < merger_->size()) {
+            item = merger_->get(static_cast<uint32_t>(index));
         }
     }
     return substitute_placeholders_for_item(cmd, item);
 }
 
 std::string Terminal::substitute_placeholders_for_item(const std::string& cmd,
-                                                       const std::shared_ptr<Item>& item) {
+                                                       const ItemRef& item) {
     std::string result = cmd;
-    std::string line_text = item ? item->text() : "";
+    std::string line_text = item ? builder_.original_text(item) : "";
 
     // Replace {n} with the item's zero-based input index (fzf semantics --
     // the ordinal in the original input stream, not the position in the
     // filtered list, which changes with every keystroke).
-    size_t n_value = item ? item->index() : 0;
+    size_t n_value = item ? item.index() : 0;
     size_t pos = 0;
     while ((pos = result.find("{n}", pos)) != std::string::npos) {
         result.replace(pos, 3, std::to_string(n_value));
@@ -1122,8 +1126,8 @@ std::string Terminal::substitute_placeholders_for_item(const std::string& cmd,
         pos = 0;
         while ((pos = result.find(placeholder, pos)) != std::string::npos) {
             std::string field_value;
-            if (item && item->has_fields()) {
-                field_value = item->get_field(field_num);
+            if (item) {
+                field_value = builder_.field_text(item, field_num);
             }
             // Escape field value
             std::string escaped_field = field_value;
@@ -1230,9 +1234,9 @@ void Terminal::populate_prefetch_queue() {
     prefetch_queue_.clear();
 
     size_t start = scroll_offset_;
-    size_t end = std::min(current_results_.size(), start + 2 * visible_lines_);
+    size_t end = std::min(static_cast<size_t>(merger_->size()), start + 2 * visible_lines_);
     for (size_t i = start; i < end; ++i) {
-        std::string item_text = current_results_[i].item->text();
+        std::string item_text = builder_.original_text(merger_->get(static_cast<uint32_t>(i)));
 
         // Skip if already cached
         if (preview_cache_.find(item_text) != preview_cache_.end()) {
@@ -1267,7 +1271,7 @@ void Terminal::preview_worker() {
 
             uint64_t my_generation = preview_generation_.load();
             std::string target_text;
-            std::shared_ptr<Item> target_item;
+            ItemRef target_item;
             {
                 // Captured together with the request. Reading the live
                 // target again at completion time used to cache a
@@ -1275,7 +1279,7 @@ void Terminal::preview_worker() {
                 // wrong-item cache poisoning that persisted until eviction.
                 std::lock_guard<std::mutex> lock(preview_mutex_);
                 target_text = preview_target_item_;
-                target_item = preview_target_item_ptr_;
+                target_item = preview_target_item_ref_;
             }
 
             try {
@@ -1360,12 +1364,18 @@ void Terminal::preview_worker() {
                     // Capture the Item while scanning: substituting by index
                     // after releasing the lock used to race a results update
                     // and cache a different item's output under this key.
-                    std::shared_ptr<Item> prefetch_item;
+                    ItemRef prefetch_item;
                     {
                         std::lock_guard<std::mutex> lock(results_mutex_);
-                        for (const auto& r : current_results_) {
-                            if (r.item->text() == item_to_prefetch) {
-                                prefetch_item = r.item;
+                        // The queue only ever holds items around the visible
+                        // window, so scanning that window finds them.
+                        size_t start = scroll_offset_;
+                        size_t end = std::min(static_cast<size_t>(merger_->size()),
+                                              start + 2 * visible_lines_);
+                        for (size_t i = start; i < end; ++i) {
+                            ItemRef r = merger_->get(static_cast<uint32_t>(i));
+                            if (builder_.original_text(r) == item_to_prefetch) {
+                                prefetch_item = r;
                                 break;
                             }
                         }
@@ -1441,8 +1451,8 @@ bool Terminal::handle_mouse_event(const KeyEvent& event) {
 
     if (mouse.button == MouseInfo::Button::WheelDown) {
         std::lock_guard<std::mutex> lock(results_mutex_);
-        size_t max_offset = current_results_.size() > visible_lines_
-                          ? current_results_.size() - visible_lines_
+        size_t max_offset = result_count() > visible_lines_
+                          ? result_count() - visible_lines_
                           : 0;
         if (scroll_offset_ < max_offset) {
             scroll_offset_++;
@@ -1459,20 +1469,9 @@ bool Terminal::handle_mouse_event(const KeyEvent& event) {
         // LayoutType at all, and both branches computed the same thing).
         int results_start_y = 0;
 
-        if (opts_.header_first) {
-            if (!current_header_.empty()) {
-                results_start_y += 1;  // Header line
-            }
-            if (!opts_.info_hidden) {
-                results_start_y += 1;  // Info line
-            }
-        } else {
-            if (!opts_.info_hidden) {
-                results_start_y += 1;  // Info line
-            }
-            if (!current_header_.empty()) {
-                results_start_y += 1;  // Header line
-            }
+        results_start_y += static_cast<int>(header_rows().size());
+        if (!opts_.info_hidden) {
+            results_start_y += 1;  // Info line
         }
 
         results_start_y += 1;  // Separator after header/info
@@ -1500,10 +1499,10 @@ bool Terminal::handle_mouse_event(const KeyEvent& event) {
         {
             std::lock_guard<std::mutex> lock(results_mutex_);
 
-            if (clicked_index < current_results_.size()) {
+            if (clicked_index < result_count()) {
                 if (ctrl_pressed && opts_.multi) {
                     // Ctrl+click: toggle selection without moving cursor
-                    size_t item_idx = current_results_[clicked_index].item->index();
+                    size_t item_idx = merger_->get(static_cast<uint32_t>(clicked_index)).index();
                     if (selected_.find(item_idx) != selected_.end()) {
                         selected_.erase(item_idx);
                     } else {
@@ -1573,7 +1572,7 @@ void Terminal::recompute_visible_lines() {
     get_terminal_size(term_rows, term_cols);
 
     int info_rows = opts_.info_hidden ? 0 : 1;
-    int header_rows = current_header_.empty() ? 0 : 1;
+    int header_rows = static_cast<int>(this->header_rows().size());
     int ui_overhead = info_rows + header_rows + 1 + 1 + 1;  // info + header + sep + sep + input
     if (opts_.border) {
         ui_overhead += 2;
@@ -1615,19 +1614,19 @@ void Terminal::repaint(bool preview_dirty) {
 
     int row = margin;
 
-    size_t result_count;
+    std::shared_ptr<Merger> merger;
     {
         std::lock_guard<std::mutex> lock(results_mutex_);
-        result_count = current_results_.size();
+        merger = merger_;
     }
+    size_t result_count = merger->size();
 
     std::string info = std::to_string(result_count);
     if (opts_.multi && !selected_.empty()) {
         info += " (" + std::to_string(selected_.size()) + " selected)";
     }
 
-    bool has_header = !current_header_.empty();
-    std::string header_text = has_header ? strip_ansi_codes(current_header_) : "";
+    std::vector<std::string> header_lines = header_rows();
 
     auto draw_info_line = [&]() {
         if (!opts_.info_hidden) {
@@ -1635,8 +1634,8 @@ void Terminal::repaint(bool preview_dirty) {
         }
     };
     auto draw_header_line = [&]() {
-        if (has_header) {
-            frame.draw_text(row++, margin, header_text, Style{Color::Default, true, false}, content_cols);
+        for (const auto& line : header_lines) {
+            frame.draw_text(row++, margin, line, Style{Color::Default, true, false}, content_cols);
         }
     };
 
@@ -1682,30 +1681,37 @@ void Terminal::repaint(bool preview_dirty) {
         }
     }
 
-    auto visible = get_visible_results();
+    size_t visible_start = std::min(scroll_offset_, result_count);
+    size_t visible_end = std::min(visible_start + visible_lines_, result_count);
+    size_t visible_count = visible_end - visible_start;
+    const Pattern* pattern = merger->pattern();
+    std::vector<uint32_t> match_positions;
 
-    for (size_t i = 0; i < visible.size(); ++i) {
-        size_t actual_idx = scroll_offset_ + i;
-        const auto& result = visible[i];
+    for (size_t i = 0; i < visible_count; ++i) {
+        size_t actual_idx = visible_start + i;
+        ItemRef ref = merger->get(static_cast<uint32_t>(actual_idx));
+        if (!ref) break;
 
         bool is_cursor = (actual_idx == cursor_pos_);
-        bool is_sel = is_selected(result.item->index());
+        bool is_sel = is_selected(ref.index());
 
         std::string line_prefix = (opts_.multi && is_sel) ? "> " : "  ";
 
-        std::string item_text;
-        if (!opts_.with_nth.empty() && result.item->has_fields()) {
-            std::string display = result.item->get_fields_by_ranges(opts_.with_nth, opts_.legacy_delimiter);
-            item_text = !display.empty() ? display : result.item->display_text();
-        } else {
-            item_text = result.item->display_text();
-        }
+        // The stored text is already ANSI-stripped (--ansi) and --with-nth
+        // transformed; anything else keeps its raw bytes, so a stray escape
+        // in a non---ansi input is still removed for display.
+        std::string item_text(ref.text());
         if (item_text.find('\x1b') != std::string::npos) {
             item_text = strip_ansi_codes(item_text);
         }
 
+        // Positions are computed for the visible rows only (fzf: withPos).
+        match_positions.clear();
+        if (pattern && !pattern->empty()) {
+            pattern->match(*ref.chunk, ref.idx, &match_positions);
+        }
+
         Row spans;
-        const auto& match_positions = result.positions;
 
         if (!match_positions.empty() && !item_text.empty()) {
             std::u32string u32_text;
@@ -1716,21 +1722,17 @@ void Terminal::repaint(bool preview_dirty) {
             }
 
             if (!u32_text.empty()) {
-                std::set<size_t> highlighted_positions;
-                for (const auto& match_pos : match_positions) {
-                    if (match_pos.start >= u32_text.size()) continue;
-                    size_t end = std::min(static_cast<size_t>(match_pos.end), u32_text.size());
-                    for (size_t p = match_pos.start; p < end; ++p) {
-                        highlighted_positions.insert(p);
-                    }
+                std::vector<char> highlighted(u32_text.size(), 0);
+                for (uint32_t p : match_positions) {
+                    if (p < u32_text.size()) highlighted[p] = 1;
                 }
 
                 spans.push_back(Span{line_prefix, Style{}});
 
                 size_t seg_start = 0;
-                bool seg_highlighted = highlighted_positions.count(0) > 0;
+                bool seg_highlighted = highlighted[0] != 0;
                 for (size_t p = 1; p <= u32_text.size(); ++p) {
-                    bool is_highlighted = (p < u32_text.size()) && (highlighted_positions.count(p) > 0);
+                    bool is_highlighted = (p < u32_text.size()) && (highlighted[p] != 0);
                     if (p == u32_text.size() || is_highlighted != seg_highlighted) {
                         std::string seg_text;
                         utf8::utf32to8(u32_text.begin() + static_cast<long>(seg_start),
@@ -1766,7 +1768,7 @@ void Terminal::repaint(bool preview_dirty) {
     }
 
     // Blank out any leftover result rows from a previous, longer frame.
-    for (size_t i = visible.size(); i < visible_lines_; ++i) {
+    for (size_t i = visible_count; i < visible_lines_; ++i) {
         int row_num = content_top + static_cast<int>(i);
         if (row_num >= term_rows) break;
         frame.draw_row(row_num, results_col, {}, results_width);
@@ -2077,16 +2079,16 @@ bool Terminal::maybe_request_preview() {
     }
 
     std::string current_item_text;
-    std::shared_ptr<Item> current_item;
+    ItemRef current_item;
     {
         std::lock_guard<std::mutex> lock(results_mutex_);
-        if (current_results_.empty() || cursor_pos_ == last_preview_cursor_) {
+        if (merger_->empty() || cursor_pos_ == last_preview_cursor_) {
             return false;
         }
         last_preview_cursor_ = cursor_pos_;
-        if (cursor_pos_ < current_results_.size()) {
-            current_item = current_results_[cursor_pos_].item;
-            current_item_text = current_item->text();
+        if (cursor_pos_ < merger_->size()) {
+            current_item = merger_->get(static_cast<uint32_t>(cursor_pos_));
+            current_item_text = builder_.original_text(current_item);
         }
     }
 
@@ -2107,7 +2109,7 @@ bool Terminal::maybe_request_preview() {
             preview_content_ = "Loading preview...";
             preview_scroll_offset_ = 0;
             preview_target_item_ = current_item_text;
-            preview_target_item_ptr_ = current_item;
+            preview_target_item_ref_ = current_item;
         }
         preview_target_cursor_.store(cursor_pos_);
         preview_pending_.store(true);
@@ -2143,6 +2145,8 @@ std::vector<std::string> Terminal::run() {
     sigaction(SIGHUP, &term_sa, &old_hup_sa);
 
     reader_.set_wake_callback([this]() { wake_pipe(wake_write_fd_); });
+    searcher_.set_wake_callback([this]() { wake_pipe(wake_write_fd_); });
+    searcher_.start();
 
     // Initialize query
     try {
@@ -2168,9 +2172,15 @@ std::vector<std::string> Terminal::run() {
         preview_thread_ = std::thread(&Terminal::preview_worker, this);
     }
 
+    {
+        std::lock_guard<std::mutex> lock(preview_mutex_);
+        input_header_ = reader_.header_lines();
+    }
     recompute_visible_lines();
 
-    size_t last_item_count = reader_.item_count();
+    last_item_count_ = reader_.list()->count();
+    last_finished_ = reader_.finished();
+    read_ticks_ = 0;
     size_t last_focus_pos = SIZE_MAX;
     bool last_content_different = false;
 
@@ -2218,10 +2228,14 @@ std::vector<std::string> Terminal::run() {
         }
 
         struct timeval tv;
-        bool has_timeout = esc_deadline_armed;
+        bool has_timeout = esc_deadline_armed || request_pending_;
         if (has_timeout) {
+            auto deadline = esc_deadline_armed ? esc_deadline : request_deadline_;
+            if (esc_deadline_armed && request_pending_ && request_deadline_ < deadline) {
+                deadline = request_deadline_;
+            }
             auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
-                esc_deadline - std::chrono::steady_clock::now()).count();
+                deadline - std::chrono::steady_clock::now()).count();
             if (remaining < 0) remaining = 0;
             tv.tv_sec = static_cast<time_t>(remaining / 1000000);
             tv.tv_usec = static_cast<suseconds_t>(remaining % 1000000);
@@ -2274,11 +2288,47 @@ std::vector<std::string> Terminal::run() {
 
         if (wake_read_fd_ >= 0 && FD_ISSET(wake_read_fd_, &read_fds)) {
             drain_pipe(wake_read_fd_);
-            size_t current_item_count = reader_.item_count();
-            if (current_item_count != last_item_count) {
-                last_item_count = current_item_count;
-                update_results(current_query_);
+            reader_.ack_wake();
+            needs_repaint = true;
+            preview_dirty = true;
+        }
+
+        // New items or EOF from the reader (fzf: EvtReadNew / EvtReadFin).
+        // While the producer is streaming, re-matching is throttled with a
+        // growing delay (fzf: coordinatorDelayStep up to coordinatorDelayMax)
+        // so a fast pipe cannot starve the searcher with restarts.
+        {
+            auto list = reader_.list();
+            size_t current_item_count = list->count();
+            bool finished = list->finished();
+            if (current_item_count != last_item_count_ || finished != last_finished_) {
+                last_item_count_ = current_item_count;
+                last_finished_ = finished;
+                if (opts_.header_lines > 0) {
+                    std::lock_guard<std::mutex> lock(preview_mutex_);
+                    input_header_ = reader_.header_lines();
+                }
+                if (finished) {
+                    update_results(current_query_);
+                } else {
+                    auto now = std::chrono::steady_clock::now();
+                    auto delay = std::chrono::milliseconds(std::min(100, 10 * read_ticks_));
+                    ++read_ticks_;
+                    if (now - last_request_time_ >= delay) {
+                        update_results(current_query_);
+                    } else if (!request_pending_) {
+                        request_pending_ = true;
+                        request_deadline_ = last_request_time_ + delay;
+                    }
+                }
+                needs_repaint = true;
             }
+            flush_pending_request();
+        }
+
+        // A finished scan from the searcher thread (fzf: EvtSearchFin).
+        if (auto merger = searcher_.take()) {
+            install_merger(std::move(merger));
             needs_repaint = true;
             preview_dirty = true;
         }
@@ -2308,7 +2358,7 @@ std::vector<std::string> Terminal::run() {
                     // so accept/expect-key events see the filtered results
                     // rather than a stale pre-keystroke list.
                     if (last_content_different && !changes_query) {
-                        update_results(current_query_);
+                        update_results_sync(current_query_);
                         last_content_different = false;
 
                         auto change_it = opts_.bindings.find("change");
@@ -2393,32 +2443,23 @@ std::vector<std::string> Terminal::run() {
     // Collect selected items
     std::vector<std::string> result;
 
-    // Apply --accept-nth (print only selected fields) and strip ANSI codes.
-    // The --ansi flag controls parsing for display, not output.
-    auto output_text = [this](const std::shared_ptr<Item>& item) -> std::string {
-        std::string text;
-        if (!opts_.accept_nth.empty() && item->has_fields()) {
-            text = item->get_fields_by_ranges(opts_.accept_nth, opts_.legacy_delimiter);
-        } else {
-            text = item->text();
-        }
-        return strip_ansi_codes(text);
-    };
-
+    // --accept-nth and ANSI stripping are applied by the item builder
+    // (fzf: buildItemTransformer).
     if (accepted_) {
         if (opts_.multi && !selected_.empty()) {
             // Return all selected items (Tab-selected)
-            auto items = reader_.get_items();
+            auto list = reader_.list();
             for (size_t idx : selected_) {
-                if (idx < items.size()) {
-                    result.push_back(output_text(items[idx]));
+                ItemRef ref = list->item_at(static_cast<uint32_t>(idx));
+                if (ref) {
+                    result.push_back(builder_.output_text(ref));
                 }
             }
         } else {
             // Return current cursor item (single-select or multi without Tab selections)
             std::lock_guard<std::mutex> lock(results_mutex_);
-            if (!current_results_.empty() && cursor_pos_ < current_results_.size()) {
-                result.push_back(output_text(current_results_[cursor_pos_].item));
+            if (cursor_pos_ < merger_->size()) {
+                result.push_back(builder_.output_text(merger_->get(static_cast<uint32_t>(cursor_pos_))));
             }
         }
     }
@@ -2426,26 +2467,22 @@ std::vector<std::string> Terminal::run() {
     return result;
 }
 
-std::vector<std::string> Terminal::run_filter(const std::string& query) {
-    // Wait for all input to be read
-    reader_.wait_for_finish();
-
-    // Perform matching
-    auto items = reader_.get_items();
-    auto results = matcher_.match_items(items, query);
-
-    // Return matched items, honoring --accept-nth
-    std::vector<std::string> output;
-    for (const auto& result : results) {
-        if (!opts_.accept_nth.empty() && result.item->has_fields()) {
-            output.push_back(
-                result.item->get_fields_by_ranges(opts_.accept_nth, opts_.legacy_delimiter));
-        } else {
-            output.push_back(result.item->text());
+std::vector<std::string> Terminal::header_rows_locked() const {
+    std::vector<std::string> rows;
+    if (!current_header_.empty()) {
+        for (const auto& line : split_lines(current_header_)) {
+            rows.push_back(strip_ansi_codes(line));
         }
     }
+    for (const auto& line : input_header_) {
+        rows.push_back(strip_ansi_codes(line));
+    }
+    return rows;
+}
 
-    return output;
+std::vector<std::string> Terminal::header_rows() const {
+    std::lock_guard<std::mutex> lock(preview_mutex_);
+    return header_rows_locked();
 }
 
 } // namespace fzf

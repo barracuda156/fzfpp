@@ -370,9 +370,7 @@ struct Options {
     bool preview_wrap = false;
     bool preview_hidden = false;
     bool preview_follow = false;
-    std::string legacy_delimiter;      // literal delimiter for Item::parse_fields
-    std::vector<FieldRange> with_nth;  // only for plain range expressions
-    std::vector<FieldRange> accept_nth;
+    std::string legacy_delimiter;      // literal delimiter (pre-tokenizer consumers)
     std::map<std::string, std::string> bindings;   // key -> action string
     std::vector<std::string> expect_keys;
 };

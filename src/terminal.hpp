@@ -1,10 +1,10 @@
 #pragma once
 
-#include "item.hpp"
-#include "matcher.hpp"
-#include "reader.hpp"
-#include "options.hpp"
+#include "chunklist.hpp"
 #include "keyevent.hpp"
+#include "options.hpp"
+#include "reader.hpp"
+#include "search.hpp"
 #include <string>
 #include <vector>
 #include <memory>
@@ -23,15 +23,12 @@ namespace fzf {
 // Terminal UI controller
 class Terminal {
 public:
-    explicit Terminal(const Options& opts, Reader& reader);
+    Terminal(const Options& opts, ItemBuilder& builder, Reader& reader);
     ~Terminal();
 
     // Run the interactive loop
     // Returns selected items (empty if aborted)
     std::vector<std::string> run();
-
-    // Run filter mode (non-interactive)
-    std::vector<std::string> run_filter(const std::string& query);
 
     // Get matched expect key (empty if none matched)
     std::string get_matched_expect_key() const { return matched_expect_key_; }
@@ -45,11 +42,18 @@ public:
     const std::string& final_query() const { return current_query_; }
 
 private:
-    // Update search results
+    // Post a (re)match of the current list to the searcher thread; the
+    // result arrives through the wake pipe and install_merger().
     void update_results(const std::string& query);
-
-    // Get visible results (for current scroll position)
-    std::vector<MatchResult> get_visible_results() const;
+    // Same, but scanned on this thread and installed before returning (for
+    // an accept that follows a query change in the same input batch).
+    void update_results_sync(const std::string& query);
+    void install_merger(std::shared_ptr<Merger> merger);
+    // Number of rows in the current result list (main thread).
+    size_t result_count() const { return merger_->size(); }
+    // Issue the pending list re-match now if its throttle delay elapsed
+    // (fzf: coordinatorDelayStep/Max while the reader is streaming).
+    void flush_pending_request();
 
     // Navigation
     void move_cursor_up();
@@ -94,10 +98,9 @@ private:
 
     // Item-anchored variant used by the preview worker: the item is captured
     // once by the caller, so a concurrent results update can't swap which
-    // item's text gets substituted mid-command. display_index only feeds
-    // fzf's {n} placeholder fallback when item is null.
+    // item's text gets substituted mid-command.
     std::string substitute_placeholders_for_item(const std::string& cmd,
-                                                 const std::shared_ptr<Item>& item);
+                                                 const ItemRef& item);
 
     // Run a shell command synchronously and return its stdout with a single
     // trailing newline trimmed (matching fzf's convention for transform-*
@@ -132,6 +135,12 @@ private:
     // other one — see render.hpp's write_raw_passthrough.
     void repaint(bool preview_dirty);
 
+    // Header rows to draw: the --header lines (live, see transform-header)
+    // followed by the --header-lines records diverted by the reader. Must
+    // be called with preview_mutex_ held.
+    std::vector<std::string> header_rows_locked() const;
+    std::vector<std::string> header_rows() const;
+
     // Query-buffer editing (replaces FTXUI's Input component). Operates on
     // current_query_ and query_cursor_ (a codepoint index, not a byte index).
     void query_insert_codepoints(const std::u32string& codepoints);
@@ -147,8 +156,9 @@ private:
     bool dispatch_event(const KeyEvent& event);
 
     const Options& opts_;
+    ItemBuilder& builder_;
     Reader& reader_;
-    Matcher matcher_;
+    Searcher searcher_;
 
     // UI state. current_query_ and current_header_ are mutated only on the
     // main thread, but the preview worker reads them ({q} substitution,
@@ -158,7 +168,8 @@ private:
     std::u32string query_codepoints_;  // current_query_ decoded, for cursor math
     size_t query_cursor_;              // codepoint index into query_codepoints_
     std::string current_prompt_;  // Live prompt; starts at opts_.prompt, changed by change-prompt
-    std::string current_header_;  // Live header; starts at opts_.header, changed by transform-header
+    std::string current_header_;  // Live --header text; changed by transform-header
+    std::vector<std::string> input_header_;  // --header-lines records (protected by preview_mutex_)
 
     // Rebuild current_query_ from query_codepoints_ under preview_mutex_.
     void sync_query_from_codepoints();
@@ -173,13 +184,26 @@ private:
     // repainting. Called once before the event loop (a small finished input
     // never wakes the loop) and after every dispatched batch.
     bool maybe_request_preview();
-    std::vector<MatchResult> current_results_;
+
+    // The result list on display (fzf: Terminal.merger). Swapped by the
+    // main thread under results_mutex_; the preview worker reads it under
+    // the same lock. Never null.
+    std::shared_ptr<Merger> merger_;
+    bool sort_;                   // live --sort state
     size_t cursor_pos_;           // Current cursor position
     size_t scroll_offset_;        // Scroll offset for results
     std::set<size_t> selected_;   // Selected item indices
     bool running_;
     bool accepted_;               // True if user accepted, false if aborted
     std::string matched_expect_key_;  // Stores matched expect key
+
+    // Reader/searcher coordination (main thread only).
+    size_t last_item_count_ = SIZE_MAX;
+    bool last_finished_ = false;
+    int read_ticks_ = 0;
+    bool request_pending_ = false;
+    std::chrono::steady_clock::time_point last_request_time_;
+    std::chrono::steady_clock::time_point request_deadline_;
 
     // Threading
     mutable std::mutex results_mutex_;
@@ -235,7 +259,7 @@ private:
     std::atomic<pid_t> preview_child_pid_;
     std::atomic<size_t> preview_target_cursor_;
     std::string preview_target_item_;  // Item text for the target preview (protected by preview_mutex_)
-    std::shared_ptr<Item> preview_target_item_ptr_;  // The Item itself (protected by preview_mutex_)
+    ItemRef preview_target_item_ref_;  // The item itself (protected by preview_mutex_)
 
     // Preview cache (LRU)
     std::unordered_map<std::string, std::string> preview_cache_;  // item_text -> preview_content

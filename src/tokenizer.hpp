@@ -75,6 +75,19 @@ std::vector<Transformed> transform(const std::vector<Token>& tokens,
 std::string transform_join(const std::vector<Token>& tokens,
                            const std::vector<Range>& ranges);
 
+// The parts of transform() as codepoint spans of the tokenized line (start =
+// fzf's prefixLength, len = rune count of the part), one per range, appended
+// to `out` (cleared first) without materializing any string. This is what
+// --nth stores per item so the matcher can restrict itself to those spans.
+void transform_spans(const std::vector<Token>& tokens,
+                     const std::vector<Range>& ranges,
+                     std::vector<RuneRange>& out);
+
+// fzf: util.Chars.TrimTrailingWhitespaces / strings.TrimRightFunc(s,
+// unicode.IsSpace) -- the byte length of `s` without its trailing Unicode
+// whitespace.
+size_t trim_trailing_whitespace(std::string_view s);
+
 // fzf: tokenizer.go StripLastDelimiter -- remove one trailing delimiter
 // (awk: the trailing whitespace) from a joined string.
 std::string strip_last_delimiter(std::string s, const Delimiter& d);

@@ -64,7 +64,11 @@ set(SOURCES
     src/main.cpp
     src/options.cpp
     src/keymap.cpp
+    src/tokenizer.cpp
+    src/ansi.cpp
+    src/chunklist.cpp
     src/matcher.cpp
+    src/search.cpp
     src/reader.cpp
     src/terminal.cpp
     src/tty.cpp
@@ -126,12 +130,22 @@ add_executable(tokenizer_test tools/tokenizer_test.cpp src/tokenizer.cpp src/opt
 target_include_directories(tokenizer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(tokenizer_test PRIVATE utf8cpp)
 
+# Unit tests for the item store and the matching engine (T1.4/T1.5):
+# chunk list publication, ANSI stripping, the reader (header lines, cancel),
+# merger ordering against a full sort, chunk-cache prefix narrowing, --tac,
+# --no-sort and every tiebreak.
+add_executable(search_test tools/search_test.cpp src/search.cpp src/matcher.cpp
+    src/chunklist.cpp src/ansi.cpp src/tokenizer.cpp src/reader.cpp src/tty.cpp src/options.cpp)
+target_include_directories(search_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(search_test PRIVATE utf8cpp Threads::Threads)
+
 enable_testing()
 add_test(NAME keyparser_test COMMAND keyparser_test)
 add_test(NAME keymap_test COMMAND keymap_test)
 add_test(NAME matcher_test COMMAND matcher_test)
 add_test(NAME options_test COMMAND options_test)
 add_test(NAME tokenizer_test COMMAND tokenizer_test)
+add_test(NAME search_test COMMAND search_test)
 
 # Standalone visual smoke test for src/render.hpp — prints a fake frame to
 # the real terminal for manual eyeballing (no automated pixel comparison).

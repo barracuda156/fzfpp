@@ -309,8 +309,8 @@ static void test_nth() {
     CHECK(parse({"--nth", "..,2"}).nth.size() == 2);   // not when there are several ranges
     Options o = parse({"--with-nth", "2..", "--accept-nth", "-1", "-d", ","});
     CHECK(o.with_nth_expr == "2.." && o.accept_nth_expr == "-1");
-    CHECK(o.with_nth.size() == 1 && o.with_nth[0].begin == 2 && o.with_nth[0].open_end);
-    CHECK(o.accept_nth.size() == 1 && o.accept_nth[0].begin == -1 && o.accept_nth[0].open_end);
+    // The expressions are compiled by the tokenizer's NthTransformer (T1.3,
+    // see tokenizer_test); the parser only keeps them verbatim.
     CHECK(parse({"--with-nth", "{1} {2}"}).with_nth_expr == "{1} {2}");   // template form (T1.3)
     CHECK(parse_error({"--with-nth", "abc"}).rfind("template should include", 0) == 0);
 }

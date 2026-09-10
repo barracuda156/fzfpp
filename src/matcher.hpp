@@ -1,12 +1,22 @@
 #pragma once
 
+// Fuzzy/exact matching algorithms (fzf: src/algo/algo.go) and extended
+// search term parsing (fzf: src/pattern.go parseTerms). The algorithms
+// are ported with score parity; see tools/matcher_test.cpp.
+//
+// The matcher works on text views instead of owned items: ASCII text is
+// matched directly on its bytes, non-ASCII text is decoded into a
+// thread-local scratch buffer per call. All scratch memory (decode buffer,
+// bonus table, DP matrices) is thread-local and reused, so matching one
+// item allocates nothing in steady state. `match()` is const and safe to
+// call from several threads at once on the same Matcher.
+
 #include "item.hpp"
-#include "util.hpp"
-#include <string>
-#include <vector>
+
 #include <cstdint>
-#include <algorithm>
-#include <cctype>
+#include <string>
+#include <string_view>
+#include <vector>
 
 namespace fzf {
 
@@ -53,101 +63,133 @@ struct PatternTerm {
 };
 using TermSet = std::vector<PatternTerm>;
 
-// Fuzzy matcher class
+// Result of matching one text. `begin`/`end` are codepoint offsets of the
+// matched region (min begin / max end over all terms), -1 when the query
+// had no positive term. `min_end` is the smallest end over the terms
+// (fzf's minEnd, used by the `begin` tiebreak).
+struct MatchResult {
+    bool matched = false;
+    int32_t score = 0;
+    int32_t begin = -1;
+    int32_t end = -1;
+    int32_t min_end = -1;
+};
+
+// Text views the algorithms are instantiated for.
+struct AsciiText {
+    const char* p;
+    size_t n;
+    size_t size() const { return n; }
+    CodePoint operator[](size_t i) const { return static_cast<unsigned char>(p[i]); }
+};
+struct RuneText {
+    const CodePoint* p;
+    size_t n;
+    size_t size() const { return n; }
+    CodePoint operator[](size_t i) const { return p[i]; }
+};
+
 class Matcher {
 public:
     Matcher(CaseMode case_mode = CaseMode::Smart,
             AlgoType algo = AlgoType::FuzzyV2,
-            bool exact = false)
-        : case_mode_(case_mode), algo_(algo), exact_(exact) {}
+            bool exact = false,
+            bool normalize = true)
+        : case_mode_(case_mode), algo_(algo), exact_(exact), normalize_(normalize) {}
 
-    // Match a single item against a raw query string (extended-search syntax).
-    MatchResult match(const std::shared_ptr<Item>& item, const std::string& pattern);
+    // Compile a query. Must be called before match(); not thread-safe
+    // against concurrent match() calls.
+    void set_pattern(const std::string& pattern);
+    // Install pre-built term sets (fzf's non-extended mode builds a single
+    // term from the whole query; see search.cpp).
+    void set_terms(std::vector<TermSet> sets);
+    const std::string& pattern() const { return pattern_; }
+    const std::vector<TermSet>& terms() const { return sets_; }
+    // True when the query has no term at all (everything matches, score 0).
+    bool empty() const { return sets_.empty(); }
+    // fzf's sortable flag: false when no positive term exists (all `!`).
+    bool sortable() const { return sortable_; }
 
-    // Match multiple items (for multi-threading later)
-    std::vector<MatchResult> match_items(
-        const std::vector<std::shared_ptr<Item>>& items,
-        const std::string& pattern);
+    // Match UTF-8 text. `ascii` skips decoding. `nth`/`nth_count` restrict
+    // matching to those codepoint ranges (fzf: --nth; the first matching
+    // range wins). `positions`, if given, receives the matched codepoint
+    // indices (sorted, may contain duplicates across terms).
+    MatchResult match(std::string_view text, bool ascii,
+                      const RuneRange* nth = nullptr, size_t nth_count = 0,
+                      std::vector<uint32_t>* positions = nullptr) const;
 
-    // Set case sensitivity mode
-    void set_case_mode(CaseMode mode) { case_mode_ = mode; invalidate_cache(); }
+    // Convenience: detects ASCII itself.
+    MatchResult match(std::string_view text, std::vector<uint32_t>* positions = nullptr) const;
 
-    // Set algorithm
+    // Settings
+    void set_case_mode(CaseMode mode) { case_mode_ = mode; }
     void set_algo(AlgoType algo) { algo_ = algo; }
-
-    // Exact (substring) matching by default instead of fuzzy (--exact / -e).
-    // A 'quoted term then flips back to fuzzy, matching fzf.
-    void set_exact(bool exact) { exact_ = exact; invalidate_cache(); }
+    void set_exact(bool exact) { exact_ = exact; }
+    void set_normalize(bool normalize) { normalize_ = normalize; }
+    CaseMode case_mode() const { return case_mode_; }
 
     // Parse a raw query into extended-search term sets (exposed for tests).
     std::vector<TermSet> parse_terms(const std::string& pattern) const;
 
+    // Character class detection / bonus (exposed for tiebreak computation).
+    static CharClass char_class_of(CodePoint c);
+    static int32_t bonus_for(CharClass prev, CharClass curr);
+
+    // The thread-local decode buffer the last non-ASCII match() on this
+    // thread used. Valid until the next match() call on the same thread;
+    // lets the caller compute rune-based tiebreaks without decoding twice.
+    static const std::vector<CodePoint>& scratch_runes();
+
+    // fzf: parseTerms' per-term case/normalize decision, exposed so the
+    // non-extended pattern builder applies the same rules.
+    static bool term_case_sensitive(CaseMode mode, const std::string& text);
+
 private:
-    // Term dispatch: run the right algorithm for one term. On success the
-    // result's item is set; on failure it is null.
-    MatchResult match_term(const std::shared_ptr<Item>& item,
-                           const PatternTerm& term);
+    template <class Text>
+    MatchResult match_text(const Text& text, uint32_t base,
+                           std::vector<uint32_t>* positions) const;
 
-    // Fuzzy match V1 (greedy algorithm - faster)
-    MatchResult fuzzy_match_v1(
-        const std::shared_ptr<Item>& item,
-        const std::vector<CodePoint>& pattern, bool case_sensitive);
+    template <class Text>
+    MatchResult match_term(const Text& text, const PatternTerm& term,
+                           std::vector<uint32_t>* positions) const;
 
-    // Fuzzy match V2 (Smith-Waterman-style optimal algorithm)
-    MatchResult fuzzy_match_v2(
-        const std::shared_ptr<Item>& item,
-        const std::vector<CodePoint>& pattern, bool case_sensitive);
-
-    // Exact substring occurrence with the best first-char bonus (fzf's
-    // ExactMatchNaive / ExactMatchBoundary when boundary_check is set).
-    MatchResult exact_match_naive(
-        const std::shared_ptr<Item>& item,
-        const std::vector<CodePoint>& pattern, bool case_sensitive,
-        bool boundary_check);
-
-    MatchResult prefix_match(const std::shared_ptr<Item>& item,
-                             const std::vector<CodePoint>& pattern,
-                             bool case_sensitive);
-    MatchResult suffix_match(const std::shared_ptr<Item>& item,
-                             const std::vector<CodePoint>& pattern,
-                             bool case_sensitive);
-    MatchResult equal_match(const std::shared_ptr<Item>& item,
-                            const std::vector<CodePoint>& pattern,
-                            bool case_sensitive);
-
-    // fzf's calculateScore: score a known match region [sidx, eidx) of the
-    // text against the pattern, optionally collecting per-char positions.
-    int32_t calculate_score(const std::vector<CodePoint>& text,
-                            const std::vector<CodePoint>& pattern,
+    template <class Text>
+    MatchResult fuzzy_match_v1(const Text& text, const std::vector<CodePoint>& pattern,
+                               bool case_sensitive, std::vector<uint32_t>* positions) const;
+    template <class Text>
+    MatchResult fuzzy_match_v2(const Text& text, const std::vector<CodePoint>& pattern,
+                               bool case_sensitive, std::vector<uint32_t>* positions) const;
+    template <class Text>
+    MatchResult exact_match_naive(const Text& text, const std::vector<CodePoint>& pattern,
+                                  bool case_sensitive, bool boundary_check,
+                                  std::vector<uint32_t>* positions) const;
+    template <class Text>
+    MatchResult prefix_match(const Text& text, const std::vector<CodePoint>& pattern,
+                             bool case_sensitive, std::vector<uint32_t>* positions) const;
+    template <class Text>
+    MatchResult suffix_match(const Text& text, const std::vector<CodePoint>& pattern,
+                             bool case_sensitive, std::vector<uint32_t>* positions) const;
+    template <class Text>
+    MatchResult equal_match(const Text& text, const std::vector<CodePoint>& pattern,
+                            bool case_sensitive, std::vector<uint32_t>* positions) const;
+    template <class Text>
+    int32_t calculate_score(const Text& text, const std::vector<CodePoint>& pattern,
                             size_t sidx, size_t eidx, bool case_sensitive,
-                            std::vector<MatchPos>* positions) const;
+                            std::vector<uint32_t>* positions) const;
 
-    // Character class detection
-    CharClass char_class_of(CodePoint c) const;
-
-    // Bonus score calculation
-    int32_t bonus_for(CharClass prev, CharClass curr) const;
-
-    // Bonus at a text position (start-of-string counts as a white boundary).
-    int32_t bonus_at(const std::vector<CodePoint>& text, size_t idx) const;
-
-    // Character comparison (case-sensitive or insensitive)
     bool char_equal(CodePoint a, CodePoint b, bool case_sensitive) const;
-
-    // Normalize character for comparison
     CodePoint normalize_char(CodePoint c) const;
-
-    void invalidate_cache() { cached_valid_ = false; }
+    template <class Text>
+    int32_t bonus_at(const Text& text, size_t idx) const;
 
     CaseMode case_mode_;
     AlgoType algo_;
-    bool exact_;  // Exact (substring) matching instead of fuzzy
+    bool exact_;
+    bool normalize_;
 
-    // Parsed-pattern cache: match() is called once per item per keystroke
-    // with the same query string; re-parsing per item would be pure waste.
-    mutable std::string cached_pattern_;
-    mutable std::vector<TermSet> cached_sets_;
-    mutable bool cached_valid_ = false;
+    std::string pattern_;
+    std::vector<TermSet> sets_;
+    bool sortable_ = false;
 };
 
 } // namespace fzf
