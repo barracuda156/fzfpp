@@ -1,0 +1,204 @@
+# testing/invocations.txt -- real fzf command lines used by fzf++'s target
+# apps, collected for docs/TASKS.md T1.11. Shell variables are left as-is
+# (verbatim from source); Python/C sources that build argv lists or C
+# printf-style command templates instead of literal shell strings are
+# reconstructed into an equivalent command-line form and clearly marked
+# "reconstructed from <language>" so it's obvious which lines are literal
+# source text and which are derived. Each block is prefixed by a
+# "# <repo> <file>:<line>" comment giving the exact source location.
+
+# =============================================================================
+# pystardust/ani-cli (shell, POSIX sh)
+# =============================================================================
+
+# pystardust/ani-cli ani-cli:11
+fzf --reverse --cycle --prompt "$1" $2 $3
+# $2 is the multi-select flag: set to "-m" at line 516 when
+# menu_program="fzf" (the default, ANI_CLI_MENU env var can override).
+# $3 is $menu_extra_flags, user-supplied extra flags.
+
+# pystardust/ani-cli ani-cli:429
+menu_program="${ANI_CLI_MENU:-fzf}"
+
+# pystardust/ani-cli ani-cli:516
+[ "$menu_program" = "fzf" ] && menu_multi_flag="-m"
+
+# =============================================================================
+# Benexl/yt-x (shell, POSIX sh)
+# =============================================================================
+
+# Benexl/yt-x yt-x:200-236 (CONFIG_FZF_OPTS default -- becomes FZF_DEFAULT_OPTS)
+: "${CONFIG_FZF_OPTS:="
+  --ansi
+  --border
+  --scheme=history
+  --style=full
+  --color=bg+:#283457
+  --color=bg:#16161e
+  --color=border:#27a1b9
+  --color=fg:#c0caf5
+  --color=gutter:#16161e
+  --color=header:#2ac3de
+  --color=hl+:#2ac3de
+  --color=hl:#2ac3de
+  --color=info:#545c7e
+  --color=marker:#ff007c
+  --color=pointer:#ff007c
+  --color=prompt:#2ac3de
+  --color=query:#c0caf5:regular
+  --color=scrollbar:#27a1b9
+  --color=separator:#ff9e64
+  --color=spinner:#ff007c
+  --border=rounded
+  --border-label=''
+  --prompt=' >'
+  --marker=' >'
+  --pointer='◆'
+  --layout=reverse
+  --cycle
+  --ghost='こんにちは...'
+  --height=100%
+  --bind=ctrl-/:toggle-preview,ctrl-space:toggle-wrap+toggle-preview-wrap
+  --no-margin
+  +m
+  -i
+  --exact
+  --tabstop=1
+  ...(truncated; see file for the rest)
+"}"
+
+# Benexl/yt-x yt-x:284
+CONFIG_FZF_OPTS="${YT_X_FZF_OPTS:-$CONFIG_FZF_OPTS}"
+
+# Benexl/yt-x yt-x:831 (FZF_DEFAULT_OPTS assignment)
+export FZF_DEFAULT_OPTS="$CONFIG_FZF_OPTS"
+
+# Benexl/yt-x yt-x:1223 (__ui_fzf_launcher; custom_opts += "--multi" and/or
+# "--header-first --header=$CONFIG_FZF_HEADER" depending on args)
+fzf --prompt="${1}: " $custom_opts
+
+# Benexl/yt-x yt-x:1286 (__ui_fzf_launcher_with_preview)
+fzf --prompt="${1}: " --delimiter '|' --with-nth "{2..}" --accept-nth "{2..}" --preview="$preview_script" $custom_opts
+
+# =============================================================================
+# Benexl/FastAnime (Python; package is "viu_media". fzf is invoked via
+# subprocess.run() with an argv LIST, not a shell string -- reconstructed
+# below into an equivalent command line, one per selector method)
+# =============================================================================
+
+# Benexl/FastAnime viu_media/libs/selectors/fzf/selector.py:24 (FZF_DEFAULT_OPTS assignment)
+os.environ["FZF_DEFAULT_OPTS"] = self.config.opts  # self.config.opts defaults to the file below
+
+# Benexl/FastAnime viu_media/assets/defaults/fzf-opts (FzfConfig.opts default -- becomes FZF_DEFAULT_OPTS)
+--color=fg:#d0d0d0,fg+:#d0d0d0,bg:#121212,bg+:#262626
+--color=hl:#5f87af,hl+:#5fd7ff,info:#afaf87,marker:#87ff00
+--color=prompt:#d7005f,spinner:#af5fff,pointer:#af5fff,header:#87afaf
+--color=border:#262626,label:#aeaeae,query:#d9d9d9
+--border=rounded
+--border-label=''
+--prompt='>'
+--marker='>'
+--pointer='◆'
+--separator='─'
+--scrollbar='│'
+--layout=reverse
+--cycle
+--info=hidden
+--height=100%
+--bind=right:accept,ctrl-/:toggle-preview,ctrl-space:toggle-wrap+toggle-preview-wrap
+--no-margin
++m
+-i
+--exact
+--tabstop=1
+--preview-window=border-rounded,left,35%,wrap
+--wrap
+
+# Benexl/FastAnime viu_media/libs/selectors/fzf/selector.py:37-49 (choose(); reconstructed from argv list)
+fzf --prompt "<PROMPT>: " --header "<HEADER_ASCII_ART>" --header-first [--preview "<PREVIEW_CMD>"]
+
+# Benexl/FastAnime viu_media/libs/selectors/fzf/selector.py:64-76 (choose_multiple(); reconstructed from argv list)
+fzf --multi --prompt "<PROMPT>: " --header "<HEADER_ASCII_ART>
+Press TAB to select multiple items, ENTER to confirm" --header-first [--preview "<PREVIEW_CMD>"]
+
+# Benexl/FastAnime viu_media/libs/selectors/fzf/selector.py:103-111 (ask(); dead code, "not going to be used"; reconstructed)
+fzf --prompt "<PROMPT>: " --header "<HEADER_ASCII_ART>" --header-first --print-query
+
+# Benexl/FastAnime viu_media/libs/selectors/fzf/selector.py:140-158 (search(); dynamic/--disabled reload search; reconstructed from argv list)
+fzf --prompt "<PROMPT>: " --header "<HEADER_ASCII_ART>
+<header>" --header-first --disabled --bind "change:reload(<SEARCH_COMMAND>)" --ansi [--query "<INITIAL_QUERY>" --bind "start:reload(<SEARCH_COMMAND>)"] [--preview "<PREVIEW_CMD>"]
+
+# Benexl/FastAnime viu_media/cli/utils/preview.py:600-604 (the --preview command dynamic_search() passes in, once the
+# per-run preview script has been written out; reconstructed)
+<python-executable> <cache-dir>/dynamic-search-preview-script.py {}
+
+# Benexl/FastAnime viu_media/cli/commands/config.py:26 (doc example in --help text, literal)
+viu --icons --selector fzf --preview full config --update
+
+# =============================================================================
+# leo-arch/clifm (C; fzf is invoked via a printf/snprintf-built command
+# string run through launch_execl(), not a static literal -- reconstructed
+# below from the snprintf() template with the same %s ordering, shell
+# variables/placeholders left as descriptive names)
+# =============================================================================
+
+# leo-arch/clifm src/settings.h:686-692 (DEF_FZFTAB_OPTIONS -- default value of
+# the "FzfTabOptions" config / used as the leading options in the fzf
+# command below; functionally clifm's own FZF_DEFAULT_OPTS equivalent)
+--color=16,prompt:6,fg+:-1,pointer:4,hl:2,hl+:2,gutter:-1,marker:2,border:7:dim --bind tab:accept,right:accept,left:abort,alt-p:toggle-preview,change:top,alt-up:preview-page-up,alt-down:preview-page-down --tiebreak=begin --inline-info --layout=reverse-list --preview-window=wrap,border-left
+
+# leo-arch/clifm src/settings.h:693-696 (DEF_FZFTAB_OPTIONS_NO_COLOR)
+--color=bw --bind tab:accept,right:accept,left:abort,alt-p:toggle-preview,change:top,alt-up:preview-page-up,alt-down:preview-page-down --tiebreak=begin --inline-info --layout=reverse-list --preview-window=wrap,border-left
+
+# leo-arch/clifm src/tabcomp.c:807-820 (run_finder(), FZF branch; reconstructed
+# from the snprintf() format string -- see the source for the exact
+# conditional logic behind each placeholder)
+fzf $FZFTAB_OPTIONS $NO_UNICODE_FLAG $HEIGHT_STR --margin=0,0,0,$OFFSET $CASE_FLAG --read0 --ansi --query='$LAST_WORD' $COLOR_FLAG $MULTI_FLAGS $PREVIEW_FLAG $PREVIEW_HIDDEN_FLAGS $PREVIEW_WINDOW_OPTS < $FINDER_IN_FILE > $FINDER_OUT_FILE
+# where (from the source):
+#   $FZFTAB_OPTIONS         = conf.fzftab_options (DEF_FZFTAB_OPTIONS[_NO_COLOR]
+#                              above, or FzfTabOptions from the config file)
+#   $NO_UNICODE_FLAG         = "--no-unicode" if the terminal lacks unicode, else ""
+#   $HEIGHT_STR              = "--height=<N>"
+#   $CASE_FLAG               = "+i" (ignore-case off) or "-i" (smart/insensitive)
+#   $COLOR_FLAG              = "--color=bw" if colors are disabled, else ""
+#   $MULTI_FLAGS             = "--multi --bind tab:toggle+down,ctrl-s:select-all,\
+#                                ctrl-d:deselect-all,ctrl-t:toggle-all" if multi-select
+#   $PREVIEW_FLAG            = '--preview "clifm --preview -- {}"' if an internal
+#                                previewer is active
+#   $PREVIEW_HIDDEN_FLAGS    = "--preview-window=hidden --bind alt-p:toggle-preview"
+#                                if the preview starts hidden
+#   $PREVIEW_WINDOW_OPTS     = "--preview-window=<width>" (computed from terminal size)
+
+# leo-arch/clifm src/tabcomp.c:581 (setenv_fzf_alt_preview_file -- comment references
+# fzf re-invoking clifm itself as the previewer via "clifm --preview -- {}" above)
+
+# leo-arch/clifm src/sanitize.c:226,270 (FZF_DEFAULT_OPTS is read from the
+# environment, sanitized, then re-exported for the fzf child process)
+fzfopts = xgetenv("FZF_DEFAULT_OPTS", 1);
+...
+xsetenv("FZF_DEFAULT_OPTS", fzfopts);
+
+# =============================================================================
+# Stan-breaks/ytsurf (shell, bash; most-starred GitHub match for "ytsurf")
+# =============================================================================
+
+# Stan-breaks/ytsurf ytsurf.sh:195
+chosen=$(printf "%s\n" "${items[@]}" | fzf --prompt="$prompt" --header="$header")
+
+# Stan-breaks/ytsurf ytsurf.sh:705-707 (channel search, with preview)
+selected_item=$(printf "%s\n" "${menuList[@]}" | fzf \
+  --prompt="search channel" \
+  --preview="bash -c '$previewScript' -- {n}")
+
+# Stan-breaks/ytsurf ytsurf.sh:786-788 (same pattern, second call site)
+selected_item=$(printf "%s\n" "${menuList[@]}" | fzf \
+  --prompt="search channel" \
+  --preview="bash -c '$previewScript' -- {n}")
+
+# Stan-breaks/ytsurf ytsurf.sh:1570-1572 (main menu, with preview)
+selected_item=$(printf "%s\n" "${menu_items[@]}" | fzf \
+  --prompt="$prompt" \
+  --preview="bash -c '$preview_script' -- {n}")
+
+# Stan-breaks/ytsurf: no FZF_DEFAULT_OPTS assignment found (grep -rn
+# 'FZF_DEFAULT_OPTS' ytsurf.sh returned nothing).

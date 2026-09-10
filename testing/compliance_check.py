@@ -24,12 +24,20 @@ import pty
 import re
 import select
 import shutil
+import signal
 import struct
 import sys
+import tempfile
 import termios
 import time
 
 FAILURES = []
+# Names of checks that failed but were marked xfail=<task id> (expected --
+# not counted as a failure) and ones that were marked xfail but passed
+# anyway (XPASS -- also not a failure, just noted). See check().
+XFAIL_NAMES = []
+XPASS_NAMES = []
+PASS_COUNT = 0
 
 
 def set_winsize(fd, rows, cols):
@@ -91,6 +99,172 @@ def run_fzf(fzf_path, args, rows, cols, feed_lines, drain_s=2.0, nudge=None,
         pass
 
     return buf.decode(errors="replace")
+
+
+ENTER = b"\r"
+TAB = b"\t"
+UP = b"\x1b[A"
+DOWN = b"\x1b[B"
+CTRL_C = b"\x03"
+
+
+def run_interactive(fzf, args, feed_bytes, keys, rows=20, cols=60,
+                     settle=0.6, timeout=4.0, env=None):
+    """Fork fzf under a pty with stdin AND stdout routed through separate
+    pipes (stdin: a plain pipe fed with `feed_bytes`; stdout: piped so
+    fzf's actual output-contract bytes -- the accepted item(s), --print0,
+    --expect key, etc. -- can be told apart from what it drew to the
+    terminal). `keys` is a list of (delay_s, bytes) pairs written to the
+    pty (i.e. as if typed) with a `drain(delay_s)` after each. Returns
+    (stdout_bytes, screen_bytes, exit_code); exit_code is an int for a
+    normal exit, "sigN" for death by signal N, or the string
+    "TIMEOUT(still running)" if it had to be SIGKILLed after `timeout`s of
+    waiting for it to exit once the keys were all sent.
+
+    fzf: src/tui/light.go et al. write the UI to /dev/tty (or whatever fd
+    2/the controlling terminal is) while the OUTPUT PROTOCOL (accepted
+    selection(s), --print-query, --expect key) goes to stdout -- keeping
+    them on separate captured streams here mirrors that split instead of
+    scraping the selection back out of the rendered screen."""
+    in_r, in_w = os.pipe()
+    out_r, out_w = os.pipe()
+    pid, master = pty.fork()
+    if pid == 0:
+        os.dup2(in_r, 0)
+        os.dup2(out_w, 1)
+        for fd in (in_r, in_w, out_r, out_w):
+            os.close(fd)
+        os.environ["TERM"] = "xterm-256color"
+        if env:
+            os.environ.update(env)
+        os.execv(fzf, [fzf] + args)
+        os._exit(127)
+    os.close(in_r)
+    os.close(out_w)
+    set_winsize(master, rows, cols)
+    if feed_bytes is not None:
+        try:
+            os.write(in_w, feed_bytes)
+        except OSError:
+            pass
+    os.close(in_w)
+
+    screen = b""
+    out = b""
+
+    def drain(t):
+        nonlocal screen, out
+        end = time.time() + t
+        while time.time() < end:
+            r, _, _ = select.select([master, out_r], [], [], 0.05)
+            if master in r:
+                try:
+                    c = os.read(master, 65536)
+                except OSError:
+                    c = b""
+                if c:
+                    screen += c
+            if out_r in r:
+                try:
+                    c = os.read(out_r, 65536)
+                except OSError:
+                    c = b""
+                if c:
+                    out += c
+
+    drain(settle)
+    for delay, k in keys:
+        try:
+            os.write(master, k)
+        except OSError:
+            pass
+        drain(delay)
+
+    status = None
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            wpid, st = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            wpid, st = pid, 0
+        if wpid == pid:
+            status = st
+            break
+        drain(0.1)
+    if status is None:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+        status = "TIMEOUT(still running)"
+    drain(0.2)
+    try:
+        os.close(master)
+    except OSError:
+        pass
+    try:
+        os.close(out_r)
+    except OSError:
+        pass
+
+    if isinstance(status, str):
+        code = status
+    elif os.WIFEXITED(status):
+        code = os.WEXITSTATUS(status)
+    else:
+        code = f"sig{os.WTERMSIG(status)}"
+    return out, screen, code
+
+
+def last_frame_rows(screen, rows, cols):
+    """Very rough screen model: apply CUP (cursor position) and text writes
+    onto a `rows` x `cols` grid, honoring \\r/\\n and ED/EL erase sequences;
+    ignores SGR/other attributes. Good enough to answer "what text is on
+    row N" questions without a full terminal emulator. Returns a list of
+    `rows` strings, right-trimmed of trailing spaces."""
+    grid = [[" "] * cols for _ in range(rows)]
+    r = c = 0
+    i = 0
+    s = screen.decode("utf-8", "replace")
+    while i < len(s):
+        ch = s[i]
+        if ch == "\x1b":
+            m = re.match(r"\x1b\[([0-9;?]*)([A-Za-z])", s[i:])
+            if m:
+                params, fin = m.group(1), m.group(2)
+                if fin == "H":
+                    p = [int(x) if x else 1 for x in params.split(";")] \
+                        if params else [1, 1]
+                    r = min(max(p[0] - 1, 0), rows - 1)
+                    c = min(max((p[1] - 1 if len(p) > 1 else 0), 0), cols - 1)
+                elif fin == "J":
+                    if params in ("", "0", "2"):
+                        grid = [[" "] * cols for _ in range(rows)]
+                elif fin == "K":
+                    for k in range(c, cols):
+                        grid[r][k] = " "
+                i += len(m.group(0))
+                continue
+            m = re.match(r"\x1b[()][A-Za-z0-9]|\x1b[78=>]", s[i:])
+            if m:
+                i += len(m.group(0))
+                continue
+            i += 1
+            continue
+        if ch == "\r":
+            c = 0
+        elif ch == "\n":
+            r = min(r + 1, rows - 1)
+        else:
+            if 0 <= r < rows and 0 <= c < cols:
+                grid[r][c] = ch
+            c += 1
+        i += 1
+    return ["".join(row).rstrip() for row in grid]
 
 
 def _is_extended_pictographic(cp):
@@ -187,13 +361,31 @@ def strip_sgr(s):
     return re.sub(r"\x1b\[[0-9;]*m", "", s)
 
 
-def check(name, condition, detail=""):
-    status = "PASS" if condition else "FAIL"
+def check(name, condition, detail="", xfail=None):
+    """Record one check's result. `xfail`, when given, is a task id string
+    (e.g. "T1.7") for a scenario that is known not to pass yet -- the task
+    that is expected to make it pass. A failing xfail check prints
+    `[XFAIL <id>] name` and does NOT count towards FAILURES/the exit code;
+    a PASSING xfail check prints `[XPASS <id>] name` (the feature already
+    works -- also not a failure, just noted so the tag can be dropped)."""
+    global PASS_COUNT
+    if condition:
+        if xfail:
+            status = f"XPASS {xfail}"
+            XPASS_NAMES.append(name)
+        else:
+            status = "PASS"
+            PASS_COUNT += 1
+    else:
+        if xfail:
+            status = f"XFAIL {xfail}"
+            XFAIL_NAMES.append(name)
+        else:
+            status = "FAIL"
+            FAILURES.append(name)
     print(f"[{status}] {name}")
-    if not condition:
-        FAILURES.append(name)
-        if detail:
-            print(f"       {detail}")
+    if not condition and detail:
+        print(f"       {detail}")
 
 
 def test_column_layout(fzf, border, position, rows=24, cols=97, pct=35):
@@ -533,6 +725,467 @@ def test_preview_uses_dollar_shell(fzf, rows=24, cols=80):
           f"/bin/sh for preview/execute commands instead of $SHELL")
 
 
+# --------------------------------------------------------------------------
+# T1.11 scenarios: docs/DESIGN.md section 15 / docs/TASKS.md T1.11. Each is
+# tagged with the task expected to turn it green (xfail=). A few may XPASS
+# already if the underlying behavior happens to work in 0.2.1 -- that's
+# fine, it just means the tag can be dropped once that task lands for real.
+# --------------------------------------------------------------------------
+
+def test_version_string(fzf):
+    out, _screen, _code = run_interactive(fzf, ["--version"], b"", [],
+                                           timeout=2.0)
+    token = out.split()[0] if out.split() else b""
+    check("version/first-token-is-fzf-version",
+          bool(re.match(rb"^0\.\d+", token)),
+          f"first token of `fzf --version` output was {token!r} "
+          f"(fzf: a bare '0.<minor>.<patch>...' token, e.g. '0.55.0')",
+          xfail="T1.8")
+
+
+def test_unknown_option_exits_2(fzf):
+    _out, _screen, code = run_interactive(fzf, ["-f", "a", "--bogus"],
+                                           b"a\n", [], timeout=2.0)
+    check("options/unknown-option-exits-2", code == 2,
+          f"exit code was {code!r}, expected 2",
+          xfail="T1.1")
+
+
+def test_positional_arg_exits_2(fzf):
+    _out, _screen, code = run_interactive(fzf, ["some-positional-arg"],
+                                           b"a\n", [], timeout=2.0)
+    check("options/positional-arg-exits-2", code == 2,
+          f"exit code was {code!r}, expected 2 (fzf takes no positional "
+          f"arguments)",
+          xfail="T1.1")
+
+
+def test_accept_nth(fzf):
+    out, _screen, _code = run_interactive(
+        fzf, ["-f", "a", "--accept-nth", "2"], b"a b c\n", [], timeout=2.0)
+    check("nth/accept-nth-without-delimiter", out.strip() == b"b",
+          f"stdout was {out!r}, expected b'b\\n' (--accept-nth 2 with the "
+          f"default AWK-style whitespace delimiter)",
+          xfail="T1.3")
+
+
+def test_tab_delimiter(fzf):
+    # -d '\t' must parse the two-character escape as an actual tab byte,
+    # not split on a literal backslash-t. Field 2 of "a\tb" is "b": a query
+    # of 'b' restricted to field 2 must match, a query of 'a' restricted to
+    # field 2 must not.
+    out_match, _s1, _c1 = run_interactive(
+        fzf, ["-f", "b", "-d", "\\t", "--nth", "2"], b"a\tb\n", [],
+        timeout=2.0)
+    out_nomatch, _s2, _c2 = run_interactive(
+        fzf, ["-f", "a", "-d", "\\t", "--nth", "2"], b"a\tb\n", [],
+        timeout=2.0)
+    ok = out_match.strip() == b"a\tb" and out_nomatch.strip() == b""
+    check("nth/tab-delimiter-regex", ok,
+          f"query 'b' --nth 2 -d '\\t' on 'a<TAB>b' -> {out_match!r} "
+          f"(expected the whole line); query 'a' --nth 2 -d '\\t' -> "
+          f"{out_nomatch!r} (expected no match)",
+          xfail="T1.3")
+
+
+def test_nth_restricts_match(fzf):
+    out, _screen, _code = run_interactive(
+        fzf, ["-f", "^foo", "--nth", "2"], b"foo bar\nbar foo\n", [],
+        timeout=2.0)
+    check("nth/--nth-restricts-match", out.strip() == b"bar foo",
+          f"stdout was {out!r}, expected b'bar foo\\n' -- field 2 of "
+          f"'foo bar' is 'bar' (doesn't match ^foo), field 2 of 'bar foo' "
+          f"is 'foo' (matches)",
+          xfail="T1.5")
+
+
+def test_tac(fzf):
+    out, _screen, _code = run_interactive(fzf, ["-f", "", "--tac"],
+                                           b"a\nb\nc\n", [], timeout=2.0)
+    check("sort/--tac", out == b"c\nb\na\n",
+          f"stdout was {out!r}, expected b'c\\nb\\na\\n' (--tac reverses "
+          f"input order before matching)",
+          xfail="T1.5")
+
+
+def test_plus_s_keeps_input_order(fzf):
+    out, _screen, _code = run_interactive(fzf, ["-f", "ab", "+s"],
+                                           b"xxab\nab\n", [], timeout=2.0)
+    first_line = out.split(b"\n")[0] if out else b""
+    check("sort/+s-keeps-input-order", first_line == b"xxab",
+          f"first line of stdout was {first_line!r}, expected b'xxab' -- "
+          f"+s disables sorting, so input order (xxab before ab) is kept "
+          f"even though 'ab' would score higher",
+          xfail="T1.5")
+
+
+def test_print0(fzf):
+    out, _screen, _code = run_interactive(
+        fzf, ["-f", "apple", "--print0"], b"apple\nbanana\n", [],
+        timeout=2.0)
+    check("output/--print0", out == b"apple\0",
+          f"stdout was {out!r}, expected b'apple\\x00' (NUL-separated, "
+          f"not newline-separated)",
+          xfail="T1.8")
+
+
+def test_selection_order(fzf):
+    out, _screen, _code = run_interactive(
+        fzf, ["-m", "--reverse"], b"one\ntwo\nthree\n",
+        [(0.2, DOWN), (0.2, DOWN), (0.2, TAB), (0.2, UP), (0.2, UP),
+         (0.2, UP), (0.2, TAB), (0.3, ENTER)])
+    check("output/selection-order", out == b"three\none\n",
+          f"stdout was {out!r}, expected b'three\\none\\n' (select 'three' "
+          f"then 'one': fzf prints multi-selections in selection order, "
+          f"not list order)",
+          xfail="T1.8")
+
+
+def test_header_lines_excluded(fzf):
+    out, _screen, _code = run_interactive(
+        fzf, ["--header-lines", "1", "--reverse"], b"HEADER\nbody\n",
+        [(0.3, ENTER)])
+    check("header/--header-lines-excluded-from-output", out.strip() == b"body",
+          f"stdout was {out!r}, expected b'body\\n' -- the header line "
+          f"must not be selectable/printable",
+          xfail="T1.4")
+
+
+def test_multiline_header(fzf):
+    _out, screen, _code = run_interactive(
+        fzf, ["--header", "line1\nline2", "--reverse"], b"one\n",
+        [(0.3, ENTER)], rows=12, cols=40)
+    rows_list = last_frame_rows(screen, 12, 40)
+    row1 = next((i for i, r in enumerate(rows_list) if "line1" in r), None)
+    row2 = next((i for i, r in enumerate(rows_list) if "line2" in r), None)
+    ok = row1 is not None and row2 is not None and row1 != row2
+    check("header/multiline-header-two-rows", ok,
+          f"'line1' on row {row1}, 'line2' on row {row2} of the captured "
+          f"frame -- expected both present on two distinct rows\n"
+          + "\n".join(f"       {i:2d}|{r}" for i, r in enumerate(rows_list) if r),
+          xfail="T2.2")
+
+
+def test_become(fzf):
+    out, _screen, code = run_interactive(
+        fzf, ["--bind", "enter:become(echo BECAME {})"], b"one\ntwo\n",
+        [(0.3, ENTER)], timeout=2.0)
+    check("bind/become-replaces-process",
+          out.strip() == b"BECAME one" and code == 0,
+          f"stdout={out!r} exit={code!r}, expected stdout b'BECAME one\\n' "
+          f"and exit 0 (become() execs and replaces the fzf process)",
+          xfail="T1.7")
+
+
+def test_execute_runs_on_tty(fzf):
+    marker = os.path.join(
+        tempfile.gettempdir(), f"fzfpp_compliance_execute_marker_{os.getpid()}")
+    try:
+        os.unlink(marker)
+    except OSError:
+        pass
+    bind = (f"ctrl-r:execute(sh -c 'test -t 0 && test -t 1 && "
+            f"touch {marker}')")
+    try:
+        run_interactive(fzf, ["--bind", bind], b"one\n",
+                         [(0.5, b"\x12"), (0.3, ENTER)], timeout=2.0)
+        ok = os.path.exists(marker)
+        check("bind/execute-runs-on-tty", ok,
+              f"marker file {marker} was not created -- expected "
+              f"execute() to run its command with both stdin and stdout "
+              f"attached to a tty (chafa/less/etc. -style previewers and "
+              f"editors need this)",
+              xfail="T1.7")
+    finally:
+        try:
+            os.unlink(marker)
+        except OSError:
+            pass
+
+
+def test_execute_silent(fzf):
+    marker = os.path.join(
+        tempfile.gettempdir(),
+        f"fzfpp_compliance_execute_silent_marker_{os.getpid()}")
+    try:
+        os.unlink(marker)
+    except OSError:
+        pass
+    bind = f"ctrl-r:execute-silent(touch {marker})"
+    try:
+        run_interactive(fzf, ["--bind", bind], b"one\n",
+                         [(0.5, b"\x12"), (0.3, ENTER)], timeout=2.0)
+        ok = os.path.exists(marker)
+        check("bind/execute-silent-runs", ok,
+              f"marker file {marker} was not created by "
+              f"ctrl-r:execute-silent(touch {marker})",
+              xfail="T1.7")
+    finally:
+        try:
+            os.unlink(marker)
+        except OSError:
+            pass
+
+
+def test_load_event(fzf):
+    out, _screen, _code = run_interactive(
+        fzf, ["--bind", "load:accept"], b"one\ntwo\n", [], timeout=1.5)
+    check("bind/load-event", out.strip() == b"one",
+          f"stdout was {out!r}, expected b'one\\n' -- load:accept should "
+          f"fire once the initial item batch has loaded, with no keys sent",
+          xfail="T1.7")
+
+
+def test_space_key_name(fzf):
+    out, _screen, _code = run_interactive(
+        fzf, ["--bind", "space:accept"], b"one\n", [(0.3, b" ")],
+        timeout=1.5)
+    check("bind/space-key-name", out.strip() == b"one",
+          f"stdout was {out!r}, expected b'one\\n' after pressing space "
+          f"with --bind space:accept",
+          xfail="T1.2")
+
+
+def test_expect_f1(fzf):
+    out, _screen, _code = run_interactive(
+        fzf, ["--expect", "f1"], b"one\n", [(0.3, b"\x1bOP")], timeout=1.5)
+    check("expect/f1-key", out == b"f1\none\n",
+          f"stdout was {out!r}, expected b'f1\\none\\n' after pressing F1 "
+          f"(ESC O P, the SS3 encoding xterm sends for F1) with "
+          f"--expect f1",
+          xfail="T1.8")
+
+
+def test_placeholder_plus_and_f(fzf):
+    _out, screen, _code = run_interactive(
+        fzf, ["-m", "--preview", "echo PLUS[{+}] F[{f}]"], b"one\ntwo\n",
+        [(0.8, ENTER)], rows=16, cols=60, timeout=2.0)
+    has_plus = b"PLUS['one']" in screen
+    has_f_path = bool(re.search(rb"F\[[^\]]*[/\\][^\]]*\]", screen))
+    check("placeholder/plus-and-file", has_plus and has_f_path,
+          f"expected the preview output to contain \"PLUS['one']\" "
+          f"(has_plus={has_plus}) and \"F[<a path>]\" (has_f_path="
+          f"{has_f_path})",
+          xfail="T1.6")
+
+
+def test_reload_does_not_block_on_streaming_stdin(fzf):
+    # This one genuinely needs a shell pipeline (a slow producer feeding
+    # fzf), not a single pipe write -- run_interactive always fully writes
+    # feed_bytes up front, which wouldn't exercise "reader still blocked
+    # mid-stream" at all.
+    cmd = f"(echo a; sleep 3; echo b) | {fzf} --reverse " \
+          f"--bind 'start:reload(echo RELOADED)'"
+    pid, master = pty.fork()
+    if pid == 0:
+        os.environ["TERM"] = "xterm-256color"
+        os.execv("/bin/sh", ["/bin/sh", "-c", cmd])
+        os._exit(127)
+    set_winsize(master, 20, 60)
+    t0 = time.time()
+    buf = b""
+    seen = None
+    while time.time() - t0 < 1.5:
+        r, _, _ = select.select([master], [], [], 0.05)
+        if master in r:
+            try:
+                d = os.read(master, 65536)
+            except OSError:
+                break
+            if not d:
+                break
+            buf += d
+            if b"RELOADED" in buf and seen is None:
+                seen = time.time() - t0
+                break
+    seen_desc = f"{seen:.2f}s" if seen is not None else "never (within 1.5s)"
+    check("reload/does-not-block-on-streaming-stdin",
+          seen is not None and seen < 1.0,
+          f"RELOADED appeared after {seen_desc} (expected < 1.0s) -- "
+          f"start:reload must not wait for the "
+          f"still-streaming stdin producer to finish/EOF",
+          xfail="T1.4")
+    try:
+        os.write(master, b"\x03")
+    except OSError:
+        pass
+    time.sleep(0.2)
+    try:
+        wpid, _st = os.waitpid(pid, os.WNOHANG)
+        if wpid == 0:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+    except (ChildProcessError, ProcessLookupError):
+        pass
+    try:
+        os.close(master)
+    except OSError:
+        pass
+
+
+def test_layout_reverse_prompt_on_top(fzf):
+    _out, screen, _code = run_interactive(
+        fzf, ["--reverse"], b"one\ntwo\nthree\n", [(0.3, ENTER)],
+        rows=10, cols=40)
+    rows_list = last_frame_rows(screen, 10, 40)
+    # last_frame_rows() right-trims each row, so the prompt's trailing
+    # space after "> " is gone by the time it gets here -- match on ">"
+    # alone.
+    ok = bool(rows_list) and rows_list[0].startswith(">")
+    check("layout/reverse-prompt-on-top", ok,
+          f"row 0 was {rows_list[0]!r} (expected it to start with '>') "
+          f"-- with --reverse the prompt is the FIRST row",
+          xfail="T2.2")
+
+
+def test_layout_default_prompt_at_bottom(fzf):
+    _out, screen, _code = run_interactive(
+        fzf, [], b"one\ntwo\nthree\n", [(0.3, ENTER)], rows=10, cols=40)
+    rows_list = last_frame_rows(screen, 10, 40)
+    prompt_idx = next((i for i, r in enumerate(rows_list)
+                        if r.startswith(">")), None)
+    ok = prompt_idx is not None and prompt_idx > 0 and \
+        "one" in rows_list[prompt_idx - 1]
+    row_above = rows_list[prompt_idx - 1] if prompt_idx else None
+    check("layout/default-prompt-at-bottom-first-item-above", ok,
+          f"prompt row index={prompt_idx}, row above it={row_above!r} -- "
+          f"expected the default (non-reverse) layout to put the prompt "
+          f"at the bottom with the first item directly above it",
+          xfail="T2.2")
+
+
+def test_height_inline_no_alt_screen(fzf):
+    _out, screen, _code = run_interactive(
+        fzf, ["--height", "40%"], b"one\ntwo\n", [(0.3, ENTER)],
+        rows=20, cols=60)
+    check("height/inline-no-alt-screen", b"\x1b[?1049h" not in screen,
+          f"the alternate-screen sequence ESC[?1049h appeared in the "
+          f"captured output -- --height N%% (without a leading ~) must "
+          f"draw inline instead",
+          xfail="T2.3")
+
+
+def test_ansi_colors_rendered(fzf):
+    _out, screen, _code = run_interactive(
+        fzf, ["--ansi"], b"\x1b[31mred\x1b[0m\nplain\n", [(0.3, ENTER)])
+    check("ansi/colors-rendered", b"\x1b[31m" in screen,
+          f"SGR 31 (red) from the --ansi-colored input line never "
+          f"appeared in the captured output",
+          xfail="T2.4")
+
+
+def test_hscroll_match_kept_visible(fzf):
+    long_line = "x" * 100 + "NEEDLE"
+    _out, screen, _code = run_interactive(
+        fzf, ["--reverse"], (long_line + "\nother\n").encode(),
+        [(0.3, b"NEEDLE"), (0.5, ENTER)], cols=40)
+    check("hscroll/match-kept-visible", b"NEEDLE" in screen,
+          f"query 'NEEDLE' against a 100-'x'-then-NEEDLE line in a "
+          f"40-column terminal never showed NEEDLE on screen -- the "
+          f"matched region must stay horizontally scrolled into view",
+          xfail="T2.5")
+
+
+def test_preview_window_up_is_horizontal(fzf):
+    _out, screen, _code = run_interactive(
+        fzf, ["--preview", "echo PREVIEW-{}", "--preview-window", "up:40%"],
+        b"one\ntwo\n", [(0.8, ENTER)], rows=16, cols=50)
+    rows_list = last_frame_rows(screen, 16, 50)
+    preview_idx = next((i for i, r in enumerate(rows_list)
+                         if "PREVIEW-" in r), None)
+    # "one" is also a substring of the preview's own rendered text
+    # ("PREVIEW-one"), so exclude preview rows when looking for the list
+    # row -- otherwise a left/right split (where both land on the same
+    # physical row) would look like a false match instead of a real split.
+    item_idx = next((i for i, r in enumerate(rows_list)
+                      if "one" in r and "PREVIEW-" not in r), None)
+    ok = preview_idx is not None and item_idx is not None and \
+        preview_idx < item_idx
+    check("preview/window-up-is-horizontal-split", ok,
+          f"preview row index={preview_idx}, list-item row index="
+          f"{item_idx} -- expected the preview pane ABOVE the list (a "
+          f"horizontal split), not beside it",
+          xfail="T1.10")
+
+
+def test_stdin_tty_runs_default_command(fzf):
+    # Deliberately does NOT go through run_interactive: that helper always
+    # pipes stdin, but this scenario needs fzf's stdin left as the pty
+    # itself (pty.fork()'s child inherits the pty slave as fd 0/1/2 by
+    # default) so it takes the "no pipe, tty stdin" code path and falls
+    # back to FZF_DEFAULT_COMMAND.
+    pid, master = pty.fork()
+    if pid == 0:
+        os.environ["TERM"] = "xterm-256color"
+        os.environ["FZF_DEFAULT_COMMAND"] = "echo from-default"
+        os.execv(fzf, [fzf])
+        os._exit(127)
+    set_winsize(master, 20, 60)
+    buf = b""
+    end = time.time() + 1.5
+    while time.time() < end:
+        r, _, _ = select.select([master], [], [], 0.1)
+        if master in r:
+            try:
+                d = os.read(master, 65536)
+            except OSError:
+                break
+            if not d:
+                break
+            buf += d
+    check("stdin/tty-runs-default-command", b"from-default" in buf,
+          f"expected 'from-default' (FZF_DEFAULT_COMMAND='echo "
+          f"from-default') to appear on screen when fzf's stdin is a tty "
+          f"(no pipe, no positional command)",
+          xfail="T1.9")
+    try:
+        os.write(master, b"\x03")
+    except OSError:
+        pass
+    time.sleep(0.2)
+    try:
+        wpid, _st = os.waitpid(pid, os.WNOHANG)
+        if wpid == 0:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+    except (ChildProcessError, ProcessLookupError):
+        pass
+    try:
+        os.close(master)
+    except OSError:
+        pass
+
+
+def run_t1_11_scenarios(fzf):
+    test_version_string(fzf)
+    test_unknown_option_exits_2(fzf)
+    test_positional_arg_exits_2(fzf)
+    test_accept_nth(fzf)
+    test_tab_delimiter(fzf)
+    test_nth_restricts_match(fzf)
+    test_tac(fzf)
+    test_plus_s_keeps_input_order(fzf)
+    test_print0(fzf)
+    test_selection_order(fzf)
+    test_header_lines_excluded(fzf)
+    test_multiline_header(fzf)
+    test_become(fzf)
+    test_execute_runs_on_tty(fzf)
+    test_execute_silent(fzf)
+    test_load_event(fzf)
+    test_space_key_name(fzf)
+    test_expect_f1(fzf)
+    test_placeholder_plus_and_f(fzf)
+    test_reload_does_not_block_on_streaming_stdin(fzf)
+    test_layout_reverse_prompt_on_top(fzf)
+    test_layout_default_prompt_at_bottom(fzf)
+    test_height_inline_no_alt_screen(fzf)
+    test_ansi_colors_rendered(fzf)
+    test_hscroll_match_kept_visible(fzf)
+    test_preview_window_up_is_horizontal(fzf)
+    test_stdin_tty_runs_default_command(fzf)
+
+
 def main():
     fzf = sys.argv[1] if len(sys.argv) > 1 else shutil.which("fzf")
     if not fzf or not os.path.exists(fzf):
@@ -558,12 +1211,19 @@ def main():
     test_preview_uses_dollar_shell(real)
 
     print()
+    run_t1_11_scenarios(real)
+
+    print()
+    print(f"{PASS_COUNT} passed, {len(XPASS_NAMES)} xpassed "
+          f"(marked xfail but currently working), {len(XFAIL_NAMES)} "
+          f"xfailed (expected -- see docs/TASKS.md), "
+          f"{len(FAILURES)} FAILED")
     if FAILURES:
         print(f"{len(FAILURES)} check(s) FAILED:")
         for f in FAILURES:
             print(f"  - {f}")
         return 1
-    print("All checks passed.")
+    print("All checks passed (xfail/xpass do not count as failures).")
     return 0
 
 
