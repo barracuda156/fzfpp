@@ -395,6 +395,6 @@ std::vector<Range> parse_nth(const std::string& spec);              // fzf: spli
 Delimiter parse_delimiter(const std::string& spec);                 // fzf: delimiterRegexp
 std::vector<std::string> str_lines(const std::string& s);           // fzf: strLines
 const char* fzf_compat_version();                                   // "0.74"
-const char* fzfpp_version();                                        // "0.2.1"
+const char* fzfpp_version();                                        // fzf++ own version
 
 } // namespace fzf
