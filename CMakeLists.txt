@@ -7,7 +7,6 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Note: using bundled dependencies introduces a build-time dependency on git.
 
-option(USE_SYSTEM_CLI11 "Use system CLI11 library" OFF)
 option(USE_SYSTEM_UTFCPP "Use system utfcpp library" OFF)
 
 # Compiler warnings and flags
@@ -25,25 +24,6 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 find_package(Threads REQUIRED)
-
-# CLI11 - Header-only command line parser
-if(USE_SYSTEM_CLI11)
-    find_package(CLI11 CONFIG REQUIRED)
-else()
-    # Use bundled CLI11
-    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/CLI11/include/CLI/CLI.hpp")
-        message(STATUS "CLI11 not found, fetching the source")
-        include(FetchContent)
-        FetchContent_Declare(
-            cli11
-            GIT_REPOSITORY https://github.com/CLIUtils/CLI11.git
-            GIT_TAG v2.6.2
-        )
-        FetchContent_MakeAvailable(cli11)
-    else()
-        add_subdirectory(external/CLI11 EXCLUDE_FROM_ALL)
-    endif()
-endif()
 
 # utfcpp - Header-only UTF-8 library
 if(USE_SYSTEM_UTFCPP)
@@ -97,7 +77,6 @@ add_executable(fzf ${SOURCES})
 target_include_directories(fzf PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 target_link_libraries(fzf PRIVATE
-    CLI11::CLI11
     utf8cpp
     Threads::Threads
 )
@@ -128,9 +107,16 @@ add_executable(matcher_test tools/matcher_test.cpp src/matcher.cpp)
 target_include_directories(matcher_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(matcher_test PRIVATE utf8cpp)
 
+# Unit tests for src/options.cpp -- the hand-written fzf option parser:
+# every option name, value forms, precedence, and fzf's error messages.
+add_executable(options_test tools/options_test.cpp src/options.cpp)
+target_include_directories(options_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(options_test PRIVATE utf8cpp)
+
 enable_testing()
 add_test(NAME keyparser_test COMMAND keyparser_test)
 add_test(NAME matcher_test COMMAND matcher_test)
+add_test(NAME options_test COMMAND options_test)
 
 # Standalone visual smoke test for src/render.hpp — prints a fake frame to
 # the real terminal for manual eyeballing (no automated pixel comparison).
@@ -147,6 +133,5 @@ message(STATUS "fzf++ Configuration Summary:")
 message(STATUS "  C++ Standard: ${CMAKE_CXX_STANDARD}")
 message(STATUS "  Build Type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "  Compiler: ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
-message(STATUS "  Use System CLI11: ${USE_SYSTEM_CLI11}")
 message(STATUS "  Use System utfcpp: ${USE_SYSTEM_UTFCPP}")
 message(STATUS "")

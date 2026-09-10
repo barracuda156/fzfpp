@@ -739,16 +739,14 @@ def test_version_string(fzf):
     check("version/first-token-is-fzf-version",
           bool(re.match(rb"^0\.\d+", token)),
           f"first token of `fzf --version` output was {token!r} "
-          f"(fzf: a bare '0.<minor>.<patch>...' token, e.g. '0.55.0')",
-          xfail="T1.8")
+          f"(fzf: a bare '0.<minor>.<patch>...' token, e.g. '0.55.0')")
 
 
 def test_unknown_option_exits_2(fzf):
     _out, _screen, code = run_interactive(fzf, ["-f", "a", "--bogus"],
                                            b"a\n", [], timeout=2.0)
     check("options/unknown-option-exits-2", code == 2,
-          f"exit code was {code!r}, expected 2",
-          xfail="T1.1")
+          f"exit code was {code!r}, expected 2")
 
 
 def test_positional_arg_exits_2(fzf):
@@ -756,8 +754,7 @@ def test_positional_arg_exits_2(fzf):
                                            b"a\n", [], timeout=2.0)
     check("options/positional-arg-exits-2", code == 2,
           f"exit code was {code!r}, expected 2 (fzf takes no positional "
-          f"arguments)",
-          xfail="T1.1")
+          f"arguments)")
 
 
 def test_accept_nth(fzf):

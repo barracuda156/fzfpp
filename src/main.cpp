@@ -42,8 +42,8 @@ int main(int argc, char* argv[]) {
 
         fzf::Reader reader;
 
-        if (!opts.delimiter.empty()) {
-            reader.set_delimiter(opts.delimiter);
+        if (!opts.legacy_delimiter.empty()) {
+            reader.set_delimiter(opts.legacy_delimiter);
         }
 
         if (opts.read_zero) {

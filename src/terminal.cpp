@@ -90,7 +90,7 @@ Terminal::Terminal(const Options& opts, Reader& reader)
       winch_write_fd_(-1)
 {
     current_prompt_ = opts_.prompt;
-    current_header_ = opts_.header;
+    current_header_ = opts_.legacy_header;
 }
 
 Terminal::~Terminal() {
@@ -1587,11 +1587,11 @@ void Terminal::recompute_visible_lines() {
     if (max_lines < 1) max_lines = 1;
 
     int computed;
-    if (opts_.height > 0) {
+    if (opts_.legacy_height > 0) {
         if (opts_.height_is_percent) {
-            computed = (term_rows * opts_.height) / 100 - ui_overhead;
+            computed = (term_rows * opts_.legacy_height) / 100 - ui_overhead;
         } else {
-            computed = opts_.height - ui_overhead;
+            computed = opts_.legacy_height - ui_overhead;
         }
     } else {
         computed = max_lines;
@@ -1695,7 +1695,7 @@ void Terminal::repaint(bool preview_dirty) {
 
         std::string item_text;
         if (!opts_.with_nth.empty() && result.item->has_fields()) {
-            std::string display = result.item->get_fields_by_ranges(opts_.with_nth, opts_.delimiter);
+            std::string display = result.item->get_fields_by_ranges(opts_.with_nth, opts_.legacy_delimiter);
             item_text = !display.empty() ? display : result.item->display_text();
         } else {
             item_text = result.item->display_text();
@@ -2398,7 +2398,7 @@ std::vector<std::string> Terminal::run() {
     auto output_text = [this](const std::shared_ptr<Item>& item) -> std::string {
         std::string text;
         if (!opts_.accept_nth.empty() && item->has_fields()) {
-            text = item->get_fields_by_ranges(opts_.accept_nth, opts_.delimiter);
+            text = item->get_fields_by_ranges(opts_.accept_nth, opts_.legacy_delimiter);
         } else {
             text = item->text();
         }
@@ -2439,7 +2439,7 @@ std::vector<std::string> Terminal::run_filter(const std::string& query) {
     for (const auto& result : results) {
         if (!opts_.accept_nth.empty() && result.item->has_fields()) {
             output.push_back(
-                result.item->get_fields_by_ranges(opts_.accept_nth, opts_.delimiter));
+                result.item->get_fields_by_ranges(opts_.accept_nth, opts_.legacy_delimiter));
         } else {
             output.push_back(result.item->text());
         }
