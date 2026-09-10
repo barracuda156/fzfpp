@@ -120,11 +120,18 @@ add_executable(keymap_test tools/keymap_test.cpp src/keymap.cpp src/options.cpp)
 target_include_directories(keymap_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(keymap_test PRIVATE utf8cpp)
 
+# Unit tests for src/tokenizer.cpp -- fzf's tokenizer_test.go fixtures plus
+# the --nth / --with-nth / --accept-nth transformer behaviour (T1.3).
+add_executable(tokenizer_test tools/tokenizer_test.cpp src/tokenizer.cpp src/options.cpp)
+target_include_directories(tokenizer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(tokenizer_test PRIVATE utf8cpp)
+
 enable_testing()
 add_test(NAME keyparser_test COMMAND keyparser_test)
 add_test(NAME keymap_test COMMAND keymap_test)
 add_test(NAME matcher_test COMMAND matcher_test)
 add_test(NAME options_test COMMAND options_test)
+add_test(NAME tokenizer_test COMMAND tokenizer_test)
 
 # Standalone visual smoke test for src/render.hpp — prints a fake frame to
 # the real terminal for manual eyeballing (no automated pixel comparison).
