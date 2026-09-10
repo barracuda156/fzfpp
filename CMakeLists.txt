@@ -63,6 +63,7 @@ endif()
 set(SOURCES
     src/main.cpp
     src/options.cpp
+    src/keymap.cpp
     src/matcher.cpp
     src/reader.cpp
     src/terminal.cpp
@@ -113,8 +114,15 @@ add_executable(options_test tools/options_test.cpp src/options.cpp)
 target_include_directories(options_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(options_test PRIVATE utf8cpp)
 
+# Unit tests for src/keymap.cpp -- key-chord names, --bind action lists in
+# every delimiter form, the default keymap, --expect, KeyEvent -> Event.
+add_executable(keymap_test tools/keymap_test.cpp src/keymap.cpp src/options.cpp)
+target_include_directories(keymap_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(keymap_test PRIVATE utf8cpp)
+
 enable_testing()
 add_test(NAME keyparser_test COMMAND keyparser_test)
+add_test(NAME keymap_test COMMAND keymap_test)
 add_test(NAME matcher_test COMMAND matcher_test)
 add_test(NAME options_test COMMAND options_test)
 
