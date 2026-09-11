@@ -17,7 +17,7 @@ what a previous keystroke already rejected.
 
     cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
     cmake --build build
-    build/fzf --version        # 0.74 (fzf++ 0.3.1)
+    build/fzf --version        # 0.74 (fzf++ 0.4.0)
 
 `ctest --test-dir build` runs the unit tests; `python3 testing/compliance_check.py
 build/fzf` drives the binary under a pty and checks layout, preview and the
@@ -73,9 +73,13 @@ output contract; `testing/bench.sh` measures memory and latency.
 - `--version` prints `0.74 (fzf++ X.Y.Z)`: the first token is the fzf
   version whose command line is mirrored, so scripts that check the first
   field keep working.
-- The screen layout is fzf-like but not pixel-identical yet: the list is
-  drawn top-down, `--height` still uses the alternate screen, and `--ansi`
-  colors are not rendered. These are the next milestone.
+- The screen layout follows fzf's: the three `--layout` modes, the info
+  line with its separator, `--header`/`--header-first` placement, pointer,
+  marker and gutter, scrollbar, `--margin`/`--padding`, `--border` styles
+  and labels, the preview window's border, and the `dark`/`light`/`16`/`bw`
+  colour themes with `--color` overrides. Not there yet: `--height` still
+  uses the alternate screen, and `--ansi` colours in items are not
+  rendered. These are the next milestone.
 
 Disclaimer: the code was written with Claude Code's assistance. Tested with
 bash and Python apps such as viu (fastanime), ytsurf and ani-cli on macOS

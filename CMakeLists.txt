@@ -1,12 +1,11 @@
 cmake_minimum_required(VERSION 3.14)
-project(fzf++ VERSION 0.3.1 LANGUAGES CXX)
+project(fzf++ VERSION 0.4.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Note: using bundled dependencies introduces a build-time dependency on git.
-
 option(USE_SYSTEM_UTFCPP "Use system utfcpp library" OFF)
 
 # Compiler warnings and flags
@@ -75,6 +74,7 @@ set(SOURCES
     src/preview.cpp
     src/terminal.cpp
     src/actions.cpp
+    src/theme.cpp
     src/tty.cpp
     src/keyparser.cpp
     src/render.cpp
@@ -162,7 +162,7 @@ add_test(NAME placeholder_test COMMAND placeholder_test)
 
 # Standalone visual smoke test for src/render.hpp — prints a fake frame to
 # the real terminal for manual eyeballing (no automated pixel comparison).
-add_executable(render_smoketest tools/render_smoketest.cpp src/render.cpp src/tty.cpp)
+add_executable(render_smoketest tools/render_smoketest.cpp src/render.cpp src/tty.cpp src/options.cpp)
 target_include_directories(render_smoketest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(render_smoketest PRIVATE utf8cpp)
 

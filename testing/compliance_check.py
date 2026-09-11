@@ -388,15 +388,43 @@ def check(name, condition, detail="", xfail=None):
         print(f"       {detail}")
 
 
+def fzf_geometry(rows, cols, pct, border, position):
+    """Mirrors Terminal::compute_layout (fzf's resizeWindows) for a preview
+    on the left or right with the default rounded preview border and the
+    default scrollbar: returns a dict with 0-based columns."""
+    # fzf: adjustMarginAndPadding -- a rounded border adds one row top and
+    # bottom and two columns left and right (the line plus one gap column)
+    margin_tb = 1 if border else 0
+    margin_lr = 2 if border else 0
+    width = cols - 2 * margin_lr
+    height = rows - 2 * margin_tb
+    # calculateSize(width, pct%, occupied=4, minPreviewWidth=1+4)
+    pwidth = max(5, min(int(width * 0.01 * pct), max(width - 4, 5)))
+    if position == "left":
+        list_left = margin_lr + pwidth + 1
+        list_width = width - pwidth - 1
+        pborder_left = margin_lr
+    else:
+        list_left = margin_lr
+        list_width = width - pwidth
+        pborder_left = margin_lr + width - pwidth
+    margin = margin_tb
+    return {
+        "list_left": list_left, "list_width": list_width,
+        "scrollbar_col": list_left + list_width - 1,
+        "text_budget": list_width - 3,          # pointer + marker + scrollbar column
+        "pborder_left": pborder_left, "pborder_right": pborder_left + pwidth - 1,
+        "ptext_left": pborder_left + 2, "ptext_width": pwidth - 4,
+        "list_top": margin, "list_height": height,
+    }
+
+
 def test_column_layout(fzf, border, position, rows=24, cols=97, pct=35):
-    """The core invariant this checker exists for: results end where the
-    separator begins, and the separator sits immediately before/after the
-    preview pane, for every combination of --border and preview-window
-    left/right. No gap (dead, never-cleared columns) and no overshoot past
-    the border. This is what caught the divergent-formula bug between
-    calculate_preview_position() and repaint() (results/separator agreed,
-    preview pane started up to 3 columns further right, and could overshoot
-    past the border's right edge)."""
+    """The core invariant this checker exists for: the list, the scrollbar
+    column and the preview window tile the area exactly the way fzf lays
+    them out (fzf: resizeWindows): the preview's rounded border sits at the
+    computed columns, the preview text starts two columns inside it, the
+    list's last column holds the scrollbar, and nothing overlaps."""
     args = ["--height=100%", f"--preview-window={position},{pct}%",
             "--preview=echo PREVIEWMARK; seq 1 5"]
     if border:
@@ -404,27 +432,18 @@ def test_column_layout(fzf, border, position, rows=24, cols=97, pct=35):
     items = [f"item{i}" for i in range(40)]
     text = run_fzf(fzf, args, rows, cols, items,
                     drain_s=2.0, nudge=b"\x1bOB", nudge_drain_s=1.5)
-
-    margin = 1 if border else 0
-    content_cols = cols - 2 * margin
-    preview_cols = (content_cols * pct) // 100
-    results_width = content_cols - preview_cols - 1
-    if results_width < 1:
-        results_width = 1
-    sep_col_rel = preview_cols if position == "left" else results_width
-    sep_col_abs = margin + sep_col_rel + 1  # 1-indexed
-
+    g = fzf_geometry(rows, cols, pct, border, position)
     label = f"border={border} pos={position} {rows}x{cols}"
 
-    # The outer --border box also uses '│' for its own left/right edges (col
-    # 1 and `cols`) -- exclude those, we only care about the INTERNAL
-    # results/preview separator.
-    sep_positions = re.findall(r"\x1b\[(\d+);(\d+)H(?:\x1b\[0?m)?│", text)
-    sep_cols_seen = sorted(set(int(c) for _, c in sep_positions
-                               if int(c) not in (1, cols)))
-    check(f"layout/separator-column [{label}]",
-          sep_cols_seen == [sep_col_abs],
-          f"expected separator only at col {sep_col_abs}, saw {sep_cols_seen}")
+    # Vertical bars (preview border sides, list scrollbar, outer border)
+    # by 1-based column.
+    bar_cols = sorted(set(int(c) for _, c in
+                          re.findall(r"\x1b\[(\d+);(\d+)H(?:\x1b\[[0-9;]*m)?│", text)))
+    expected = {g["pborder_left"] + 1, g["pborder_right"] + 1, g["scrollbar_col"] + 1}
+    if border:
+        expected |= {1, cols}
+    check(f"layout/vertical-bars [{label}]", set(bar_cols) == expected,
+          f"expected │ only at columns {sorted(expected)}, saw {bar_cols}")
 
     idx = text.find("PREVIEWMARK")
     check(f"layout/preview-found [{label}]", idx >= 0,
@@ -433,27 +452,36 @@ def test_column_layout(fzf, border, position, rows=24, cols=97, pct=35):
         pre = text[:idx]
         m = re.findall(r"\x1b\[(\d+);(\d+)H", pre)
         preview_col = int(m[-1][1]) if m else None
-        expected_preview_col = margin + 1 if position == "left" \
-            else sep_col_abs + 1
         check(f"layout/preview-start-col [{label}]",
-              preview_col == expected_preview_col,
-              f"expected preview text at col {expected_preview_col}, "
-              f"got {preview_col}")
+              preview_col == g["ptext_left"] + 1,
+              f"expected preview text at col {g['ptext_left'] + 1}, got {preview_col}")
 
-    # No overshoot: preview's right edge must not pass the border's right col.
-    border_right_col = cols - margin
-    preview_left_0idx = margin if position == "left" else margin + sep_col_rel + 1
-    preview_right_edge = preview_left_0idx + preview_cols
-    check(f"layout/no-overshoot [{label}]",
-          preview_right_edge <= border_right_col,
-          f"preview pane right edge at col {preview_right_edge} exceeds "
-          f"border's right column {border_right_col}")
+    # No overlap: the list's right edge (scrollbar column) is left of the
+    # preview border (right) or the preview border is left of the list
+    # (left), with fzf's one-column gap on the left.
+    if position == "right":
+        ok = g["scrollbar_col"] < g["pborder_left"]
+    else:
+        ok = g["pborder_right"] + 1 < g["list_left"]
+    check(f"layout/no-overlap [{label}]", ok,
+          f"list columns [{g['list_left']}, {g['scrollbar_col']}] vs preview "
+          f"border [{g['pborder_left']}, {g['pborder_right']}]")
 
-    # No dead gap: results_width + 1 (sep) + preview_cols must equal content_cols.
-    check(f"layout/no-gap [{label}]",
-          results_width + 1 + preview_cols == content_cols,
-          f"results_width({results_width}) + 1 + preview_cols({preview_cols}) "
-          f"!= content_cols({content_cols})")
+    # Every list row's text stays within its budget (pointer + marker + text
+    # < scrollbar column).
+    rows_list = last_frame_rows(text.encode(), rows, cols)
+    too_wide = []
+    for r in rows_list:
+        if "item" not in r:
+            continue
+        padded = r.ljust(cols)
+        # pointer + marker + text must stop before the scrollbar column,
+        # which holds the bar or a space (an overflowing row would put a
+        # character of the item there)
+        if padded[g["scrollbar_col"]] not in " │":
+            too_wide.append(r)
+    check(f"layout/rows-within-list [{label}]", not too_wide,
+          f"list rows wider than the list window: {too_wide[:2]!r}")
 
 
 def test_results_row_clip(fzf, rows=24, cols=80):
@@ -466,9 +494,8 @@ def test_results_row_clip(fzf, rows=24, cols=80):
     text = run_fzf(fzf, ["--height=100%", "--preview-window=right,35%",
                           "--preview=echo x"], rows, cols, items)
 
-    content_cols = cols
-    preview_cols = (content_cols * 35) // 100
-    results_width = content_cols - preview_cols - 1
+    g = fzf_geometry(rows, cols, 35, False, "right")
+    results_width = g["list_width"]
 
     # Anchor on the wide title itself (its first few codepoints are enough to
     # find it uniquely), then walk BACK to the cursor move that started its
@@ -492,7 +519,7 @@ def test_results_row_clip(fzf, rows=24, cols=80):
     if m:
         row_content = strip_sgr(m.group(3))
         w = visible_width(row_content)
-        check("clip/wide-row-width", w <= results_width,
+        check("clip/wide-row-width", w <= results_width - 1,
               f"row rendered {w} display columns, budget is {results_width} "
               f"-- a wide-char row exceeding its pane can auto-wrap the "
               f"terminal and push the whole list down")
@@ -516,10 +543,9 @@ def test_legacy_emoji_width(fzf, rows=33, cols=97):
                           "--preview=echo x"], rows, cols, items,
                     drain_s=1.2)
 
-    content_cols = cols
-    preview_cols = (content_cols * 50) // 100
-    results_width = content_cols - preview_cols - 1
-    sep_col_abs = results_width + 1
+    g = fzf_geometry(rows, cols, 50, False, "right")
+    results_width = g["list_width"]
+    sep_col_abs = g["pborder_left"] + 1
 
     anchor = "MANATO"
     aidx = text.find(anchor)
@@ -545,17 +571,18 @@ def test_legacy_emoji_width(fzf, rows=33, cols=97):
 
     row_content = strip_sgr(m.group(3))
     w = visible_width(row_content)
-    check("clip/legacy-emoji-row-width", w <= results_width,
+    check("clip/legacy-emoji-row-width", w <= results_width - 1,
           f"row measured {w} display columns, budget is {results_width} -- "
           f"a legacy-block emoji (e.g. star U+2B50) is under-measured if "
           f"this fails, letting the row spill past its pane")
 
-    sep_positions = re.findall(r"\x1b\[(\d+);(\d+)H(?:\x1b\[0?m)?│", text)
+    sep_positions = re.findall(r"\x1b\[(\d+);(\d+)H(?:\x1b\[[0-9;]*m)?│", text)
     sep_cols_seen = sorted(set(int(c) for _, c in sep_positions
                                if int(c) not in (1, cols)))
-    check("clip/legacy-emoji-separator-column", sep_cols_seen == [sep_col_abs],
-          f"expected the separator only at col {sep_col_abs} even on the "
-          f"star-emoji row, saw {sep_cols_seen}")
+    check("clip/legacy-emoji-separator-column", sep_col_abs in sep_cols_seen
+          and all(c <= sep_col_abs for c in sep_cols_seen),
+          f"expected the preview border at col {sep_col_abs} and no bar past "
+          f"it on the star-emoji row, saw {sep_cols_seen}")
 
 
 def test_zwj_and_skintone_emoji_width(fzf, rows=37, cols=106):
@@ -578,10 +605,9 @@ def test_zwj_and_skintone_emoji_width(fzf, rows=37, cols=106):
                           "--preview=echo x"], rows, cols, items,
                     drain_s=1.5)
 
-    content_cols = cols
-    preview_cols = (content_cols * 50) // 100
-    results_width = content_cols - preview_cols - 1
-    sep_col_abs = results_width + 1
+    g = fzf_geometry(rows, cols, 50, False, "right")
+    results_width = g["list_width"]
+    sep_col_abs = g["pborder_left"] + 1
 
     anchor = "Perfect"
     aidx = text.find(anchor)
@@ -615,18 +641,19 @@ def test_zwj_and_skintone_emoji_width(fzf, rows=37, cols=106):
     # row with wasted blank columns instead of overlapping the separator;
     # an UNDER-counting bug (the ⭐ class from test_legacy_emoji_width)
     # clips too LATE. Asserting equality catches both directions.
-    check("clip/zwj-row-width", w == results_width,
+    check("clip/zwj-row-width", w == results_width - 1,
           f"row measured {w} display columns, budget is {results_width} -- "
           f"a skin-tone modifier or ZWJ sequence is being summed instead of "
           f"collapsed to one cluster's width (row under-fills, wasting "
           f"columns) or a wide char is under-measured (row overflows)")
 
-    sep_positions = re.findall(r"\x1b\[(\d+);(\d+)H(?:\x1b\[0?m)?│", text)
+    sep_positions = re.findall(r"\x1b\[(\d+);(\d+)H(?:\x1b\[[0-9;]*m)?│", text)
     sep_cols_seen = sorted(set(int(c) for _, c in sep_positions
                                if int(c) not in (1, cols)))
-    check("clip/zwj-separator-column", sep_cols_seen == [sep_col_abs],
-          f"expected the separator only at col {sep_col_abs} even on the "
-          f"ZWJ/skin-tone-emoji row, saw {sep_cols_seen}")
+    check("clip/zwj-separator-column", sep_col_abs in sep_cols_seen
+          and all(c <= sep_col_abs for c in sep_cols_seen),
+          f"expected the preview border at col {sep_col_abs} and no bar past "
+          f"it on the ZWJ/skin-tone-emoji row, saw {sep_cols_seen}")
 
 
 def test_preview_line_overlong_clip(fzf, rows=24, cols=80):
@@ -642,7 +669,7 @@ def test_preview_line_overlong_clip(fzf, rows=24, cols=80):
                     rows, cols, [f"item{i}" for i in range(10)],
                     drain_s=2.0, nudge=b"\x1bOB", nudge_drain_s=1.0)
 
-    preview_cols = (cols * 35) // 100
+    preview_cols = fzf_geometry(rows, cols, 35, False, "right")["ptext_width"]
     # Find the emitted preview row and measure it.
     idx = text.find("X" * 20)
     check("clip/overlong-preview-found", idx >= 0,
@@ -1016,8 +1043,7 @@ def test_layout_reverse_prompt_on_top(fzf):
     ok = bool(rows_list) and rows_list[0].startswith(">")
     check("layout/reverse-prompt-on-top", ok,
           f"row 0 was {rows_list[0]!r} (expected it to start with '>') "
-          f"-- with --reverse the prompt is the FIRST row",
-          xfail="T2.2")
+          f"-- with --reverse the prompt is the FIRST row")
 
 
 def test_layout_default_prompt_at_bottom(fzf):
@@ -1026,14 +1052,64 @@ def test_layout_default_prompt_at_bottom(fzf):
     rows_list = last_frame_rows(screen, 10, 40)
     prompt_idx = next((i for i, r in enumerate(rows_list)
                         if r.startswith(">")), None)
-    ok = prompt_idx is not None and prompt_idx > 0 and \
-        "one" in rows_list[prompt_idx - 1]
-    row_above = rows_list[prompt_idx - 1] if prompt_idx else None
+    # fzf: prompt on the last row, the info line ("3/3 ────") above it, and
+    # the first item right above the info line.
+    ok = prompt_idx == 9 and "3/3" in rows_list[8] and \
+        rows_list[7].endswith("one") and rows_list[6].endswith("two")
     check("layout/default-prompt-at-bottom-first-item-above", ok,
-          f"prompt row index={prompt_idx}, row above it={row_above!r} -- "
-          f"expected the default (non-reverse) layout to put the prompt "
-          f"at the bottom with the first item directly above it",
-          xfail="T2.2")
+          f"rows={rows_list!r} -- expected the prompt on the last row, the "
+          f"info line above it and 'one' above that (list grows upwards)")
+
+
+def test_layout_reverse_list(fzf):
+    _out, screen, _code = run_interactive(
+        fzf, ["--layout=reverse-list", "--header", "HDR"], b"one\ntwo\n",
+        [(0.3, ENTER)], rows=8, cols=40)
+    rows_list = last_frame_rows(screen, 8, 40)
+    ok = rows_list[0].endswith("one") and rows_list[1].endswith("two") and \
+        "HDR" in rows_list[5] and "2/2" in rows_list[6] and rows_list[7].startswith(">")
+    check("layout/reverse-list", ok,
+          f"rows={rows_list!r} -- expected items from the top, then the "
+          f"header, the info line and the prompt at the bottom")
+
+
+def test_layout_header_placement(fzf):
+    # Default layout: --header lines sit between the list and the info
+    # line; --header-first puts them below the prompt.
+    _out, screen, _code = run_interactive(
+        fzf, ["--header", "H1\nH2"], b"one\n", [(0.3, ENTER)], rows=8, cols=40)
+    rows_list = last_frame_rows(screen, 8, 40)
+    ok = rows_list[7].startswith(">") and "1/1" in rows_list[6] and \
+        "H2" in rows_list[5] and "H1" in rows_list[4] and rows_list[3].endswith("one")
+    check("layout/header-between-list-and-info", ok, f"rows={rows_list!r}")
+    _out, screen, _code = run_interactive(
+        fzf, ["--header", "H1", "--header-first"], b"one\n", [(0.3, ENTER)], rows=8, cols=40)
+    rows_list = last_frame_rows(screen, 8, 40)
+    ok = "H1" in rows_list[7] and rows_list[6].startswith(">") and "1/1" in rows_list[5]
+    check("layout/header-first-below-prompt", ok, f"rows={rows_list!r}")
+
+
+def test_pointer_and_marker(fzf):
+    _out, screen, _code = run_interactive(
+        fzf, ["-m", "--reverse", "--pointer", "=>", "--marker", "*"], b"one\ntwo\n",
+        [(0.3, TAB), (0.3, ENTER)], rows=8, cols=40)
+    rows_list = last_frame_rows(screen, 8, 40)
+    # After Tab: 'one' is marked (*), the cursor moved to 'two' (=>).
+    check("layout/pointer-and-marker",
+          any(r.startswith("  *one") for r in rows_list) and any(r.startswith("=> two") for r in rows_list),
+          f"rows={rows_list!r} -- expected '  *one' and '=> two'")
+
+
+def test_border_styles(fzf):
+    for style, corners in (("rounded", "╭╮╰╯"), ("sharp", "┌┐└┘"), ("double", "╔╗╚╝")):
+        _out, screen, _code = run_interactive(
+            fzf, [f"--border={style}", "--border-label", " LBL "], b"one\n",
+            [(0.3, ENTER)], rows=8, cols=30)
+        rows_list = last_frame_rows(screen, 8, 30)
+        ok = rows_list[0].startswith(corners[0]) and rows_list[0].endswith(corners[1]) and \
+            rows_list[7].startswith(corners[2]) and rows_list[7].endswith(corners[3]) and \
+            "LBL" in rows_list[0] and rows_list[6][1:4] == " > "
+        check(f"layout/border-{style}", ok, f"rows={rows_list!r}")
 
 
 def test_height_inline_no_alt_screen(fzf):
@@ -1159,6 +1235,10 @@ def run_t1_11_scenarios(fzf):
     test_reload_does_not_block_on_streaming_stdin(fzf)
     test_layout_reverse_prompt_on_top(fzf)
     test_layout_default_prompt_at_bottom(fzf)
+    test_layout_reverse_list(fzf)
+    test_layout_header_placement(fzf)
+    test_pointer_and_marker(fzf)
+    test_border_styles(fzf)
     test_height_inline_no_alt_screen(fzf)
     test_ansi_colors_rendered(fzf)
     test_hscroll_match_kept_visible(fzf)

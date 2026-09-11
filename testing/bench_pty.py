@@ -84,7 +84,9 @@ def set_winsize(fd, rows, cols):
 # because the digits immediately follow the "H" of the escape sequence,
 # which is a word character, so \b never falls between them). Match the
 # digits directly off the escape sequence instead.
-COUNT_RE = re.compile(rb"\x1b\[1;1H(?:\x1b\[[0-9;]*m)*\s*(\d+)")
+# With --reverse the prompt is row 1 and the info line row 2: "[spinner] N/M"
+# with SGR sequences between the parts (fzf's printInfo layout).
+COUNT_RE = re.compile(rb"\x1b\[[12];1H(?:\x1b\[[0-9;]*m|\s|\xe2\xa0\x8b)*(\d+)/\d+")
 
 
 def last_count(buf):

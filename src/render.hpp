@@ -1,24 +1,29 @@
 #pragma once
 
+#include "options.hpp"
+
+#include <cstdint>
 #include <string>
 #include <vector>
 
 namespace fzf {
 
-// Foreground/background color a styled span can carry. Mirrors the small
-// subset of SGR color space fzf's own chrome (match highlighting, cursor
-// row, header) actually uses — this is NOT a general ANSI parser (that job
-// moved to raw passthrough for preview content, see write_raw_passthrough).
-enum class Color {
-    Default,
-    Black, Red, Green, Yellow, Blue, Magenta, Cyan, White,
+// One style a span can carry: fzf's ColorPair. Colors use the encoding of
+// options.hpp (kColorDefault, 0-255, or (1<<24)|RGB); attributes the kAttr*
+// bits (bold, dim, italic, underline, reverse, strikethrough).
+struct Style {
+    int32_t fg = -1;
+    int32_t bg = -1;
+    uint32_t attr = 0;
 };
 
-struct Style {
-    Color fg = Color::Default;
-    bool bold = false;
-    bool inverted = false;
-};
+inline Style style_of(const ColorAttr& fg, const ColorAttr& bg) {
+    Style s;
+    s.fg = fg.color == kColorUndefined ? kColorDefault : fg.color;
+    s.bg = bg.color == kColorUndefined ? kColorDefault : bg.color;
+    s.attr = fg.attr;
+    return s;
+}
 
 // One piece of styled text within a row, e.g. one match-highlighted run.
 struct Span {
@@ -61,21 +66,14 @@ public:
     // Convenience for a single-style full-width row.
     void draw_text(int row, int col, const std::string& text, Style style = {}, int max_cols = 0);
 
-    // Draws a horizontal line of box-drawing characters at `row`. By default
-    // (col_start/width both 0) spans the full terminal width from column 0
-    // and finishes with EL (erase-to-end-of-line), matching the original
-    // behavior. Pass col_start/width to keep the separator confined inside
-    // --border verticals (e.g. col_start = 1, width = cols - 2): in that case
-    // EL is skipped, since it would erase the border's right-hand bar sitting
-    // just past the bounded span.
-    void draw_separator(int row, int col_start = 0, int width = 0);
+    // Draws `width` copies of `glyph` (one UTF-8 character) at (row, col).
+    void draw_hline(int row, int col, int width, const std::string& glyph, Style style = {});
 
-    // Draws a single-line box border around the full frame (rows/cols given
-    // to the constructor). Must be called after all interior content is
-    // drawn, since callers are expected to have reserved a 1-cell margin on
-    // all sides when border is enabled (matching the existing
-    // calculate_preview_position/layout math in terminal.cpp).
-    void draw_border();
+    // Draws the edges of `shape` (fzf: BorderStyle) on the rectangle
+    // (top, left, width, height): only the sides the shape has. `unicode`
+    // selects box-drawing glyphs over ASCII.
+    void draw_box(int top, int left, int width, int height, BorderShape shape, bool unicode,
+                  Style style = {});
 
     // Clears the region [row, row+height) x [col, col+width) — used before
     // repainting the preview pane at a new size, so a smaller image doesn't

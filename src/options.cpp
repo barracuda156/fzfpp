@@ -26,7 +26,7 @@ namespace fzf {
 namespace {
 
 constexpr const char* kCompatVersion = "0.74";
-constexpr const char* kPortVersion = "0.3.1";
+constexpr const char* kPortVersion = "0.4.0";
 constexpr int kMaxMulti = INT_MAX;
 constexpr const char* kDefaultInfoPrefix = " < ";
 constexpr BorderShape kDefaultBorderShape = BorderShape::Rounded;

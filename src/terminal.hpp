@@ -18,6 +18,7 @@
 #include "preview.hpp"
 #include "reader.hpp"
 #include "search.hpp"
+#include "theme.hpp"
 #include "tty.hpp"
 
 #include <chrono>
@@ -38,20 +39,42 @@ struct RunResult {
     std::vector<std::string> lines;   // everything to print, in order, one per printsep
 };
 
-// Rectangles of the current frame (0-based rows/cols), used by the painter
-// and by mouse hit-testing.
+// Rectangles of the current frame (0-based rows/cols), computed like fzf's
+// resizeWindows: screen -> margin -> border -> padding -> list window, with
+// the preview window carved out of one side. Used by the painter and by
+// mouse hit-testing.
+struct Rect {
+    int top = 0, left = 0, width = 0, height = 0;
+    bool contains(int y, int x) const {
+        return y >= top && y < top + height && x >= left && x < left + width;
+    }
+    int bottom() const { return top + height; }
+    int right() const { return left + width; }
+};
+
 struct Layout {
-    int rows = 0, cols = 0;
-    int margin = 0;                 // 1 with --border
-    int content_col = 0, content_cols = 0;
-    int info_row = -1;
-    int header_row = -1, header_rows = 0;
-    int list_top = 0, list_rows = 0, list_col = 0, list_width = 0;
-    int prompt_row = 0;
+    int rows = 0, cols = 0;                    // screen (or the --height area)
+    int area_lines = 0, area_columns = 0;      // fzf: t.areaLines / t.areaColumns
+    BorderShape border_shape = BorderShape::None;
+    Rect border;                               // outer border window (when visible)
+    Rect window;                               // list window: prompt, info, header, items
     bool preview = false;
-    int preview_top = 0, preview_left = 0, preview_lines = 0, preview_cols = 0;
-    int vsep_col = -1;              // vertical separator column (left/right preview)
-    int hsep_row = -1;              // horizontal separator row (up/down preview)
+    BorderShape preview_shape = BorderShape::None;
+    Rect pborder;                              // preview border window
+    Rect pwindow;                              // preview text window
+    int prompt_lines = 0;                      // 0 (--no-input), 1, or 2 with the info line
+    int header_lines = 0;                      // visible header rows
+    int list_rows = 0;                         // fzf: maxItems
+    int bar_col = 0;                           // 1 when the last column is kept for the scrollbar
+    // Screen rows of the sections (-1 when absent). Items: list line i
+    // (0 = first item on screen) is at items_top + i, or, in the default
+    // layout, items_top + list_rows - 1 - i (the list grows upwards).
+    int prompt_row = -1, info_row = -1;
+    int header_top = -1;
+    int items_top = 0;
+    bool items_bottom_up = false;
+    int item_row(int line) const { return items_bottom_up ? items_top + list_rows - 1 - line : items_top + line; }
+    int line_of_row(int row) const { return items_bottom_up ? items_top + list_rows - 1 - row : row - items_top; }
 };
 
 class Terminal {
@@ -240,6 +263,9 @@ private:
 
     // --- Rendering ---
     Layout layout_;
+    ColorScheme scheme_;
+    std::string pointer_empty_, marker_empty_, separator_, scrollbar_;
+    int pointer_len_ = 0, marker_len_ = 0;
     bool needs_repaint_ = true;
     bool preview_dirty_ = true;
     bool full_redraw_ = false;
@@ -248,8 +274,11 @@ private:
     void compute_layout();
     void repaint();
     void paint_preview(bool force);
+    // The header lines in display order (top-down), fzf's printHeaderImpl.
     std::vector<std::string> header_rows() const;
-    void render_info_text(std::string& out) const;
+    bool no_separator_line() const;
+    std::string info_text() const;
+    void place_cursor();
 
     // --- tty plumbing ---
     int tty_in_;

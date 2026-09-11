@@ -119,10 +119,11 @@ int32_t Terminal::current_index() const {
     return item ? static_cast<int32_t>(item.index()) : kMinItemIndex;
 }
 
-// fzf: vmove. Positive `o` moves towards the top of the screen. The list
-// is drawn top-down (item 0 first), so that is a decreasing cy.
+// fzf: vmove. Positive `o` moves towards the top of the screen: a higher
+// index in the default layout (the list grows upwards), a lower one in the
+// reverse layouts.
 bool Terminal::vmove(int o, bool allow_cycle) {
-    o = -o;
+    if (opts_.layout != LayoutType::Default) o = -o;
     int dest = cy_ + o;
     if (opts_.cycle && allow_cycle) {
         int max = list_count() - 1;
@@ -347,7 +348,7 @@ bool Terminal::do_action(const Action& a) {
             if (has_preview_window()) scroll_preview_to(0);
             break;
         case ActionType::PreviewBottom:
-            if (has_preview_window()) scroll_preview_to(static_cast<int>(preview_total_lines_) - layout_.preview_lines);
+            if (has_preview_window()) scroll_preview_to(static_cast<int>(preview_total_lines_) - layout_.pwindow.height);
             break;
         case ActionType::PreviewUp:
             if (has_preview_window()) scroll_preview_by(-1);
@@ -356,16 +357,16 @@ bool Terminal::do_action(const Action& a) {
             if (has_preview_window()) scroll_preview_by(1);
             break;
         case ActionType::PreviewPageUp:
-            if (has_preview_window()) scroll_preview_by(-layout_.preview_lines);
+            if (has_preview_window()) scroll_preview_by(-layout_.pwindow.height);
             break;
         case ActionType::PreviewPageDown:
-            if (has_preview_window()) scroll_preview_by(layout_.preview_lines);
+            if (has_preview_window()) scroll_preview_by(layout_.pwindow.height);
             break;
         case ActionType::PreviewHalfPageUp:
-            if (has_preview_window()) scroll_preview_by(-layout_.preview_lines / 2);
+            if (has_preview_window()) scroll_preview_by(-layout_.pwindow.height / 2);
             break;
         case ActionType::PreviewHalfPageDown:
-            if (has_preview_window()) scroll_preview_by(layout_.preview_lines / 2);
+            if (has_preview_window()) scroll_preview_by(layout_.pwindow.height / 2);
             break;
         case ActionType::BeginningOfLine:
             cx_ = 0;
@@ -670,19 +671,24 @@ bool Terminal::do_action(const Action& a) {
             if (a.type == ActionType::HalfPageUp || a.type == ActionType::HalfPageDown) lines = max_lines / 2;
             lines = std::max(1, lines);
             int direction = (a.type == ActionType::PageUp || a.type == ActionType::HalfPageUp) ? 1 : -1;
-            vmove(direction * lines, false);
+            // In non-default layouts, items are listed from top to bottom
+            if (opts_.layout != LayoutType::Default) direction = -direction;
+            vset(cy_ + direction * lines);
             needs_repaint_ = true;
             break;
         }
         case ActionType::OffsetUp: case ActionType::OffsetDown: {
-            // Scroll the list by one row, keeping the cursor on screen.
-            int diff = a.type == ActionType::OffsetUp ? -1 : 1;
+            // fzf: actOffsetUp/Down -- scroll by one row, moving the cursor
+            // only when the list cannot scroll further.
+            int diff = a.type == ActionType::OffsetDown ? -1 : 1;
+            if (opts_.layout != LayoutType::Default) diff = -diff;
             offset_ += diff;
             int before = offset_;
             constrain();
             if (before != offset_) {
                 offset_ = before;
-                vmove(-diff, false);
+                if (opts_.layout != LayoutType::Default) diff = -diff;
+                vmove(diff, false);
             }
             needs_repaint_ = true;
             break;

@@ -4,6 +4,7 @@
 #include "keyparser.hpp"
 #include "render.hpp"
 #include "shellcmd.hpp"
+#include "theme.hpp"
 #include "util.hpp"
 
 #include <algorithm>
@@ -102,6 +103,25 @@ Terminal::Terminal(Options& opts, ItemBuilder& builder, Reader& reader, int tty_
     ghost_ = opts.ghost;
     pointer_ = opts.pointer.value_or(">");
     prefetch_n_ = opts.preview_prefetch;
+    scheme_ = materialize_theme(opts);
+    // fzf: NewTerminal -- glyph defaults follow --unicode
+    pointer_len_ = static_cast<int>(visible_width(pointer_));
+    marker_len_ = static_cast<int>(visible_width(opts.marker.value_or(">")));
+    pointer_empty_ = std::string(static_cast<size_t>(pointer_len_), ' ');
+    marker_empty_ = std::string(static_cast<size_t>(marker_len_), ' ');
+    if (opts.separator) separator_ = *opts.separator;
+    else separator_ = opts.unicode ? "\xE2\x94\x80" : "-";
+    if (opts.scrollbar) {
+        scrollbar_ = *opts.scrollbar;
+        // Only the first character is used for the list (the second is the
+        // preview scrollbar).
+        if (!scrollbar_.empty()) {
+            size_t n = utf8_char_length(scrollbar_[0]);
+            scrollbar_ = scrollbar_.substr(0, n);
+        }
+    } else {
+        scrollbar_ = opts.unicode ? "\xE2\x94\x82" : "|";
+    }
     input_ = to_utf32(opts.query);
     cx_ = input_.size();
     display_list_ = reader.list();
@@ -356,8 +376,8 @@ std::vector<std::string> Terminal::environ(bool for_preview) {
     add("FZF_TOTAL_COUNT", std::to_string(display_list_ ? display_list_->count() : 0));
     add("FZF_MATCH_COUNT", std::to_string(merger_->size()));
     add("FZF_SELECT_COUNT", std::to_string(selected_.size()));
-    add("FZF_LINES", std::to_string(term_rows_));
-    add("FZF_COLUMNS", std::to_string(term_cols_));
+    add("FZF_LINES", std::to_string(layout_.area_lines));
+    add("FZF_COLUMNS", std::to_string(layout_.area_columns));
     add("FZF_POS", std::to_string(std::min(list_count(), cy_ + 1)));
     if (ItemRef item = current_item()) {
         // Skip if the value contains a NUL byte (exec(2) would reject the
@@ -369,17 +389,17 @@ std::vector<std::string> Terminal::environ(bool for_preview) {
     add("FZF_CLICK_HEADER_COLUMN", std::to_string(click_header_column_));
     add("FZF_CLICK_FOOTER_LINE", "0");
     add("FZF_CLICK_FOOTER_COLUMN", "0");
-    if (layout_.preview && layout_.preview_lines > 0) {
-        std::string lines = std::to_string(layout_.preview_lines);
-        std::string columns = std::to_string(layout_.preview_cols);
+    if (layout_.preview && layout_.pwindow.height > 0) {
+        std::string lines = std::to_string(layout_.pwindow.height);
+        std::string columns = std::to_string(layout_.pwindow.width);
         if (for_preview) {
             add("LINES", lines);
             add("COLUMNS", columns);
         }
         add("FZF_PREVIEW_LINES", lines);
         add("FZF_PREVIEW_COLUMNS", columns);
-        add("FZF_PREVIEW_TOP", std::to_string(layout_.preview_top));
-        add("FZF_PREVIEW_LEFT", std::to_string(layout_.preview_left));
+        add("FZF_PREVIEW_TOP", std::to_string(layout_.pwindow.top));
+        add("FZF_PREVIEW_LEFT", std::to_string(layout_.pwindow.left));
     }
     return env;
 }
@@ -530,7 +550,7 @@ int Terminal::evaluate_scroll_offset() {
         if ((c >= '0' && c <= '9') || c == '/' || c == '+' || c == '-') expr += c;
     }
     int base = -1;
-    int height = std::max(0, layout_.preview_lines - preview_opts_.header_lines);
+    int height = std::max(0, layout_.pwindow.height - preview_opts_.header_lines);
     // Components: ([+-][0-9]+) | (-?/[1-9][0-9]*)
     size_t i = 0;
     while (i < expr.size()) {
@@ -650,107 +670,273 @@ void Terminal::scroll_preview_by(int amount) { scroll_preview_to(preview_offset_
 // Layout and rendering
 // ---------------------------------------------------------------------------
 
+// fzf: printHeaderImpl -- --header lines and --header-lines records in the
+// order they appear on screen (top-down). In the default and reverse-list
+// layouts the block is drawn bottom-up, so the records come first in
+// reverse order, then the --header lines in their natural order.
 std::vector<std::string> Terminal::header_rows() const {
     std::vector<std::string> rows;
     if (!header_visible_) return rows;
-    for (const auto& line : header0_) rows.push_back(strip_ansi_codes(line));
-    for (const auto& line : input_header_) rows.push_back(strip_ansi_codes(line));
+    if (opts_.layout == LayoutType::Reverse) {
+        for (const auto& line : header0_) rows.push_back(strip_ansi_codes(line));
+        for (const auto& line : input_header_) rows.push_back(strip_ansi_codes(line));
+    } else {
+        for (auto it = input_header_.rbegin(); it != input_header_.rend(); ++it) rows.push_back(strip_ansi_codes(*it));
+        for (const auto& line : header0_) rows.push_back(strip_ansi_codes(line));
+    }
     return rows;
 }
 
+// fzf: noSeparatorLine
+bool Terminal::no_separator_line() const {
+    if (inputless_) return true;
+    bool separator = !separator_.empty();
+    switch (opts_.info_style) {
+        case InfoStyle::Inline: return true;
+        case InfoStyle::Hidden: case InfoStyle::InlineRight: return !separator;
+        default: return false;
+    }
+}
+
+namespace {
+
+// fzf: calculateSize
+int calculate_size(int base, const SizeSpec& size, int occupied, int min_size) {
+    int max = base - occupied;
+    if (max < min_size) max = min_size;
+    if (size.percent) return std::clamp(static_cast<int>(base * 0.01 * size.size), min_size, max);
+    return std::clamp(static_cast<int>(size.size) + min_size - 1, min_size, max);
+}
+
+int border_lines(BorderShape s) { return (border_has_top(s) ? 1 : 0) + (border_has_bottom(s) ? 1 : 0); }
+int border_columns(BorderShape s, int bw) {
+    return (border_has_left(s) ? 1 + bw : 0) + (border_has_right(s) ? 1 + bw : 0);
+}
+
+// fzf: previewOpts.Border(layout) -- "line" resolves to the side facing
+// the list.
+BorderShape preview_border_shape(const PreviewOpts& p) {
+    if (p.border != BorderShape::Line) return p.border == BorderShape::Undefined ? BorderShape::Rounded : p.border;
+    switch (p.position) {
+        case WindowPosition::Up: return BorderShape::Bottom;
+        case WindowPosition::Down: return BorderShape::Top;
+        case WindowPosition::Left: return BorderShape::Right;
+        default: return BorderShape::Left;
+    }
+}
+
+} // namespace
+
+// fzf: adjustMarginAndPadding + resizeWindows, reduced to the windows this
+// renderer has: the outer border, the list window and the preview.
 void Terminal::compute_layout() {
     Layout l;
     l.rows = term_rows_;
     l.cols = term_cols_;
-    bool border = opts_.border_shape != BorderShape::None && opts_.border_shape != BorderShape::Undefined;
-    l.margin = border ? 1 : 0;
-    l.content_col = l.margin;
-    l.content_cols = std::max(1, term_cols_ - 2 * l.margin);
-
-    int row = l.margin;
-    bool info_hidden = opts_.info_style == InfoStyle::Hidden;
-    l.header_rows = static_cast<int>(header_rows().size());
-    if (!opts_.header_first) {
-        if (!info_hidden) l.info_row = row++;
-        l.header_row = row;
-        row += l.header_rows;
-    } else {
-        l.header_row = row;
-        row += l.header_rows;
-        if (!info_hidden) l.info_row = row++;
-    }
-    int top_sep_row = row++;
-    (void)top_sep_row;
-    l.list_top = row;
-
-    // Rows available for the list band: whatever --height asks for, capped
-    // at what the terminal leaves after the chrome.
-    int overhead = (info_hidden ? 0 : 1) + l.header_rows + 1 + 1 + 1;   // info + header + sep + sep + prompt
-    if (border) overhead += 2;
-    int max_band = std::max(1, term_rows_ - overhead);
-    int band = max_band;
+    // Until inline height lands (T2.3) the --height area is the top of the
+    // alternate screen.
     if (opts_.height.is_set() && opts_.height.size > 0) {
-        int height_rows = opts_.height.percent
-            ? (term_rows_ * static_cast<int>(opts_.height.size)) / 100
-            : static_cast<int>(opts_.height.size);
-        band = std::clamp(height_rows - overhead, 1, max_band);
+        int h = opts_.height.percent ? (term_rows_ * static_cast<int>(opts_.height.size)) / 100
+                                     : static_cast<int>(opts_.height.size);
+        l.rows = std::clamp(h, 1, term_rows_);
+    }
+    const int screen_w = l.cols, screen_h = l.rows;
+    const int bw = 1;
+    BorderShape shape = border_visible(opts_.border_shape) ? opts_.border_shape : BorderShape::None;
+    l.border_shape = shape;
+
+    auto spec_to_int = [&](int idx, const SizeSpec& spec) {
+        if (spec.percent) {
+            double max = idx % 2 == 0 ? screen_h : screen_w;
+            return static_cast<int>(max * spec.size * 0.01);
+        }
+        return static_cast<int>(spec.size);
+    };
+    int margin[4], padding[4], extra[4] = {0, 0, 0, 0};   // TRBL
+    for (int i = 0; i < 4; ++i) padding[i] = spec_to_int(i, opts_.padding[i]);
+    for (int i = 0; i < 4; ++i) {
+        switch (shape) {
+            case BorderShape::Horizontal: extra[i] += 1 - i % 2; break;
+            case BorderShape::Vertical: extra[i] += (1 + bw) * (i % 2); break;
+            case BorderShape::Top: if (i == 0) extra[i]++; break;
+            case BorderShape::Right: if (i == 1) extra[i] += 1 + bw; break;
+            case BorderShape::Bottom: if (i == 2) extra[i]++; break;
+            case BorderShape::Left: if (i == 3) extra[i] += 1 + bw; break;
+            case BorderShape::Rounded: case BorderShape::Sharp: case BorderShape::Bold: case BorderShape::Block:
+            case BorderShape::ThinBlock: case BorderShape::Double: case BorderShape::Dashed:
+                extra[i] += 1 + bw * (i % 2); break;
+            default: break;
+        }
+        margin[i] = spec_to_int(i, opts_.margin[i]) + extra[i];
     }
 
-    l.list_col = l.content_col;
-    l.list_width = l.content_cols;
-    l.list_rows = band;
+    l.prompt_lines = inputless_ ? 0 : (no_separator_line() ? 1 : 2);
     l.preview = has_preview_window();
+    BorderShape pshape = l.preview ? preview_border_shape(preview_opts_) : BorderShape::None;
+    l.preview_shape = pshape;
+    int min_preview_w = 1 + border_columns(pshape, bw);
+    int min_preview_h = 1 + border_lines(pshape);
+    bool preview_horizontal = l.preview && (preview_opts_.position == WindowPosition::Left ||
+                                            preview_opts_.position == WindowPosition::Right);
+    if (preview_horizontal && !scrollbar_.empty() && !border_has_right(pshape)) min_preview_w++;
+
+    int min_area_w = 4, min_area_h = 3;
+    if (inputless_) min_area_h--;
+    if (no_separator_line()) min_area_h--;
     if (l.preview) {
-        WindowPosition pos = preview_opts_.position;
-        if (pos == WindowPosition::Up || pos == WindowPosition::Down) {
-            int lines = preview_opts_.size.percent
-                ? (band * static_cast<int>(preview_opts_.size.size)) / 100
-                : static_cast<int>(preview_opts_.size.size);
-            lines = std::clamp(lines, 1, std::max(1, band - 2));
-            l.preview_cols = l.content_cols;
-            l.preview_left = l.content_col;
-            l.preview_lines = lines;
-            l.list_rows = std::max(1, band - lines - 1);
-            if (pos == WindowPosition::Up) {
-                l.preview_top = l.list_top;
-                l.hsep_row = l.list_top + lines;
-                l.list_top = l.hsep_row + 1;
-            } else {
-                l.hsep_row = l.list_top + l.list_rows;
-                l.preview_top = l.hsep_row + 1;
-            }
+        if (preview_horizontal) {
+            min_area_w += min_preview_w;
+            min_area_h = std::max(min_preview_h, min_area_h);
         } else {
-            int preview_width = preview_opts_.size.percent
-                ? (l.content_cols * static_cast<int>(preview_opts_.size.size)) / 100
-                : static_cast<int>(preview_opts_.size.size);
-            preview_width = std::clamp(preview_width, 1, std::max(1, l.content_cols - 2));
-            int results_width = std::max(1, l.content_cols - preview_width - 1);
-            l.preview_cols = preview_width;
-            l.preview_lines = band;
-            l.preview_top = l.list_top;
-            l.list_width = results_width;
-            if (pos == WindowPosition::Left) {
-                l.vsep_col = l.content_col + preview_width;
-                l.preview_left = l.content_col;
-                l.list_col = l.vsep_col + 1;
-            } else {
-                l.vsep_col = l.content_col + results_width;
-                l.preview_left = l.vsep_col + 1;
-            }
+            min_area_h += min_preview_h;
+            min_area_w = std::max(min_preview_w, min_area_w);
         }
     }
-    l.prompt_row = l.list_top + l.list_rows + 1;
-    if (l.hsep_row >= 0 && preview_opts_.position == WindowPosition::Down) {
-        l.prompt_row = l.preview_top + l.preview_lines + 1;
+    auto adjust = [&](int i1, int i2, int maximum, int minimum) {
+        if (minimum > maximum) minimum = maximum;
+        int m = margin[i1] + margin[i2] + padding[i1] + padding[i2];
+        if (m > 0 && maximum - m < minimum) {
+            int desired = maximum - minimum;
+            padding[i1] = desired * padding[i1] / m;
+            padding[i2] = desired * padding[i2] / m;
+            margin[i1] = std::max(extra[i1], desired * margin[i1] / m);
+            margin[i2] = std::max(extra[i2], desired * margin[i2] / m);
+        }
+    };
+    adjust(1, 3, screen_w, min_area_w);
+    adjust(0, 2, screen_h, min_area_h);
+
+    int width = screen_w - margin[1] - margin[3];
+    int height = screen_h - margin[0] - margin[2];
+    if (shape != BorderShape::None) {
+        l.border.top = margin[0] - (border_has_top(shape) ? 1 : 0);
+        l.border.left = margin[3] - (border_has_left(shape) ? 1 + bw : 0);
+        l.border.width = width + (border_has_left(shape) ? 1 + bw : 0) + (border_has_right(shape) ? 1 + bw : 0);
+        l.border.height = height + (border_has_top(shape) ? 1 : 0) + (border_has_bottom(shape) ? 1 : 0);
+    }
+    for (int i = 0; i < 4; ++i) margin[i] += padding[i];
+    width -= padding[1] + padding[3];
+    height -= padding[0] + padding[2];
+    width = std::max(width, 1);
+    height = std::max(height, 1);
+    l.area_lines = height;
+    l.area_columns = width;
+
+    int available = height - l.prompt_lines;
+    Rect window{margin[0], margin[3], width, height};
+    if (l.preview) {
+        switch (preview_opts_.position) {
+            case WindowPosition::Up: case WindowPosition::Down: {
+                int min_window_h = min_area_h - (preview_horizontal ? 0 : min_preview_h);
+                int ph = calculate_size(height, preview_opts_.size, min_window_h, min_preview_h);
+                ph = std::clamp(ph, min_preview_h, std::max(min_preview_h, available - 1));
+                if (preview_opts_.position == WindowPosition::Up) {
+                    window = Rect{margin[0] + ph, margin[3], width, height - ph};
+                    l.pborder = Rect{margin[0], margin[3], width, ph};
+                } else {
+                    window = Rect{margin[0], margin[3], width, height - ph};
+                    l.pborder = Rect{margin[0] + height - ph, margin[3], width, ph};
+                }
+                break;
+            }
+            case WindowPosition::Left: {
+                int pw = calculate_size(width, preview_opts_.size, 4, min_preview_w);
+                const int m = 1;   // a 1-column margin between the preview and the list
+                window = Rect{margin[0], margin[3] + pw + m, std::max(1, width - pw - m), height};
+                l.pborder = Rect{margin[0], margin[3], pw, height};
+                break;
+            }
+            default: {
+                int pw = calculate_size(width, preview_opts_.size, 4, min_preview_w);
+                window = Rect{margin[0], margin[3], std::max(1, width - pw), height};
+                l.pborder = Rect{margin[0], margin[3] + width - pw, pw, height};
+                break;
+            }
+        }
+        Rect pw = l.pborder;
+        if (border_has_left(pshape)) { pw.left += 1 + bw; }
+        if (border_has_top(pshape)) { pw.top += 1; }
+        pw.width -= border_columns(pshape, bw);
+        pw.height -= border_lines(pshape);
+        if (preview_horizontal && !scrollbar_.empty() && !border_has_right(pshape)) pw.width -= 1;
+        pw.width = std::max(pw.width, 0);
+        pw.height = std::max(pw.height, 0);
+        l.pwindow = pw;
+    }
+    l.window = window;
+    l.bar_col = (scrollbar_.empty() && !border_has_right(shape) &&
+                 !(l.preview && preview_opts_.position == WindowPosition::Right)) ? 0 : 1;
+
+    // Rows inside the list window (fzf: move() for each layout).
+    l.header_lines = static_cast<int>(header_rows().size());
+    int h = window.height;
+    l.list_rows = std::max(0, h - l.prompt_lines - l.header_lines);
+    int top = window.top;
+    switch (opts_.layout) {
+        case LayoutType::Reverse:
+            if (opts_.header_first) {
+                l.header_top = l.header_lines > 0 ? top : -1;
+                l.prompt_row = l.prompt_lines > 0 ? top + l.header_lines : -1;
+                l.info_row = l.prompt_lines > 1 ? l.prompt_row + 1 : -1;
+            } else {
+                l.prompt_row = l.prompt_lines > 0 ? top : -1;
+                l.info_row = l.prompt_lines > 1 ? top + 1 : -1;
+                l.header_top = l.header_lines > 0 ? top + l.prompt_lines : -1;
+            }
+            l.items_top = top + l.prompt_lines + l.header_lines;
+            l.items_bottom_up = false;
+            break;
+        case LayoutType::ReverseList:
+            l.items_top = top;
+            l.items_bottom_up = false;
+            if (opts_.header_first) {
+                l.info_row = l.prompt_lines > 1 ? top + l.list_rows : -1;
+                l.prompt_row = l.prompt_lines > 0 ? top + l.list_rows + (l.prompt_lines - 1) : -1;
+                l.header_top = l.header_lines > 0 ? top + l.list_rows + l.prompt_lines : -1;
+            } else {
+                l.header_top = l.header_lines > 0 ? top + l.list_rows : -1;
+                l.info_row = l.prompt_lines > 1 ? top + l.list_rows + l.header_lines : -1;
+                l.prompt_row = l.prompt_lines > 0 ? top + h - 1 : -1;
+            }
+            break;
+        default:
+            l.items_top = top;
+            l.items_bottom_up = true;
+            if (opts_.header_first) {
+                l.info_row = l.prompt_lines > 1 ? top + l.list_rows : -1;
+                l.prompt_row = l.prompt_lines > 0 ? top + l.list_rows + (l.prompt_lines - 1) : -1;
+                l.header_top = l.header_lines > 0 ? top + l.list_rows + l.prompt_lines : -1;
+            } else {
+                l.header_top = l.header_lines > 0 ? top + l.list_rows : -1;
+                l.info_row = l.prompt_lines > 1 ? top + h - 2 : -1;
+                l.prompt_row = l.prompt_lines > 0 ? top + h - 1 : -1;
+            }
+            break;
     }
     layout_ = l;
 }
 
-void Terminal::render_info_text(std::string& out) const {
-    out = "  " + std::to_string(merger_->size()) + "/" +
-          std::to_string(display_list_ ? display_list_->count() : 0);
-    if (!selected_.empty()) out += " (" + std::to_string(selected_.size()) + ")";
-    if (!failed_command_.empty()) out += " [Command failed: " + failed_command_ + "]";
+// fzf: printInfoImpl's text
+std::string Terminal::info_text() const {
+    int found = list_count();
+    int total = std::max<int>(found, display_list_ ? static_cast<int>(display_list_->count()) : 0);
+    std::string output = std::to_string(found) + "/" + std::to_string(total);
+    if (multi_ > 0) {
+        if (multi_ == 2147483647) output += " (" + std::to_string(selected_.size()) + ")";
+        else output += " (" + std::to_string(selected_.size()) + "/" + std::to_string(multi_) + ")";
+    }
+    if (opts_.toggle_sort) output += sort_ ? " +S" : " -S";
+    if (!failed_command_.empty() && total == 0) output = "[Command failed: " + failed_command_ + "]";
+    return output;
+}
+
+void Terminal::place_cursor() {
+    if (inputless_ || layout_.prompt_row < 0) return;
+    std::string before_cursor = to_utf8(input_.substr(0, cx_));
+    int x = static_cast<int>(visible_width(prompt_string_) + visible_width(before_cursor));
+    x = std::min(x, layout_.window.width - 1);
+    write_all(tty_out_, "\x1b[" + std::to_string(layout_.prompt_row + 1) + ";" +
+                            std::to_string(layout_.window.left + x + 1) + "H");
 }
 
 void Terminal::repaint() {
@@ -758,125 +944,224 @@ void Terminal::repaint() {
     compute_layout();
     constrain();
     const Layout& l = layout_;
-    FrameRenderer frame(l.rows, l.cols);
-    bool border = l.margin > 0;
+    const ColorScheme& t = scheme_;
+    FrameRenderer frame(term_rows_, term_cols_);
+    const bool unicode = opts_.unicode;
 
     if (full_redraw_) {
-        // Whatever ran in the foreground may have painted anywhere.
-        frame.clear_region(0, 0, l.rows, l.cols);
+        frame.clear_region(0, 0, term_rows_, term_cols_);
         full_redraw_ = false;
     }
 
-    if (l.info_row >= 0) {
-        std::string info;
-        render_info_text(info);
-        frame.draw_text(l.info_row, l.content_col, info, Style{}, l.content_cols);
-    }
-    std::vector<std::string> headers = header_rows();
-    for (int i = 0; i < l.header_rows; ++i) {
-        frame.draw_text(l.header_row + i, l.content_col, headers[static_cast<size_t>(i)],
-                        Style{Color::Default, true, false}, l.content_cols);
-    }
-    int top_sep = (l.preview && preview_opts_.position == WindowPosition::Up) ? l.preview_top - 1 : l.list_top - 1;
-    frame.draw_separator(top_sep, l.content_col, border ? l.content_cols : 0);
+    // fzf: ColorPair(fg, bg): the pair's attributes are the fg's plus the bg's
+    auto pair = [](const ColorAttr& fg, const ColorAttr& bg) {
+        Style st = style_of(fg, bg);
+        st.attr = ColorAttr::merge_attr(fg.attr, bg.attr) & ~kAttrRegular;
+        return st;
+    };
+    const Style col_normal = pair(t.list_fg, t.list_bg);
+    const Style col_match = pair(t.match, t.list_bg);
+    const Style col_selected = pair(t.selected_fg, t.selected_bg);
+    const Style col_selected_match = pair(t.selected_match, t.selected_bg);
+    const Style col_current = pair(t.current, t.dark_bg);
+    const Style col_current_match = pair(t.current_match, t.dark_bg);
+    const Style col_pointer_empty = pair(ColorAttr{kColorDefault, 0}, t.gutter);
+    const Style col_current_pointer = pair(t.pointer, t.dark_bg);
+    const Style col_current_empty = pair(ColorAttr{kColorDefault, 0}, t.dark_bg);
+    const Style col_marker = pair(t.marker, t.list_bg);
+    const Style col_current_marker = pair(t.marker, t.dark_bg);
+    const Style col_prompt = pair(t.prompt, t.list_bg);
+    const Style col_input = pair(paused_ ? t.disabled : t.input, t.list_bg);
+    const Style col_info = pair(t.info, t.list_bg);
+    const Style col_separator = pair(t.separator, t.list_bg);
+    const Style col_scrollbar = pair(t.scrollbar, t.list_bg);
+    const Style col_header = pair(t.header, t.list_bg);
+    const Style col_border = pair(t.border, t.bg);
+    const Style col_border_label = pair(t.border_label, t.bg);
+    const Style col_preview_border = pair(t.preview_border, t.bg);
+    const Style col_preview_label = pair(t.preview_label, t.bg);
 
-    if (l.vsep_col >= 0) {
-        for (int r = l.list_top; r < l.list_top + l.list_rows && r < l.rows; ++r) {
-            frame.draw_text(r, l.vsep_col, "\xE2\x94\x82", Style{}, 1);
+    // Labels sit on the top (or bottom) edge of a border; fzf: printLabel
+    auto draw_label = [&](const Rect& r, BorderShape shape, const LabelOpts& opts, const std::string& text,
+                          Style style) {
+        if (text.empty() || r.width < 3) return;
+        bool bottom = opts.bottom;
+        if ((bottom && !border_has_bottom(shape)) || (!bottom && !border_has_top(shape))) return;
+        int row = bottom ? r.bottom() - 1 : r.top;
+        int width = static_cast<int>(visible_width(text));
+        int usable = r.width - 2;
+        std::string label = text;
+        if (width > usable) {
+            label = truncate_ansi_text(text, static_cast<size_t>(std::max(0, usable)));
+            width = usable;
         }
+        int col;
+        if (opts.column == 0) col = r.left + (r.width - width) / 2;
+        else if (opts.column > 0) col = r.left + opts.column;
+        else col = r.right() + opts.column - width + 1;
+        col = std::clamp(col, r.left + 1, std::max(r.left + 1, r.right() - 1 - width));
+        frame.draw_text(row, col, label, style, width);
+    };
+
+    if (l.border_shape != BorderShape::None) {
+        frame.draw_box(l.border.top, l.border.left, l.border.width, l.border.height, l.border_shape, unicode, col_border);
+        draw_label(l.border, l.border_shape, opts_.border_label, border_label_, col_border_label);
     }
-    if (l.hsep_row >= 0) {
-        frame.draw_separator(l.hsep_row, l.content_col, border ? l.content_cols : 0);
+    if (l.preview) {
+        frame.draw_box(l.pborder.top, l.pborder.left, l.pborder.width, l.pborder.height, l.preview_shape, unicode,
+                       col_preview_border);
+        draw_label(l.pborder, l.preview_shape, opts_.preview_label, preview_label_, col_preview_label);
     }
 
-    size_t count = merger_->size();
-    size_t visible_start = std::min(static_cast<size_t>(offset_), count);
-    size_t visible_end = std::min(visible_start + static_cast<size_t>(l.list_rows), count);
-    const Pattern* pattern = merger_->pattern();
-    std::vector<uint32_t> match_positions;
+    const Rect& w = l.window;
+    const int text_width = w.width - l.bar_col;   // columns for prompt/info/header/items
 
-    for (size_t i = visible_start; i < visible_end; ++i) {
-        ItemRef ref = merger_->get(static_cast<uint32_t>(i));
-        if (!ref) break;
-        bool is_cursor = static_cast<int>(i) == cy_;
-        bool is_sel = selected_.count(ref.index()) > 0;
-        std::string line_prefix = (multi_ > 0 && is_sel) ? "> " : "  ";
-
-        // The stored text is already ANSI-stripped (--ansi) and --with-nth
-        // transformed; a stray escape in a non---ansi input is removed for
-        // display only.
-        std::string item_text(ref.text());
-        if (item_text.find('\x1b') != std::string::npos) item_text = strip_ansi_codes(item_text);
-
-        // Positions are computed for the visible rows only (fzf: withPos).
-        match_positions.clear();
-        if (pattern && !pattern->empty()) pattern->match(*ref.chunk, ref.idx, &match_positions);
-
+    // --- prompt line (fzf: printPrompt + inline info styles) ---
+    if (l.prompt_row >= 0) {
         Row spans;
-        if (!match_positions.empty() && !item_text.empty()) {
-            std::u32string u32_text = to_utf32(item_text);
-            if (!u32_text.empty()) {
-                std::vector<char> highlighted(u32_text.size(), 0);
-                for (uint32_t p : match_positions) {
-                    if (p < u32_text.size()) highlighted[p] = 1;
-                }
-                spans.push_back(Span{line_prefix, Style{}});
-                size_t seg_start = 0;
-                bool seg_highlighted = highlighted[0] != 0;
-                for (size_t p = 1; p <= u32_text.size(); ++p) {
-                    bool is_highlighted = (p < u32_text.size()) && (highlighted[p] != 0);
-                    if (p == u32_text.size() || is_highlighted != seg_highlighted) {
-                        std::string seg_text;
-                        utf8::unchecked::utf32to8(u32_text.begin() + static_cast<long>(seg_start),
-                                                  u32_text.begin() + static_cast<long>(p),
-                                                  std::back_inserter(seg_text));
-                        Style style;
-                        if (seg_highlighted) {
-                            style.fg = Color::Yellow;
-                            style.bold = true;
-                        }
-                        spans.push_back(Span{seg_text, style});
-                        seg_start = p;
-                        seg_highlighted = is_highlighted;
-                    }
-                }
+        spans.push_back(Span{prompt_string_, col_prompt});
+        std::string query = query_utf8();
+        if (query.empty() && !ghost_.empty()) {
+            spans.push_back(Span{ghost_, pair(t.ghost, t.list_bg)});
+        } else {
+            spans.push_back(Span{query, col_input});
+        }
+        if (opts_.info_style == InfoStyle::Inline || opts_.info_style == InfoStyle::InlineRight) {
+            std::string info = info_text();
+            int used = static_cast<int>(visible_width(prompt_string_) + visible_width(query)) + 1;
+            if (opts_.info_style == InfoStyle::Inline) {
+                spans.push_back(Span{opts_.info_prefix, col_prompt});
+                spans.push_back(Span{info, col_info});
+            } else {
+                int target = std::max(used, text_width - static_cast<int>(info.size()) - 3);
+                spans.push_back(Span{std::string(static_cast<size_t>(std::max(0, target - used + 1)), ' '), col_normal});
+                spans.push_back(Span{"  ", col_normal});
+                spans.push_back(Span{info, col_info});
             }
         }
-        if (spans.empty()) spans.push_back(Span{line_prefix + item_text, Style{}});
-        if (is_cursor) {
-            for (auto& span : spans) span.style.inverted = true;
-        }
-        int row_num = l.list_top + static_cast<int>(i - visible_start);
-        if (row_num < l.rows) frame.draw_row(row_num, l.list_col, spans, l.list_width);
+        frame.draw_row(l.prompt_row, w.left, spans, text_width);
+        if (l.bar_col) frame.draw_text(l.prompt_row, w.right() - 1, " ", col_normal, 1);
     }
-    // Blank out any leftover result rows from a previous, longer frame.
-    for (size_t i = visible_end - visible_start; i < static_cast<size_t>(l.list_rows); ++i) {
-        int row_num = l.list_top + static_cast<int>(i);
-        if (row_num >= l.rows) break;
-        frame.draw_row(row_num, l.list_col, {}, l.list_width);
+    // --- info / separator line (fzf: printInfoImpl) ---
+    if (l.info_row >= 0) {
+        Row spans;
+        int used = 0;
+        if (opts_.info_style == InfoStyle::Default) {
+            std::string info = info_text();
+            spans.push_back(Span{reading_ ? "\xE2\xA0\x8B" : " ", pair(t.spinner, t.list_bg)});   // fzf: spinner
+            spans.push_back(Span{" ", col_normal});
+            spans.push_back(Span{info, col_info});
+            used = 2 + static_cast<int>(info.size());
+            int fill = (text_width - used - 1) - 1;
+            if (fill > 0 && !separator_.empty()) {
+                spans.push_back(Span{" ", col_separator});
+                std::string sep;
+                for (int i = 0; i < fill; ++i) sep += separator_;
+                spans.push_back(Span{sep, col_separator});
+            }
+        } else if (opts_.info_style == InfoStyle::Right) {
+            std::string info = info_text();
+            int fill = text_width - static_cast<int>(info.size()) - 2;
+            if (fill >= 0 && !separator_.empty()) {
+                std::string sep;
+                for (int i = 0; i < fill; ++i) sep += separator_;
+                spans.push_back(Span{sep, col_separator});
+                spans.push_back(Span{" ", col_normal});
+            } else if (fill > 0) {
+                spans.push_back(Span{std::string(static_cast<size_t>(fill + 1), ' '), col_normal});
+            }
+            spans.push_back(Span{info, col_info});
+        } else if (!separator_.empty()) {
+            // hidden / inline-right: the separator line alone
+            std::string sep;
+            for (int i = 0; i < text_width - 1; ++i) sep += separator_;
+            spans.push_back(Span{sep, col_separator});
+        }
+        frame.draw_row(l.info_row, w.left, spans, text_width);
+        if (l.bar_col) frame.draw_text(l.info_row, w.right() - 1, " ", col_normal, 1);
+    }
+    // --- header ---
+    if (l.header_top >= 0) {
+        std::vector<std::string> headers = header_rows();
+        std::string indent(static_cast<size_t>(pointer_len_ + marker_len_), ' ');
+        for (int i = 0; i < l.header_lines; ++i) {
+            Row spans{Span{indent, col_normal}, Span{headers[static_cast<size_t>(i)], col_header}};
+            frame.draw_row(l.header_top + i, w.left, spans, text_width);
+            if (l.bar_col) frame.draw_text(l.header_top + i, w.right() - 1, " ", col_normal, 1);
+        }
     }
 
-    int bottom_sep = l.prompt_row - 1;
-    if (bottom_sep < l.rows) frame.draw_separator(bottom_sep, l.content_col, border ? l.content_cols : 0);
-    std::string query = query_utf8();
-    if (l.prompt_row < l.rows) {
-        if (inputless_) {
-            frame.draw_row(l.prompt_row, l.content_col, {}, l.content_cols);
+    // --- items (fzf: printList / printItem / printHighlighted) ---
+    const int count = list_count();
+    const Pattern* pattern = merger_->pattern();
+    std::vector<uint32_t> match_positions;
+    int bar_length = 0, bar_start = 0;
+    if (!scrollbar_.empty() && count > l.list_rows && l.list_rows > 0) {
+        bar_length = std::max(1, l.list_rows * l.list_rows / count);
+        bar_start = count == l.list_rows ? 0
+                    : std::min(l.list_rows - bar_length, (l.list_rows - bar_length) * offset_ / (count - l.list_rows));
+    }
+    const int item_budget = w.width - l.bar_col;
+    for (int line = 0; line < l.list_rows; ++line) {
+        int row = l.item_row(line);
+        if (row < 0 || row >= term_rows_) continue;
+        int idx = offset_ + line;
+        if (idx >= count) {
+            frame.draw_row(row, w.left, {}, item_budget);
         } else {
-            frame.draw_text(l.prompt_row, l.content_col, prompt_string_ + query, Style{}, l.content_cols);
+            ItemRef ref = merger_->get(static_cast<uint32_t>(idx));
+            bool current = idx == cy_;
+            bool selected = selected_.count(ref.index()) > 0;
+            Row spans;
+            if (current) spans.push_back(Span{pointer_, col_current_pointer});
+            else spans.push_back(Span{pointer_empty_, col_pointer_empty});
+            if (selected) spans.push_back(Span{opts_.marker.value_or(">"), current ? col_current_marker : col_marker});
+            else spans.push_back(Span{marker_empty_, current ? col_current_empty : col_normal});
+
+            std::string item_text(ref.text());
+            if (item_text.find('\x1b') != std::string::npos) item_text = strip_ansi_codes(item_text);
+            const Style base = current ? col_current : (selected ? col_selected : col_normal);
+            const Style hl = current ? col_current_match : (selected ? col_selected_match : col_match);
+
+            match_positions.clear();
+            if (pattern && !pattern->empty()) pattern->match(*ref.chunk, ref.idx, &match_positions);
+            if (!match_positions.empty() && !item_text.empty()) {
+                std::u32string u32 = to_utf32(item_text);
+                std::vector<char> highlighted(u32.size(), 0);
+                for (uint32_t p : match_positions) if (p < u32.size()) highlighted[p] = 1;
+                size_t seg_start = 0;
+                bool seg_hl = !u32.empty() && highlighted[0] != 0;
+                for (size_t p = 1; p <= u32.size(); ++p) {
+                    bool is_hl = p < u32.size() && highlighted[p] != 0;
+                    if (p == u32.size() || is_hl != seg_hl) {
+                        std::string seg;
+                        utf8::unchecked::utf32to8(u32.begin() + static_cast<long>(seg_start),
+                                                  u32.begin() + static_cast<long>(p), std::back_inserter(seg));
+                        spans.push_back(Span{seg, seg_hl ? hl : base});
+                        seg_start = p;
+                        seg_hl = is_hl;
+                    }
+                }
+            } else {
+                spans.push_back(Span{item_text, base});
+            }
+            if (opts_.cursor_line && current) {
+                // --highlight-line: the background covers the whole row
+                int used = pointer_len_ + marker_len_ + static_cast<int>(visible_width(item_text));
+                if (used < item_budget) spans.push_back(Span{std::string(static_cast<size_t>(item_budget - used), ' '), col_current_empty});
+            }
+            frame.draw_row(row, w.left, spans, item_budget);
+        }
+        if (l.bar_col) {
+            bool has_bar = bar_length > 0 && line >= bar_start && line < bar_start + bar_length;
+            frame.draw_text(row, w.right() - 1, has_bar ? scrollbar_ : " ", has_bar ? col_scrollbar : col_normal, 1);
         }
     }
-    if (border) frame.draw_border();
-    write_all(tty_out_, frame.bytes().data(), frame.bytes().size());
 
-    // Move the real cursor to the query-editing position, measured in
-    // display columns (a CJK/emoji query is wider than its codepoint count).
-    std::string before_cursor = to_utf8(input_.substr(0, cx_));
-    int cursor_col = l.content_col + static_cast<int>(visible_width(prompt_string_) + visible_width(before_cursor));
-    std::string cursor_seq = "\x1b[" + std::to_string(l.prompt_row + 1) + ";" +
-                             std::to_string(cursor_col + 1) + "H";
-    write_all(tty_out_, cursor_seq);
-    if (!inputless_ && !opts_.phony) show_cursor(tty_out_);
+    write_all(tty_out_, frame.bytes().data(), frame.bytes().size());
+    place_cursor();
+    if (!inputless_) show_cursor(tty_out_);
+    else hide_cursor(tty_out_);
 
     if (l.preview && preview_dirty_) paint_preview(false);
     needs_repaint_ = false;
@@ -884,7 +1169,7 @@ void Terminal::repaint() {
 }
 
 void Terminal::paint_preview(bool force) {
-    const Layout& l = layout_;
+    const Rect& pw = layout_.pwindow;
     PreviewWorker::Content c = preview_.content();
     // Completed output for the current request goes into the cache.
     if (c.complete && !preview_request_key_.empty() && c.version == preview_request_version_ &&
@@ -892,6 +1177,7 @@ void Terminal::paint_preview(bool force) {
         cache_preview(preview_request_key_, c.text);
         preview_request_key_.clear();
     }
+    if (pw.width <= 0 || pw.height <= 0) return;
 
     // Skip the write entirely when neither the content nor the scroll
     // position changed since the pane was last painted: a preview holding a
@@ -906,14 +1192,14 @@ void Terminal::paint_preview(bool force) {
         return;
     }
     {
-        FrameRenderer clear_frame(l.rows, l.cols);
-        clear_frame.clear_region(l.preview_top, l.preview_left, l.preview_lines, l.preview_cols);
+        FrameRenderer clear_frame(term_rows_, term_cols_);
+        clear_frame.clear_region(pw.top, pw.left, pw.height, pw.width);
         write_all(tty_out_, clear_frame.bytes().data(), clear_frame.bytes().size());
     }
     int painted_offset = preview_offset_;
     size_t total = 0;
-    write_preview_content(tty_out_, l.preview_top, l.preview_left, c.text,
-                          static_cast<size_t>(painted_offset), l.preview_lines, l.preview_cols, total);
+    write_preview_content(tty_out_, pw.top, pw.left, c.text, static_cast<size_t>(painted_offset),
+                          pw.height, pw.width, total);
     preview_total_lines_ = total;
     if (preview_total_lines_ > 0 && preview_offset_ >= static_cast<int>(preview_total_lines_)) {
         preview_offset_ = static_cast<int>(preview_total_lines_) - 1;
@@ -921,10 +1207,7 @@ void Terminal::paint_preview(bool force) {
     last_painted_preview_ = c.text;
     last_painted_offset_ = painted_offset;
     last_painted_valid_ = true;
-    // Restore the query cursor after the preview write.
-    std::string before_cursor = to_utf8(input_.substr(0, cx_));
-    int cursor_col = l.content_col + static_cast<int>(visible_width(prompt_string_) + visible_width(before_cursor));
-    write_all(tty_out_, "\x1b[" + std::to_string(l.prompt_row + 1) + ";" + std::to_string(cursor_col + 1) + "H");
+    place_cursor();
 }
 
 // ---------------------------------------------------------------------------
@@ -935,13 +1218,7 @@ bool Terminal::handle_mouse() {
     const MouseInfo& me = current_key_.mouse;
     const Layout& l = layout_;
     int mx = me.x, my = me.y;
-    auto in_list = [&]() {
-        return my >= l.list_top && my < l.list_top + l.list_rows && mx >= l.list_col && mx < l.list_col + l.list_width;
-    };
-    auto in_preview = [&]() {
-        return l.preview && my >= l.preview_top && my < l.preview_top + l.preview_lines &&
-               mx >= l.preview_left && mx < l.preview_left + l.preview_cols;
-    };
+    auto in_preview = [&]() { return l.preview && l.pborder.contains(my, mx); };
     auto actions_for = [&](EventType t) -> ActionList {
         auto it = keymap_.find(event_of(t));
         return it == keymap_.end() ? ActionList{} : it->second;
@@ -950,7 +1227,7 @@ bool Terminal::handle_mouse() {
     // Scrolling
     if (me.button == MouseInfo::Button::WheelUp || me.button == MouseInfo::Button::WheelDown) {
         bool up = me.button == MouseInfo::Button::WheelUp;
-        if (in_list() && list_count() > 0) {
+        if (l.window.contains(my, mx) && list_count() > 0) {
             EventType evt = up ? (me.shift ? EventType::SScrollUp : EventType::ScrollUp)
                                : (me.shift ? EventType::SScrollDown : EventType::ScrollDown);
             return do_actions(actions_for(evt));
@@ -962,27 +1239,32 @@ bool Terminal::handle_mouse() {
     }
     if (me.motion != MouseInfo::Motion::Pressed) return true;
     if (in_preview()) return true;
+    if (!l.window.contains(my, mx)) return true;
 
     // Prompt line: move the cursor
     if (my == l.prompt_row && !inputless_) {
         int prompt_len = static_cast<int>(visible_width(prompt_string_));
-        int target = mx - l.content_col - prompt_len;
+        int target = mx - l.window.left - prompt_len;
         cx_ = static_cast<size_t>(std::clamp(target, 0, static_cast<int>(input_.size())));
         return true;
     }
+    if (my == l.info_row) return true;
 
     // Header
-    if (l.header_rows > 0 && my >= l.header_row && my < l.header_row + l.header_rows) {
-        int col = mx - l.content_col - 2;   // pointer + marker columns
+    if (l.header_top >= 0 && my >= l.header_top && my < l.header_top + l.header_lines) {
+        int col = mx - l.window.left - pointer_len_ - marker_len_;
         if (col < 0) return true;
-        click_header_line_ = my - l.header_row + 1;
+        int line = my - l.header_top;
+        // fzf: FZF_CLICK_HEADER_LINE counts from the list side in the
+        // default layout
+        click_header_line_ = opts_.layout == LayoutType::Reverse ? line + 1 : l.header_lines - line;
         click_header_column_ = col + 1;
         return do_actions(actions_for(EventType::ClickHeader));
     }
 
-    if (!in_list()) return true;
-    int row = my - l.list_top;
-    int cy = offset_ + row;
+    int line = l.line_of_row(my);
+    if (line < 0 || line >= l.list_rows) return true;
+    int cy = offset_ + line;
     if (cy < 0 || cy >= list_count()) return true;
 
     bool left = me.button == MouseInfo::Button::Left;

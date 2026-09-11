@@ -21,14 +21,14 @@ int main() {
 
     FrameRenderer frame(rows, cols);
 
-    frame.draw_border();
+    frame.draw_box(0, 0, cols, rows, BorderShape::Rounded, true);
 
     int row = 1;
     frame.draw_text(row++, 1, "3", {}, cols - 2);
 
-    frame.draw_text(row++, 1, "-- header line --", Style{Color::Default, true, false}, cols - 2);
+    frame.draw_text(row++, 1, "-- header line --", Style{-1, -1, kAttrBold}, cols - 2);
 
-    frame.draw_separator(row++);
+    frame.draw_hline(row++, 1, cols - 2, "\xE2\x94\x80");
 
     // Result rows: one plain, one with a highlighted match, one selected
     // (multi-select prefix), one as the cursor row (inverted).
@@ -37,16 +37,16 @@ int main() {
     {
         Row spans;
         spans.push_back(Span{"  hello_", Style{}});
-        spans.push_back(Span{"world", Style{Color::Yellow, true, false}});
+        spans.push_back(Span{"world", Style{3, -1, kAttrBold}});
         spans.push_back(Span{".cpp", Style{}});
         frame.draw_row(row++, 1, spans, cols - 2);
     }
 
     frame.draw_text(row++, 1, "> selected_item.md", {}, cols - 2);
 
-    frame.draw_text(row++, 1, "  cursor_row_here.log", Style{Color::Default, false, true}, cols - 2);
+    frame.draw_text(row++, 1, "  cursor_row_here.log", Style{-1, -1, kAttrReverse}, cols - 2);
 
-    frame.draw_separator(row++);
+    frame.draw_hline(row++, 1, cols - 2, "\xE2\x94\x80");
     frame.draw_text(row++, 1, "> query text", {}, cols - 2);
 
     ssize_t r1 = write(STDOUT_FILENO, frame.bytes().data(), frame.bytes().size());

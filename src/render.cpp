@@ -232,19 +232,6 @@ size_t utf8_display_width(const std::string& s) {
     return w;
 }
 
-const char* sgr_fg_code(Color c) {
-    switch (c) {
-        case Color::Black: return "30";
-        case Color::Red: return "31";
-        case Color::Green: return "32";
-        case Color::Yellow: return "33";
-        case Color::Blue: return "34";
-        case Color::Magenta: return "35";
-        case Color::Cyan: return "36";
-        case Color::White: return "37";
-        case Color::Default: default: return "";
-    }
-}
 
 } // namespace
 
@@ -262,19 +249,38 @@ void FrameRenderer::move_cursor(int row, int col) {
     move_to(row, col);
 }
 
+// SGR for one Style: attributes, then fg/bg. 0-7 and 8-15 use the classic
+// 30-37/90-97 (40-47/100-107) codes so 16-color terminals understand them;
+// 16-255 use 38;5;N, and (1<<24)|RGB 38;2;R;G;B.
+static void append_color(std::string& out, int32_t c, bool background) {
+    if (c < 0) return;
+    if (c >= (1 << 24)) {
+        int r = (c >> 16) & 0xff, g = (c >> 8) & 0xff, b = c & 0xff;
+        out += background ? ";48;2;" : ";38;2;";
+        out += std::to_string(r) + ";" + std::to_string(g) + ";" + std::to_string(b);
+        return;
+    }
+    if (c < 8) {
+        out += ";" + std::to_string((background ? 40 : 30) + c);
+    } else if (c < 16) {
+        out += ";" + std::to_string((background ? 100 : 90) + (c - 8));
+    } else {
+        out += background ? ";48;5;" : ";38;5;";
+        out += std::to_string(c);
+    }
+}
+
 void FrameRenderer::append_style(const Style& style) {
     buffer_ += "\x1b[0";
-    if (style.bold) {
-        buffer_ += ";1";
-    }
-    if (style.inverted) {
-        buffer_ += ";7";
-    }
-    const char* fg = sgr_fg_code(style.fg);
-    if (fg[0] != '\0') {
-        buffer_ += ";";
-        buffer_ += fg;
-    }
+    if (style.attr & (kAttrBold | kAttrBoldForce)) buffer_ += ";1";
+    if (style.attr & kAttrDim) buffer_ += ";2";
+    if (style.attr & kAttrItalic) buffer_ += ";3";
+    if (style.attr & kAttrUnderline) buffer_ += ";4";
+    if (style.attr & kAttrBlink) buffer_ += ";5";
+    if (style.attr & kAttrReverse) buffer_ += ";7";
+    if (style.attr & kAttrStrikeThrough) buffer_ += ";9";
+    append_color(buffer_, style.fg, false);
+    append_color(buffer_, style.bg, true);
     buffer_ += "m";
 }
 
@@ -374,55 +380,79 @@ void FrameRenderer::draw_text(int row, int col, const std::string& text, Style s
     draw_row(row, col, spans, max_cols);
 }
 
-void FrameRenderer::draw_separator(int row, int col_start, int width) {
-    if (row < 0 || row >= rows_) {
-        return;
-    }
-    // Default (width <= 0, matching draw_row's max_cols convention): span the
-    // whole terminal width from column 0, as before.
-    int start = col_start > 0 ? col_start : 0;
-    int span = width > 0 ? width : (cols_ - start);
-    if (span <= 0) {
-        return;
-    }
-    move_to(row, start);
-    for (int i = 0; i < span; ++i) {
-        // U+2500 BOX DRAWINGS LIGHT HORIZONTAL, encoded as UTF-8.
-        buffer_ += "\xE2\x94\x80";
-    }
-    // EL (erase to end of line) is only safe when the separator legitimately
-    // owns the rest of the physical line (the full-width default). With a
-    // bounded width -- i.e. the caller is keeping the separator inside
-    // --border verticals -- EL would erase the border's right-hand bar (and
-    // anything else past `start + span`), so it's skipped; the drawn run of
-    // box-drawing chars is the only output for a bounded separator.
-    if (col_start <= 0 && width <= 0) {
-        buffer_ += "\x1b[K";
+void FrameRenderer::draw_hline(int row, int col, int width, const std::string& glyph, Style style) {
+    if (row < 0 || row >= rows_ || width <= 0) return;
+    move_to(row, col);
+    append_style(style);
+    for (int i = 0; i < width; ++i) buffer_ += glyph;
+    append_reset();
+}
+
+namespace {
+
+struct BoxGlyphs {
+    const char *top, *bottom, *left, *right, *top_left, *top_right, *bottom_left, *bottom_right;
+};
+
+// fzf: tui.MakeBorderStyle
+BoxGlyphs box_glyphs(BorderShape shape, bool unicode) {
+    if (!unicode) return {"-", "-", "|", "|", "+", "+", "+", "+"};
+    switch (shape) {
+        case BorderShape::Sharp: case BorderShape::Dashed:
+            return {"─", "─", "│", "│", "┌", "┐", "└", "┘"};
+        case BorderShape::Bold:
+            return {"━", "━", "┃", "┃", "┏", "┓", "┗", "┛"};
+        case BorderShape::Block:
+            return {"▀", "▄", "▌", "▐", "▛", "▜", "▙", "▟"};
+        case BorderShape::ThinBlock:
+            return {"▔", "▁", "▏", "▕", "🭽", "🭾", "🭼", "🭿"};
+        case BorderShape::Double:
+            return {"═", "═", "║", "║", "╔", "╗", "╚", "╝"};
+        default:
+            return {"─", "─", "│", "│", "╭", "╮", "╰", "╯"};
     }
 }
 
-void FrameRenderer::draw_border() {
-    if (rows_ < 2 || cols_ < 2) {
-        return;
-    }
-    // Corners + horizontal edges.
-    move_to(0, 0);
-    buffer_ += "\xE2\x94\x8C";  // top-left
-    for (int i = 1; i < cols_ - 1; ++i) buffer_ += "\xE2\x94\x80";
-    buffer_ += "\xE2\x94\x90";  // top-right
+} // namespace
 
-    move_to(rows_ - 1, 0);
-    buffer_ += "\xE2\x94\x94";  // bottom-left
-    for (int i = 1; i < cols_ - 1; ++i) buffer_ += "\xE2\x94\x80";
-    buffer_ += "\xE2\x94\x98";  // bottom-right
-
-    // Vertical edges.
-    for (int r = 1; r < rows_ - 1; ++r) {
-        move_to(r, 0);
-        buffer_ += "\xE2\x94\x82";  // vertical bar
-        move_to(r, cols_ - 1);
-        buffer_ += "\xE2\x94\x82";
+void FrameRenderer::draw_box(int top, int left, int width, int height, BorderShape shape,
+                             bool unicode, Style style) {
+    if (width <= 0 || height <= 0) return;
+    BoxGlyphs g = box_glyphs(shape, unicode);
+    bool has_top = border_has_top(shape), has_bottom = border_has_bottom(shape);
+    bool has_left = border_has_left(shape), has_right = border_has_right(shape);
+    auto put = [&](int r, int c, const char* glyph) {
+        if (r < 0 || r >= rows_ || c < 0 || c >= cols_) return;
+        move_to(r, c);
+        buffer_ += glyph;
+    };
+    append_style(style);
+    if (has_top) {
+        int c0 = left, c1 = left + width;
+        if (has_left) { put(top, left, g.top_left); c0 = left + 1; }
+        if (has_right) { put(top, left + width - 1, g.top_right); c1 = left + width - 1; }
+        if (c1 > c0 && top >= 0 && top < rows_) {
+            move_to(top, c0);
+            for (int c = c0; c < c1; ++c) buffer_ += g.top;
+        }
     }
+    if (has_bottom && height > 1) {
+        int row = top + height - 1;
+        int c0 = left, c1 = left + width;
+        if (has_left) { put(row, left, g.bottom_left); c0 = left + 1; }
+        if (has_right) { put(row, left + width - 1, g.bottom_right); c1 = left + width - 1; }
+        if (c1 > c0 && row >= 0 && row < rows_) {
+            move_to(row, c0);
+            for (int c = c0; c < c1; ++c) buffer_ += g.bottom;
+        }
+    }
+    int r0 = has_top ? top + 1 : top;
+    int r1 = has_bottom ? top + height - 1 : top + height;
+    for (int r = r0; r < r1; ++r) {
+        if (has_left) put(r, left, g.left);
+        if (has_right) put(r, left + width - 1, g.right);
+    }
+    append_reset();
 }
 
 void FrameRenderer::clear_region(int row, int col, int height, int width) {

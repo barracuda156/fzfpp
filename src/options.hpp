@@ -38,6 +38,41 @@ enum class BorderShape {
     Double, Dashed, Horizontal, Vertical, Top, Bottom, Left, Right, Phantom
 };
 
+// fzf: BorderShape.HasTop/HasBottom/HasLeft/HasRight
+inline bool border_has_left(BorderShape s) {
+    switch (s) {
+        case BorderShape::None: case BorderShape::Undefined: case BorderShape::Phantom: case BorderShape::Line:
+        case BorderShape::Inline: case BorderShape::Right: case BorderShape::Top: case BorderShape::Bottom:
+        case BorderShape::Horizontal: return false;
+        default: return true;
+    }
+}
+inline bool border_has_right(BorderShape s) {
+    switch (s) {
+        case BorderShape::None: case BorderShape::Undefined: case BorderShape::Phantom: case BorderShape::Line:
+        case BorderShape::Inline: case BorderShape::Left: case BorderShape::Top: case BorderShape::Bottom:
+        case BorderShape::Horizontal: return false;
+        default: return true;
+    }
+}
+inline bool border_has_top(BorderShape s) {
+    switch (s) {
+        case BorderShape::None: case BorderShape::Undefined: case BorderShape::Phantom: case BorderShape::Line:
+        case BorderShape::Inline: case BorderShape::Left: case BorderShape::Right: case BorderShape::Bottom:
+        case BorderShape::Vertical: return false;
+        default: return true;
+    }
+}
+inline bool border_has_bottom(BorderShape s) {
+    switch (s) {
+        case BorderShape::None: case BorderShape::Undefined: case BorderShape::Phantom: case BorderShape::Line:
+        case BorderShape::Inline: case BorderShape::Left: case BorderShape::Right: case BorderShape::Top:
+        case BorderShape::Vertical: return false;
+        default: return true;
+    }
+}
+inline bool border_visible(BorderShape s) { return s != BorderShape::None && s != BorderShape::Undefined; }
+
 // fzf: windowPosition
 enum class WindowPosition { Up, Down, Left, Right, Next, Center };
 
