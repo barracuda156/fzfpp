@@ -103,15 +103,6 @@ private:
     std::string buffer_;
 };
 
-// Write an external command's raw captured output verbatim at (row, col),
-// wrapped in cursor save/restore (\x1b7...\x1b8) so the terminal's own
-// cursor-after-image behavior (inconsistent across terminals for sixel/
-// kitty-graphics) never needs to be predicted or corrected — matches fzf's
-// own LightRenderer.PassThrough. This is a separate direct write() (not part
-// of a FrameRenderer's buffered frame) since the preview region is treated
-// as content the chrome repaint must never clear or overwrite.
-void write_raw_passthrough(int fd, int row, int col, const std::string& raw_bytes);
-
 // Write a preview command's captured output (the WHOLE multi-line blob, not
 // pre-split) into the pane rooted at (top, left). `raw_content` is the bytes
 // exactly as the preview command produced them, starting at the visible line

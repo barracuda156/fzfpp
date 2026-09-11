@@ -4,8 +4,10 @@
 #include "terminal.hpp"
 
 #include <cerrno>
+#include <condition_variable>
 #include <csignal>
 #include <cstdio>
+#include <mutex>
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -28,12 +30,7 @@ namespace {
 
 // The output protocol (fzf: opts.Printer): one line per entry, terminated
 // by "\n" or, with --print0, by NUL.
-void print_lines(int fd, const std::vector<std::string>& lines, bool print0) {
-    std::string out;
-    for (const auto& line : lines) {
-        out += line;
-        out += print0 ? '\0' : '\n';
-    }
+void write_fully(int fd, const std::string& out) {
     size_t off = 0;
     while (off < out.size()) {
         ssize_t w = write(fd, out.data() + off, out.size() - off);
@@ -43,6 +40,19 @@ void print_lines(int fd, const std::vector<std::string>& lines, bool print0) {
         }
         off += static_cast<size_t>(w);
     }
+}
+
+void print_lines(int fd, const std::vector<std::string>& lines, bool print0) {
+    std::string out;
+    for (const auto& line : lines) {
+        out += line;
+        out += print0 ? '\0' : '\n';
+        if (out.size() >= 64 * 1024) {
+            write_fully(fd, out);
+            out.clear();
+        }
+    }
+    if (!out.empty()) write_fully(fd, out);
 }
 
 // Non-interactive match of the whole input (fzf: core.go's filtering
@@ -58,6 +68,55 @@ std::vector<std::string> filter_results(const fzf::Options& opts, fzf::ItemBuild
     out.reserve(merger->size());
     for (uint32_t i = 0; i < merger->size(); ++i) out.push_back(builder.output_text(merger->get(i)));
     return out;
+}
+
+// fzf: core.go streamingFilter -- when the output order is the input order
+// anyway (--no-sort without --tac/--sync), matches are printed as the input
+// arrives instead of after EOF. Returns whether anything matched.
+bool streaming_filter(const fzf::Options& opts, fzf::ItemBuilder& builder, fzf::Reader& reader,
+                      const std::string& query) {
+    fzf::Searcher searcher(opts, /*interactive=*/false);
+    auto pattern = searcher.build_pattern(query);
+    std::mutex mu;
+    std::condition_variable cv;
+    bool woke = false;
+    reader.set_wake_callback([&]() {
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            woke = true;
+        }
+        cv.notify_one();
+    });
+    bool found = false;
+    size_t chunk_i = 0;
+    uint32_t item_i = 0;
+    const char sep = opts.print0 ? '\0' : '\n';
+    for (;;) {
+        auto list = reader.list();
+        fzf::ChunkList::Snapshot snap = list->snapshot();
+        std::string out;
+        for (; chunk_i < snap.chunks.size(); ++chunk_i) {
+            const auto& chunk = snap.chunks[chunk_i];
+            uint32_t count = snap.counts[chunk_i];
+            for (; item_i < count; ++item_i) {
+                if (pattern->empty() || pattern->match(*chunk, item_i).matched) {
+                    out += builder.output_text(fzf::ItemRef{chunk, item_i});
+                    out += sep;
+                    found = true;
+                }
+            }
+            if (chunk_i + 1 < snap.chunks.size()) item_i = 0;
+        }
+        if (chunk_i > 0 && chunk_i == snap.chunks.size()) --chunk_i;   // stay on the growing tail chunk
+        if (!out.empty()) write_fully(STDOUT_FILENO, out);
+        if (snap.finished) break;
+        std::unique_lock<std::mutex> lock(mu);
+        cv.wait(lock, [&] { return woke; });
+        woke = false;
+        reader.ack_wake();
+    }
+    reader.set_wake_callback(nullptr);
+    return found;
 }
 
 } // namespace
@@ -101,11 +160,13 @@ int main(int argc, char* argv[]) {
                 }
                 reader.start_fd(filter_fd);
             }
+            if (opts.print_query) print_lines(STDOUT_FILENO, {*opts.filter}, opts.print0);
+            bool streaming = opts.sort == 0 && !opts.tac && !opts.sync;
+            if (streaming) {
+                finish(streaming_filter(opts, builder, reader, *opts.filter) ? 0 : 1);
+            }
             auto results = filter_results(opts, builder, reader, *opts.filter);
-            std::vector<std::string> lines;
-            if (opts.print_query) lines.push_back(*opts.filter);
-            for (const auto& r : results) lines.push_back(r);
-            print_lines(STDOUT_FILENO, lines, opts.print0);
+            print_lines(STDOUT_FILENO, results, opts.print0);
             finish(results.empty() ? 1 : 0);
         }
 

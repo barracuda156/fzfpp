@@ -440,15 +440,6 @@ void FrameRenderer::clear_region(int row, int col, int height, int width) {
     }
 }
 
-void write_raw_passthrough(int fd, int row, int col, const std::string& raw_bytes) {
-    std::string out;
-    out += "\x1b" "7";  // DECSC save cursor
-    out += "\x1b[" + std::to_string(row + 1) + ";" + std::to_string(col + 1) + "H";
-    out += raw_bytes;
-    out += "\x1b" "8";  // DECRC restore cursor
-    write_all(fd, out);
-}
-
 namespace {
 
 // Classify one escape sequence that begins at `line[start]` (== ESC). Sets

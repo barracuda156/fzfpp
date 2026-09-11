@@ -1149,7 +1149,7 @@ RunResult Terminal::run() {
 
     needs_repaint_ = true;
     preview_dirty_ = true;
-    repaint();
+    if (exit_ == Exit::None) repaint();
 
     while (exit_ == Exit::None) {
         if (g_termination_requested) {
@@ -1236,7 +1236,10 @@ RunResult Terminal::run() {
                 esc_deadline_armed = false;
                 auto events = parser.feed(std::string(buf, static_cast<size_t>(r)));
                 for (const auto& ev : events) {
-                    Event e = to_event(ev);
+                    // Every mouse report goes through the Mouse action
+                    // (fzf: actMouse), which hit-tests the layout and then
+                    // runs the LeftClick / ScrollUp / ... bindings.
+                    Event e = ev.type == KeyType::Mouse ? event_of(EventType::Mouse) : to_event(ev);
                     if (ev.type == KeyType::Mouse && !mouse_enabled_) continue;
                     // Re-run matching before a non-editing event that
                     // follows a query change in the same read() batch (a
