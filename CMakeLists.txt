@@ -66,12 +66,15 @@ set(SOURCES
     src/keymap.cpp
     src/tokenizer.cpp
     src/placeholder.cpp
+    src/shellcmd.cpp
     src/ansi.cpp
     src/chunklist.cpp
     src/matcher.cpp
     src/search.cpp
     src/reader.cpp
+    src/preview.cpp
     src/terminal.cpp
+    src/actions.cpp
     src/tty.cpp
     src/keyparser.cpp
     src/render.cpp
@@ -136,7 +139,8 @@ target_link_libraries(tokenizer_test PRIVATE utf8cpp)
 # merger ordering against a full sort, chunk-cache prefix narrowing, --tac,
 # --no-sort and every tiebreak.
 add_executable(search_test tools/search_test.cpp src/search.cpp src/matcher.cpp
-    src/chunklist.cpp src/ansi.cpp src/tokenizer.cpp src/reader.cpp src/tty.cpp src/options.cpp)
+    src/chunklist.cpp src/ansi.cpp src/tokenizer.cpp src/reader.cpp src/tty.cpp src/options.cpp
+    src/placeholder.cpp src/shellcmd.cpp)
 target_include_directories(search_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(search_test PRIVATE utf8cpp Threads::Threads)
 

@@ -349,30 +349,6 @@ struct Options {
     WalkerOpts walker;
     std::vector<std::string> walker_root{"."};
     std::vector<std::string> walker_skip{".git", "node_modules"};
-
-    // ------------------------------------------------------------------
-    // LEGACY VIEW -- derived from the fields above by derive_legacy_fields()
-    // so that the pre-rewrite terminal.cpp / main.cpp / reader keep working
-    // unchanged. Every field in this block is removed in T1.7 when the
-    // executor and event loop switch to the canonical fields.
-    // ------------------------------------------------------------------
-    bool disabled = false;             // = phony
-    int legacy_height = 0;             // --height as an int (0 = fullscreen)
-    bool height_is_percent = false;
-    std::string legacy_header;         // --header lines joined (first line only)
-    bool border = false;               // border_shape != None
-    bool no_mouse = false;
-    std::string preview_command;
-    bool info_hidden = false;
-    std::string preview_position = "right";
-    int preview_size_percent = 50;
-    bool preview_size_is_percent = true;
-    bool preview_wrap = false;
-    bool preview_hidden = false;
-    bool preview_follow = false;
-    std::string legacy_delimiter;      // literal delimiter (pre-tokenizer consumers)
-    std::map<std::string, std::string> bindings;   // key -> action string
-    std::vector<std::string> expect_keys;
 };
 
 // Error thrown by the parser; the message is exactly what fzf prints.
@@ -394,6 +370,9 @@ std::vector<std::string> shell_split_words(const std::string& s);   // fzf: pars
 std::vector<Range> parse_nth(const std::string& spec);              // fzf: splitNth (throws)
 Delimiter parse_delimiter(const std::string& spec);                 // fzf: delimiterRegexp
 std::vector<std::string> str_lines(const std::string& s);           // fzf: strLines
+// fzf: parsePreviewWindow -- apply a --preview-window spec on top of `opts`
+// (change-preview-window). Throws OptionError.
+void apply_preview_window(PreviewOpts& opts, const std::string& spec);
 const char* fzf_compat_version();                                   // "0.74"
 const char* fzfpp_version();                                        // fzf++ own version
 

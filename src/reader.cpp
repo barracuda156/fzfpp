@@ -1,14 +1,21 @@
 #include "reader.hpp"
 
 #include "ansi.hpp"
+#include "placeholder.hpp"
 #include "shellcmd.hpp"
 #include "tty.hpp"
 
+#include <algorithm>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <set>
+#include <utility>
 
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/stat.h>
 #include <sys/select.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -127,7 +134,8 @@ std::string ItemBuilder::field_text(const ItemRef& ref, int field) const {
 // Reader
 // ---------------------------------------------------------------------------
 
-Reader::Reader(const Options& opts, ItemBuilder& builder) : opts_(opts), builder_(builder) {
+Reader::Reader(const Options& opts, ItemBuilder& builder)
+    : opts_(opts), builder_(builder), executor_(Executor::create(opts.with_shell)) {
     if (!make_self_pipe(cancel_r_, cancel_w_)) {
         cancel_r_ = cancel_w_ = -1;
     }
@@ -173,22 +181,37 @@ std::vector<std::string> Reader::header_lines() const {
     return header_;
 }
 
+std::string Reader::failed_command() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return failed_ ? command_ : std::string();
+}
+
 std::shared_ptr<ChunkList> Reader::start_fd(int fd) {
     return start(fd, -1);
 }
 
 std::shared_ptr<ChunkList> Reader::start_command(const std::string& command,
-                                                 const std::vector<std::string>& env) {
-    SpawnedCommand sp = shell_spawn(command, env, /*null_stdin=*/true);
+                                                 const std::vector<std::string>& env,
+                                                 const std::vector<std::string>& temp_files) {
+    cancel();
+    SpawnedCommand sp = shell_spawn(executor_, command, env, /*null_stdin=*/true, /*setpgid=*/true);
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        command_ = command;
+        temp_files_ = temp_files;
+        failed_ = false;
+    }
     if (sp.fd < 0) {
         // Nothing to read: an empty, finished generation.
-        cancel();
         auto l = std::make_shared<ChunkList>(builder_.with_aux(),
                                              static_cast<uint32_t>(opts_.header_lines));
         l->finish();
         std::lock_guard<std::mutex> lock(mu_);
         list_ = l;
         header_.clear();
+        failed_ = true;
+        remove_files(temp_files_);
+        temp_files_.clear();
         return l;
     }
     return start(sp.fd, sp.pid);
@@ -202,6 +225,10 @@ std::shared_ptr<ChunkList> Reader::start(int fd, pid_t pid) {
         std::lock_guard<std::mutex> lock(mu_);
         list_ = l;
         header_.clear();
+        if (pid <= 0) {
+            command_.clear();
+            failed_ = false;
+        }
     }
     child_pid_.store(pid);
     thread_ = std::thread(&Reader::run, this, fd, pid, l);
@@ -210,11 +237,157 @@ std::shared_ptr<ChunkList> Reader::start(int fd, pid_t pid) {
 
 void Reader::cancel() {
     if (!thread_.joinable()) return;
+    walker_cancel_.store(true, std::memory_order_release);
     if (cancel_w_ >= 0) wake_pipe(cancel_w_);
     pid_t pid = child_pid_.load();
     if (pid > 0) kill(-pid, SIGKILL);
     thread_.join();
+    walker_cancel_.store(false, std::memory_order_release);
     if (cancel_r_ >= 0) drain_pipe(cancel_r_);
+}
+
+std::shared_ptr<ChunkList> Reader::start_default_source() {
+    const char* cmd = std::getenv("FZF_DEFAULT_COMMAND");
+    if (cmd && *cmd) return start_command(cmd);
+    return start_walker(opts_.walker_root, opts_.walker, opts_.walker_skip);
+}
+
+std::shared_ptr<ChunkList> Reader::start_walker(const std::vector<std::string>& roots,
+                                                const WalkerOpts& walker,
+                                                const std::vector<std::string>& skip) {
+    cancel();
+    auto l = std::make_shared<ChunkList>(builder_.with_aux(),
+                                         static_cast<uint32_t>(opts_.header_lines));
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        list_ = l;
+        header_.clear();
+        command_.clear();
+        failed_ = false;
+    }
+    child_pid_.store(-1);
+    thread_ = std::thread(&Reader::walk, this, roots, walker, skip, l);
+    return l;
+}
+
+// fzf: reader.go readFiles (fastwalk with SortFilesFirst, follow, hidden,
+// and the ignore rules of --walker-skip). Symlink loops are cut by
+// remembering every directory's (device, inode).
+void Reader::walk(std::vector<std::string> roots, WalkerOpts walker, std::vector<std::string> skip,
+                  std::shared_ptr<ChunkList> list) {
+    namespace fs = std::filesystem;
+    std::vector<std::string> ignores_base, ignores_full, ignores_suffix;
+    for (const auto& ignore : skip) {
+        if (ignore.find('/') != std::string::npos) {
+            if (!ignore.empty() && ignore[0] == '/') {
+                ignores_suffix.push_back(ignore);
+            } else {
+                // 'foo/bar' should match 'foo/bar' and 'baz/foo/bar' but not 'bazfoo/bar'
+                ignores_full.push_back(ignore);
+                ignores_suffix.push_back("/" + ignore);
+            }
+        } else {
+            ignores_base.push_back(ignore);
+        }
+    }
+    auto trim_path = [](std::string p) {
+        while (p.size() > 1 && p[0] == '.' && p[1] == '/') p.erase(0, 2);
+        if (p.empty()) p = ".";
+        return p;
+    };
+    auto has_suffix = [](const std::string& s, const std::string& suf) {
+        return s.size() >= suf.size() && s.compare(s.size() - suf.size(), suf.size(), suf) == 0;
+    };
+    std::set<std::pair<dev_t, ino_t>> visited;
+    uint32_t seen = 0;
+    const uint32_t header_lines = static_cast<uint32_t>(opts_.header_lines);
+    auto push = [&](const std::string& rec) {
+        if (seen < header_lines) {
+            {
+                std::lock_guard<std::mutex> lock(mu_);
+                header_.emplace_back(rec);
+            }
+            ++seen;
+            wake();
+            return;
+        }
+        ++seen;
+        const ItemSpec& spec = builder_.build(rec, list->first_index() + list->count());
+        list->append(spec);
+        wake();
+    };
+    auto cancelled = [&]() { return walker_cancel_.load(std::memory_order_acquire); };
+
+    struct Entry {
+        std::string path;   // trimmed, as printed
+        bool is_dir;
+    };
+    // Iterative DFS in fastwalk's order: files of a directory first, then
+    // its subdirectories, each group sorted by name.
+    std::function<void(const std::string&)> walk_dir = [&](const std::string& dir) {
+        if (cancelled()) return;
+        std::error_code ec;
+        struct stat st {};
+        if (::stat(dir.c_str(), &st) == 0) {
+            auto key = std::make_pair(st.st_dev, st.st_ino);
+            if (!visited.insert(key).second) return;   // loop or duplicate
+        }
+        std::vector<Entry> files, dirs;
+        for (fs::directory_iterator it(dir, fs::directory_options::skip_permission_denied, ec), end;
+             !ec && it != end; it.increment(ec)) {
+            if (cancelled()) return;
+            const fs::directory_entry& de = *it;
+            std::string path = trim_path(de.path().string());
+            std::string base = de.path().filename().string();
+            std::error_code sec;
+            bool is_symlink = de.is_symlink(sec);
+            bool is_dir = false;
+            if (is_symlink) {
+                if (!walker.follow) {
+                    // Symlinks are listed as files, never entered.
+                    is_dir = false;
+                } else {
+                    is_dir = fs::is_directory(de.path(), sec);
+                }
+            } else {
+                is_dir = de.is_directory(sec);
+            }
+            if (is_dir) {
+                if (!walker.hidden && !base.empty() && base[0] == '.' && base != "..") continue;
+                if (std::find(ignores_base.begin(), ignores_base.end(), base) != ignores_base.end()) continue;
+                if (std::find(ignores_full.begin(), ignores_full.end(), path) != ignores_full.end()) continue;
+                bool skipped = false;
+                for (const auto& suf : ignores_suffix) {
+                    if (has_suffix(path, suf)) { skipped = true; break; }
+                }
+                if (skipped) continue;
+                dirs.push_back(Entry{path, true});
+            } else {
+                if (!walker.hidden && !base.empty() && base[0] == '.') continue;
+                files.push_back(Entry{path, false});
+            }
+        }
+        auto by_name = [](const Entry& a, const Entry& b) { return a.path < b.path; };
+        std::sort(files.begin(), files.end(), by_name);
+        std::sort(dirs.begin(), dirs.end(), by_name);
+        if (walker.file) {
+            for (const auto& f : files) {
+                if (cancelled()) return;
+                push(f.path);
+            }
+        }
+        for (const auto& d : dirs) {
+            if (cancelled()) return;
+            if (walker.dir) push(d.path + "/");
+            walk_dir(d.path);
+        }
+    };
+    for (const auto& root : roots) {
+        if (cancelled()) break;
+        walk_dir(root);
+    }
+    list->finish();
+    wake();
 }
 
 void Reader::wait() {
@@ -306,9 +479,18 @@ void Reader::run(int fd, pid_t pid, std::shared_ptr<ChunkList> list) {
     close(fd);
     if (pid > 0) {
         if (cancelled) kill(-pid, SIGKILL);
-        int status;
+        int status = 0;
         while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
         child_pid_.store(-1);
+        std::vector<std::string> temps;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            // fzf: reader.fin(success) -- the command name is reported when
+            // it failed and was not killed by us.
+            failed_ = !cancelled && !(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+            temps.swap(temp_files_);
+        }
+        remove_files(temps);
     }
     wake();
 }

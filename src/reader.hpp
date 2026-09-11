@@ -12,6 +12,7 @@
 // waits for a producer's EOF.
 
 #include "chunklist.hpp"
+#include "executor.hpp"
 #include "options.hpp"
 #include "tokenizer.hpp"
 
@@ -93,10 +94,24 @@ public:
     // Start reading `fd` (ownership taken) into a fresh ChunkList generation.
     // Any read in flight is cancelled first.
     std::shared_ptr<ChunkList> start_fd(int fd);
-    // Start reading the stdout of `command` run under $SHELL -c in its own
-    // process group (fzf: readFromCommand).
+    // Start reading the stdout of `command` run through the executor
+    // ($SHELL -c or --with-shell) in its own process group (fzf:
+    // readFromCommand). `env` holds the FZF_* variables for the child;
+    // `temp_files` (from {f} placeholders) are removed once the command
+    // has been read to EOF.
     std::shared_ptr<ChunkList> start_command(const std::string& command,
-                                             const std::vector<std::string>& env = {});
+                                             const std::vector<std::string>& env = {},
+                                             const std::vector<std::string>& temp_files = {});
+
+    // Walk the file system (fzf: readFiles) -- the default source when stdin
+    // is a tty and $FZF_DEFAULT_COMMAND is unset. Paths are relative to the
+    // roots without a leading "./"; directories carry a trailing '/'.
+    std::shared_ptr<ChunkList> start_walker(const std::vector<std::string>& roots,
+                                            const WalkerOpts& walker,
+                                            const std::vector<std::string>& skip);
+
+    // fzf: ReadSource for a tty stdin: $FZF_DEFAULT_COMMAND or the walker.
+    std::shared_ptr<ChunkList> start_default_source();
 
     // Stop the read in flight: cancel pipe, SIGKILL the command's process
     // group, join. The current generation is marked finished.
@@ -108,23 +123,33 @@ public:
     bool finished() const;
     // The --header-lines records diverted from the current generation.
     std::vector<std::string> header_lines() const;
+    // The command of the current generation when it exited with an error
+    // (fzf shows "[Command failed: ...]" in the info line); "" otherwise.
+    std::string failed_command() const;
 
 private:
     std::shared_ptr<ChunkList> start(int fd, pid_t pid);
     void run(int fd, pid_t pid, std::shared_ptr<ChunkList> list);
+    void walk(std::vector<std::string> roots, WalkerOpts walker, std::vector<std::string> skip,
+              std::shared_ptr<ChunkList> list);
     void wake();
 
     const Options& opts_;
     ItemBuilder& builder_;
+    Executor executor_;
 
     mutable std::mutex mu_;
     std::shared_ptr<ChunkList> list_;
     std::vector<std::string> header_;
+    std::string command_;                  // of the current generation
+    std::vector<std::string> temp_files_;
+    bool failed_ = false;
 
     std::thread thread_;
     int cancel_r_ = -1;
     int cancel_w_ = -1;
     std::atomic<pid_t> child_pid_{-1};
+    std::atomic<bool> walker_cancel_{false};
 
     std::atomic<bool> wake_pending_{false};
     std::mutex wake_mu_;

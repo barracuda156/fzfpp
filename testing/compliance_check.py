@@ -817,8 +817,7 @@ def test_print0(fzf):
         timeout=2.0)
     check("output/--print0", out == b"apple\0",
           f"stdout was {out!r}, expected b'apple\\x00' (NUL-separated, "
-          f"not newline-separated)",
-          xfail="T1.8")
+          f"not newline-separated)")
 
 
 def test_selection_order(fzf):
@@ -829,8 +828,7 @@ def test_selection_order(fzf):
     check("output/selection-order", out == b"three\none\n",
           f"stdout was {out!r}, expected b'three\\none\\n' (select 'three' "
           f"then 'one': fzf prints multi-selections in selection order, "
-          f"not list order)",
-          xfail="T1.8")
+          f"not list order)")
 
 
 def test_header_lines_excluded(fzf):
@@ -863,8 +861,7 @@ def test_become(fzf):
     check("bind/become-replaces-process",
           out.strip() == b"BECAME one" and code == 0,
           f"stdout={out!r} exit={code!r}, expected stdout b'BECAME one\\n' "
-          f"and exit 0 (become() execs and replaces the fzf process)",
-          xfail="T1.7")
+          f"and exit 0 (become() execs and replaces the fzf process)")
 
 
 def test_execute_runs_on_tty(fzf):
@@ -884,8 +881,7 @@ def test_execute_runs_on_tty(fzf):
               f"marker file {marker} was not created -- expected "
               f"execute() to run its command with both stdin and stdout "
               f"attached to a tty (chafa/less/etc. -style previewers and "
-              f"editors need this)",
-              xfail="T1.7")
+              f"editors need this)")
     finally:
         try:
             os.unlink(marker)
@@ -908,8 +904,7 @@ def test_execute_silent(fzf):
         ok = os.path.exists(marker)
         check("bind/execute-silent-runs", ok,
               f"marker file {marker} was not created by "
-              f"ctrl-r:execute-silent(touch {marker})",
-              xfail="T1.7")
+              f"ctrl-r:execute-silent(touch {marker})")
     finally:
         try:
             os.unlink(marker)
@@ -922,8 +917,7 @@ def test_load_event(fzf):
         fzf, ["--bind", "load:accept"], b"one\ntwo\n", [], timeout=1.5)
     check("bind/load-event", out.strip() == b"one",
           f"stdout was {out!r}, expected b'one\\n' -- load:accept should "
-          f"fire once the initial item batch has loaded, with no keys sent",
-          xfail="T1.7")
+          f"fire once the initial item batch has loaded, with no keys sent")
 
 
 def test_space_key_name(fzf):
@@ -932,8 +926,7 @@ def test_space_key_name(fzf):
         timeout=1.5)
     check("bind/space-key-name", out.strip() == b"one",
           f"stdout was {out!r}, expected b'one\\n' after pressing space "
-          f"with --bind space:accept",
-          xfail="T1.2")
+          f"with --bind space:accept")
 
 
 def test_expect_f1(fzf):
@@ -942,21 +935,21 @@ def test_expect_f1(fzf):
     check("expect/f1-key", out == b"f1\none\n",
           f"stdout was {out!r}, expected b'f1\\none\\n' after pressing F1 "
           f"(ESC O P, the SS3 encoding xterm sends for F1) with "
-          f"--expect f1",
-          xfail="T1.8")
+          f"--expect f1")
 
 
 def test_placeholder_plus_and_f(fzf):
+    # {+} expands to the quoted current item ('one') -- the shell strips the
+    # quotes when echoing -- and {f} to the path of a temp file holding it.
     _out, screen, _code = run_interactive(
-        fzf, ["-m", "--preview", "echo PLUS[{+}] F[{f}]"], b"one\ntwo\n",
-        [(0.8, ENTER)], rows=16, cols=60, timeout=2.0)
-    has_plus = b"PLUS['one']" in screen
-    has_f_path = bool(re.search(rb"F\[[^\]]*[/\\][^\]]*\]", screen))
+        fzf, ["-m", "--preview", "echo PLUS[{+}] F[{f}]; cat {f}"],
+        b"one\ntwo\n", [(0.8, ENTER)], rows=16, cols=80, timeout=2.0)
+    has_plus = b"PLUS[one]" in screen
+    has_f_path = bool(re.search(rb"F\[/[^ \]]*fzf-temp-", screen))
     check("placeholder/plus-and-file", has_plus and has_f_path,
-          f"expected the preview output to contain \"PLUS['one']\" "
-          f"(has_plus={has_plus}) and \"F[<a path>]\" (has_f_path="
-          f"{has_f_path})",
-          xfail="T1.6")
+          f"expected the preview output to contain \"PLUS[one]\" "
+          f"(has_plus={has_plus}) and \"F[/...fzf-temp-...\" (has_f_path="
+          f"{has_f_path})")
 
 
 def test_reload_does_not_block_on_streaming_stdin(fzf):
@@ -1093,8 +1086,7 @@ def test_preview_window_up_is_horizontal(fzf):
     check("preview/window-up-is-horizontal-split", ok,
           f"preview row index={preview_idx}, list-item row index="
           f"{item_idx} -- expected the preview pane ABOVE the list (a "
-          f"horizontal split), not beside it",
-          xfail="T1.10")
+          f"horizontal split), not beside it")
 
 
 def test_stdin_tty_runs_default_command(fzf):
@@ -1125,8 +1117,7 @@ def test_stdin_tty_runs_default_command(fzf):
     check("stdin/tty-runs-default-command", b"from-default" in buf,
           f"expected 'from-default' (FZF_DEFAULT_COMMAND='echo "
           f"from-default') to appear on screen when fzf's stdin is a tty "
-          f"(no pipe, no positional command)",
-          xfail="T1.9")
+          f"(no pipe, no positional command)")
     try:
         os.write(master, b"\x03")
     except OSError:
@@ -1175,13 +1166,224 @@ def run_t1_11_scenarios(fzf):
     test_stdin_tty_runs_default_command(fzf)
 
 
+# --------------------------------------------------------------------------
+# T1.7 / T1.8 scenarios: events, actions, output contract.
+# --------------------------------------------------------------------------
+
+def test_zero_one_events(fzf):
+    _out, _screen, code = run_interactive(
+        fzf, ["--bind", "zero:abort", "-q", "nomatch"], b"one\ntwo\n", [],
+        timeout=1.5)
+    check("bind/zero-event", code == 130,
+          f"exit code was {code!r}, expected 130 (zero:abort fires when the "
+          f"final result set is empty)")
+    out, _screen, code = run_interactive(
+        fzf, ["--bind", "one:accept", "-q", "tw"], b"one\ntwo\n", [],
+        timeout=1.5)
+    check("bind/one-event", out.strip() == b"two" and code == 0,
+          f"stdout={out!r} exit={code!r}, expected b'two\\n' and 0 "
+          f"(one:accept fires when exactly one item matches)")
+
+
+def test_change_event_once_per_paste(fzf):
+    marker = os.path.join(
+        tempfile.gettempdir(), f"fzfpp_compliance_change_{os.getpid()}")
+    try:
+        os.unlink(marker)
+    except OSError:
+        pass
+    try:
+        run_interactive(fzf, ["--bind", f"change:execute-silent(echo x >> {marker})"],
+                        b"one\n", [(0.5, b"abc"), (0.3, ENTER)], timeout=2.0)
+        n = len(open(marker).read().splitlines()) if os.path.exists(marker) else 0
+        check("bind/change-fires-once-per-paste", n == 1,
+              f"change fired {n} times for a pasted 'abc', expected once")
+    finally:
+        try:
+            os.unlink(marker)
+        except OSError:
+            pass
+
+
+def test_disabled_change_reload(fzf):
+    out, _screen, _code = run_interactive(
+        fzf, ["--disabled", "--bind", "change:reload(echo got-{q})"], b"one\n",
+        [(0.4, b"zz"), (0.6, ENTER)], timeout=2.0)
+    check("bind/disabled-change-reload", out.strip() == b"got-zz",
+          f"stdout was {out!r}, expected b'got-zz\\n' (--disabled with a "
+          f"change:reload({{q}}) binding must reload on every query edit)")
+
+
+def test_abort_exit_codes(fzf):
+    out, _screen, code = run_interactive(fzf, ["--print-query"], b"one\n",
+                                          [(0.3, b"ab"), (0.3, b"\x1b")],
+                                          timeout=1.5)
+    check("exit/esc-130-no-output", code == 130 and out == b"",
+          f"exit={code!r} stdout={out!r}, expected 130 and no output on Esc")
+    _out, _screen, code = run_interactive(fzf, [], b"one\n", [(0.3, CTRL_C)],
+                                           timeout=1.5)
+    check("exit/ctrl-c-130", code == 130, f"exit={code!r}, expected 130")
+
+
+def test_multi_limit(fzf):
+    out, _screen, _code = run_interactive(
+        fzf, ["-m", "2", "--reverse"], b"a\nb\nc\n",
+        [(0.2, TAB), (0.2, TAB), (0.2, TAB), (0.3, ENTER)], timeout=2.0)
+    check("output/--multi-limit", out == b"a\nb\n",
+          f"stdout was {out!r}, expected b'a\\nb\\n' (--multi=2 caps the "
+          f"selection at two items)")
+
+
+def test_print_query_actions(fzf):
+    out, _screen, code = run_interactive(
+        fzf, ["--bind", "ctrl-p:print-query"], b"one\n",
+        [(0.3, b"hey"), (0.3, b"\x10")], timeout=1.5)
+    check("bind/print-query", out == b"hey\n" and code == 0,
+          f"stdout={out!r} exit={code!r}, expected b'hey\\n' and 0")
+    out, _screen, _code = run_interactive(
+        fzf, ["--bind", "enter:accept-or-print-query", "-q", "nomatch"],
+        b"one\n", [(0.3, ENTER)], timeout=1.5)
+    check("bind/accept-or-print-query", out == b"nomatch\n",
+          f"stdout was {out!r}, expected b'nomatch\\n'")
+
+
+def test_become_environment(fzf):
+    out, _screen, code = run_interactive(
+        fzf, ["--bind", "enter:become(echo $FZF_QUERY:{})"], b"one\n",
+        [(0.2, b"on"), (0.3, ENTER)], timeout=2.0)
+    check("bind/become-environment", out.strip() == b"on:one" and code == 0,
+          f"stdout={out!r} exit={code!r}, expected b'on:one' (FZF_QUERY "
+          f"and {{}} available to become())")
+
+
+def test_focus_event(fzf):
+    marker = os.path.join(
+        tempfile.gettempdir(), f"fzfpp_compliance_focus_{os.getpid()}")
+    try:
+        os.unlink(marker)
+    except OSError:
+        pass
+    try:
+        run_interactive(fzf, ["--bind", f"focus:execute-silent(echo {{}} >> {marker})",
+                              "--reverse"], b"a\nb\n",
+                        [(0.4, DOWN), (0.4, ENTER)], timeout=2.0)
+        seen = open(marker).read().split() if os.path.exists(marker) else []
+        check("bind/focus-event", seen == ["a", "b"],
+              f"focus fired for {seen}, expected ['a', 'b'] (once on load, "
+              f"once after moving down)")
+    finally:
+        try:
+            os.unlink(marker)
+        except OSError:
+            pass
+
+
+def test_transform_actions(fzf):
+    out, screen, _code = run_interactive(
+        fzf, ["--bind", "ctrl-r:change-prompt(NEW> )+transform-header(echo HDR-{q})"
+              "+transform(echo change-query:foo)", "--reverse"],
+        b"one\nfoo\n", [(0.3, b"\x12"), (0.4, ENTER)], rows=12, cols=40,
+        timeout=2.0)
+    rows_list = last_frame_rows(screen, 12, 40)
+    ok = any("NEW>" in r for r in rows_list) and \
+        any("HDR-" in r for r in rows_list) and out.strip() == b"foo"
+    check("bind/change-prompt-transform-header-transform", ok,
+          f"stdout={out!r}, rows={rows_list!r} -- expected the new prompt, "
+          f"the transformed header and 'foo' accepted via transform()")
+
+
+def test_reload_keeps_cursor_usable(fzf):
+    out, _screen, _code = run_interactive(
+        fzf, ["--bind", "ctrl-r:reload(seq 3)", "--reverse"], b"one\n",
+        [(0.3, b"\x12"), (0.5, DOWN), (0.3, ENTER)], timeout=2.0)
+    check("bind/reload-then-navigate", out.strip() == b"2",
+          f"stdout was {out!r}, expected b'2' (reload(seq 3), down, enter)")
+
+
+def test_select_1_exit_0_with_expect(fzf):
+    out, _screen, code = run_interactive(
+        fzf, ["-1", "-q", "two", "--expect", "f1", "--print-query"],
+        b"one\ntwo\n", [], timeout=1.5)
+    check("output/--select-1-with-expect", out == b"two\n\ntwo\n" and code == 0,
+          f"stdout={out!r} exit={code!r}, expected b'two\\n\\ntwo\\n' (query, "
+          f"blank expect line, item) and 0")
+    out, _screen, code = run_interactive(
+        fzf, ["-0", "-q", "zzz"], b"one\ntwo\n", [], timeout=1.5)
+    check("output/--exit-0", out == b"" and code == 1,
+          f"stdout={out!r} exit={code!r}, expected no output and 1")
+
+
+def test_default_command_walker(fzf):
+    # A tty stdin with no FZF_DEFAULT_COMMAND lists the files below the
+    # current directory (fzf: readFiles), without a leading "./".
+    root = tempfile.mkdtemp(prefix="fzfpp_walk_")
+    try:
+        os.makedirs(os.path.join(root, "sub", ".git"))
+        os.makedirs(os.path.join(root, "node_modules"))
+        for rel in ("a.txt", "sub/b.txt", "sub/.git/config", "node_modules/x.js"):
+            with open(os.path.join(root, rel), "w") as f:
+                f.write("x\n")
+        fzf_abs = os.path.abspath(fzf)
+        sys.stdout.flush()
+        pid, master = pty.fork()
+        if pid == 0:
+            os.chdir(root)
+            fzf = fzf_abs
+            os.environ["TERM"] = "xterm-256color"
+            os.environ.pop("FZF_DEFAULT_COMMAND", None)
+            os.execv(fzf, [fzf, "-f", ""])
+            os._exit(127)
+        set_winsize(master, 20, 60)
+        buf = b""
+        end = time.time() + 2.0
+        while time.time() < end:
+            r, _, _ = select.select([master], [], [], 0.1)
+            if master in r:
+                try:
+                    d = os.read(master, 65536)
+                except OSError:
+                    break
+                if not d:
+                    break
+                buf += d
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+        try:
+            os.close(master)
+        except OSError:
+            pass
+        lines = sorted(l.strip() for l in buf.decode(errors="replace").splitlines() if l.strip())
+        check("stdin/tty-walker-lists-files", lines == ["a.txt", "sub/b.txt"],
+              f"walker output was {lines!r}, expected ['a.txt', 'sub/b.txt'] "
+              f"(.git and node_modules skipped, no './' prefix)")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def run_t1_7_scenarios(fzf):
+    test_zero_one_events(fzf)
+    test_change_event_once_per_paste(fzf)
+    test_disabled_change_reload(fzf)
+    test_abort_exit_codes(fzf)
+    test_multi_limit(fzf)
+    test_print_query_actions(fzf)
+    test_become_environment(fzf)
+    test_focus_event(fzf)
+    test_transform_actions(fzf)
+    test_reload_keeps_cursor_usable(fzf)
+    test_select_1_exit_0_with_expect(fzf)
+    test_default_command_walker(fzf)
+
+
 def main():
     fzf = sys.argv[1] if len(sys.argv) > 1 else shutil.which("fzf")
     if not fzf or not os.path.exists(fzf):
         print(f"fzf binary not found: {fzf!r}", file=sys.stderr)
         return 3
 
-    real = shutil.which(fzf) or fzf
+    real = os.path.abspath(shutil.which(fzf) or fzf)
     print(f"testing: {real}")
     version_text = run_fzf(real, ["--version"], 24, 80, [], drain_s=0.5)
     print(f"reported version: {version_text.strip()[:80]}")
@@ -1201,6 +1403,7 @@ def main():
 
     print()
     run_t1_11_scenarios(real)
+    run_t1_7_scenarios(real)
 
     print()
     print(f"{PASS_COUNT} passed, {len(XPASS_NAMES)} xpassed "

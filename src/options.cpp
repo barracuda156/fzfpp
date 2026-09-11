@@ -1312,136 +1312,6 @@ bool has_reload_or_transform_on_start(const Options& opts) {
 }
 
 // ---------------------------------------------------------------------------
-// Legacy view (removed in T1.7)
-// ---------------------------------------------------------------------------
-
-// fzf's key names are case-insensitive; the legacy dispatcher looks keys up
-// in lowercase, except the letter after "alt-" (alt-B and alt-b differ).
-std::string normalize_bind_key(const std::string& key) {
-    std::string lower = to_lower(key);
-    if (lower.size() > 4 && lower.compare(0, 4, "alt-") == 0) lower[4] = key[4];
-    return lower;
-}
-
-void legacy_split_binds(Options& opts) {
-    static const std::vector<std::string> trailing_colon_actions = {
-        "reload", "preview", "change-preview", "change-prompt", "change-header",
-        "transform-header", "transform", "execute", "execute-silent",
-        "become", "unbind", "rebind",
-    };
-    auto match_trailing = [](const std::string& s, size_t seg_start) -> size_t {
-        for (const auto& name : trailing_colon_actions) {
-            size_t n = name.size();
-            if (seg_start + n < s.size() && s.compare(seg_start, n, name) == 0 && s[seg_start + n] == ':') {
-                return n;
-            }
-        }
-        return 0;
-    };
-
-    for (const auto& spec : opts.bind_specs) {
-        size_t start = 0, seg_start = 0;
-        bool seg_start_valid = false;
-        int depth = 0;
-        bool in_trailing_arg = false;
-        for (size_t i = 0; i <= spec.size(); ++i) {
-            bool at_end = (i == spec.size());
-            char c = at_end ? '\0' : spec[i];
-            if (!in_trailing_arg) {
-                if (c == '(' || c == '[' || c == '{') depth++;
-                else if (c == ')' || c == ']' || c == '}') { if (depth > 0) depth--; }
-                else if (c == ':' && depth == 0) {
-                    if (!seg_start_valid) { seg_start_valid = true; seg_start = i + 1; }
-                    else {
-                        size_t n = match_trailing(spec, seg_start);
-                        if (n > 0 && seg_start + n == i) in_trailing_arg = true;
-                    }
-                } else if (c == '+' && depth == 0 && seg_start_valid) {
-                    seg_start = i + 1;
-                }
-            }
-            if ((c == ',' && depth == 0 && !in_trailing_arg) || at_end) {
-                std::string pair = spec.substr(start, i - start);
-                start = i + 1;
-                seg_start_valid = false;
-                size_t colon = pair.find(':');
-                if (colon != std::string::npos) {
-                    std::string key = pair.substr(0, colon);
-                    std::string action = pair.substr(colon + 1);
-                    if (!key.empty()) opts.bindings[normalize_bind_key(key)] = action;
-                }
-                if (in_trailing_arg) break;
-            }
-        }
-    }
-
-    for (const auto& spec : opts.toggle_sort_specs) {
-        opts.bindings[normalize_bind_key(spec)] = "toggle-sort";
-    }
-
-    for (const char* key : {"ctrl-c", "ctrl-g", "ctrl-q"}) opts.bindings.emplace(key, "abort");
-    static const std::pair<const char*, const char*> default_binds[] = {
-        {"ctrl-j", "down"}, {"ctrl-k", "up"}, {"ctrl-p", "up"}, {"ctrl-n", "down"},
-        {"ctrl-u", "unix-line-discard"}, {"ctrl-w", "unix-word-rubout"},
-        {"ctrl-a", "beginning-of-line"}, {"ctrl-e", "end-of-line"},
-        {"ctrl-b", "backward-char"}, {"ctrl-f", "forward-char"},
-        {"ctrl-d", "delete-char/eof"}, {"ctrl-h", "backward-delete-char"},
-        {"alt-b", "backward-word"}, {"alt-f", "forward-word"}, {"alt-d", "kill-word"},
-        {"alt-bs", "backward-kill-word"}, {"btab", "toggle+up"}, {"tab", "toggle+down"},
-        {"home", "first"}, {"end", "last"},
-    };
-    for (const auto& [key, action] : default_binds) opts.bindings.emplace(key, action);
-}
-
-void derive_legacy_fields(Options& opts) {
-    opts.disabled = opts.phony;
-    if (opts.filter) opts.query = *opts.filter;
-
-    if (opts.height.is_set() && opts.height.size > 0) {
-        opts.legacy_height = static_cast<int>(opts.height.size);
-        opts.height_is_percent = opts.height.percent;
-        if (opts.height.percent) opts.legacy_height = std::clamp(opts.legacy_height, 0, 100);
-    } else {
-        opts.legacy_height = 0;
-        opts.height_is_percent = false;
-    }
-    opts.legacy_header = opts.header.empty() ? "" : opts.header[0];
-    opts.border = (opts.border_shape != BorderShape::None);
-    opts.no_mouse = !opts.mouse;
-    opts.preview_command = opts.preview.command;
-    opts.info_hidden = (opts.info_style == InfoStyle::Hidden);
-    switch (opts.preview.position) {
-        case WindowPosition::Up: opts.preview_position = "up"; break;
-        case WindowPosition::Down: opts.preview_position = "down"; break;
-        case WindowPosition::Left: opts.preview_position = "left"; break;
-        default: opts.preview_position = "right"; break;
-    }
-    opts.preview_size_percent = static_cast<int>(opts.preview.size.size);
-    opts.preview_size_is_percent = opts.preview.size.percent;
-    opts.preview_wrap = opts.preview.wrap;
-    opts.preview_hidden = opts.preview.hidden;
-    opts.preview_follow = opts.preview.follow;
-
-    opts.legacy_delimiter = opts.delimiter.awk ? "" : opts.delimiter.pattern;
-
-    opts.bindings.clear();
-    legacy_split_binds(opts);
-
-    opts.expect_keys.clear();
-    for (const auto& spec : opts.expect_specs) {
-        for (auto key : split(spec, ',')) {
-            size_t a = key.find_first_not_of(" \t");
-            size_t b = key.find_last_not_of(" \t");
-            if (a == std::string::npos) continue;
-            key = key.substr(a, b - a + 1);
-            if (std::find(opts.expect_keys.begin(), opts.expect_keys.end(), key) == opts.expect_keys.end()) {
-                opts.expect_keys.push_back(key);
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Usage
 // ---------------------------------------------------------------------------
 
@@ -1548,6 +1418,10 @@ fzf++ )" ;
 // ---------------------------------------------------------------------------
 // Public helpers
 // ---------------------------------------------------------------------------
+
+void apply_preview_window(PreviewOpts& opts, const std::string& spec) {
+    parse_preview_window(opts, spec);
+}
 
 const char* fzf_compat_version() { return kCompatVersion; }
 const char* fzfpp_version() { return kPortVersion; }
@@ -1716,7 +1590,6 @@ Options parse_option_args(const std::vector<std::string>& args, bool use_default
 
     validate(opts);
     post_process(opts);
-    derive_legacy_fields(opts);
     return opts;
 }
 

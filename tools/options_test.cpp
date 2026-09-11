@@ -45,8 +45,7 @@ static void test_defaults() {
     // scheme defaults to "path" when stdin is a tty, "default" otherwise
     CHECK(o.criteria.size() == (isatty(STDIN_FILENO) ? 3u : 2u) && o.criteria.back() == Criterion::Length);
     CHECK(*o.pointer == "\xE2\x96\x8C" && *o.marker == "\xE2\x94\x83");
-    CHECK(o.border_shape == BorderShape::None && !o.border);
-    CHECK(o.bindings.at("ctrl-c") == "abort" && o.bindings.at("tab") == "toggle+down");
+    CHECK(o.border_shape == BorderShape::None);
 }
 
 static void test_every_option_name_is_known() {
@@ -173,14 +172,14 @@ static void test_value_forms() {
 
 static void test_optional_values() {
     Options o = parse({"--border"});
-    CHECK(o.border_shape == BorderShape::Rounded && o.border);
+    CHECK(o.border_shape == BorderShape::Rounded);
     CHECK(parse({"--border=sharp"}).border_shape == BorderShape::Sharp);
     CHECK(parse({"--border", "sharp"}).border_shape == BorderShape::Sharp);
     CHECK(parse({"--border", "--reverse"}).border_shape == BorderShape::Rounded);   // next arg is an option
     CHECK(parse({"--border", "--border=rounded"}).border_shape == BorderShape::Rounded);
     CHECK(parse({"--border", "+m"}).border_shape == BorderShape::Rounded && parse({"--border", "+m"}).multi == 0);
     CHECK(parse({"--no-border"}).border_shape == BorderShape::None);
-    CHECK(parse({"--border=none"}).border_shape == BorderShape::None && !parse({"--border=none"}).border);
+    CHECK(parse({"--border=none"}).border_shape == BorderShape::None);
     CHECK(parse({"--scrollbar"}).scrollbar == std::nullopt);
     CHECK(*parse({"--scrollbar", "#"}).scrollbar == "#");
     CHECK(*parse({"--no-scrollbar"}).scrollbar == "");
@@ -206,21 +205,20 @@ static void test_precedence() {
     CHECK(parse({"--exact", "+e"}).fuzzy);
     CHECK(parse({"-e"}).fuzzy == false);
     CHECK(parse({"--disabled", "--enabled"}).phony == false);
-    CHECK(parse({"--phony"}).phony && parse({"--phony"}).disabled);
+    CHECK(parse({"--phony"}).phony);
     CHECK(parse({"--info=hidden", "--info=inline"}).info_style == InfoStyle::Inline);
     CHECK(parse({"--info=inline"}).info_prefix == " < ");
     CHECK(parse({"--info=inline:>> "}).info_prefix == ">> ");
-    CHECK(parse({"--no-info"}).info_hidden);
+    CHECK(parse({"--no-info"}).info_style == InfoStyle::Hidden);
 }
 
 static void test_accumulating_lists() {
     Options o = parse({"--bind", "ctrl-a:accept", "--bind", "ctrl-b:abort"});
-    CHECK(o.bind_specs.size() == 2);
-    CHECK(o.bindings.at("ctrl-a") == "accept" && o.bindings.at("ctrl-b") == "abort");
+    CHECK(o.bind_specs.size() == 2 && o.bind_specs[1] == "ctrl-b:abort");
     o = parse({"--expect", "ctrl-a,ctrl-b", "--expect", "f1"});
-    CHECK(o.expect_specs.size() == 2 && o.expect_keys.size() == 3 && o.expect_keys[2] == "f1");
+    CHECK(o.expect_specs.size() == 2 && o.expect_specs[1] == "f1");
     o = parse({"--expect", "ctrl-a", "--no-expect"});
-    CHECK(o.expect_specs.empty() && o.expect_keys.empty());
+    CHECK(o.expect_specs.empty());
     o = parse({"--color", "fg:1", "--color", "bg:2,hl:3:bold"});
     CHECK(o.theme.slot(ThemeSlot::Fg).color == 1);
     CHECK(o.theme.slot(ThemeSlot::Bg).color == 2);
@@ -240,15 +238,14 @@ static void test_accumulating_lists() {
 static void test_height() {
     Options o = parse({"--height", "40%"});
     CHECK(o.height.percent && o.height.size == 40 && !o.height.auto_);
-    CHECK(o.legacy_height == 40 && o.height_is_percent);
     o = parse({"--height", "~40%"});
     CHECK(o.height.auto_ && o.height.percent && o.height.size == 40);
     o = parse({"--height", "-3"});
     CHECK(o.height.inverse && !o.height.percent && o.height.size == 3);
     o = parse({"--height", "20"});
-    CHECK(!o.height.percent && o.height.size == 20 && o.legacy_height == 20 && !o.height_is_percent);
+    CHECK(!o.height.percent && o.height.size == 20);
     o = parse({"--height", "40%", "--no-height"});
-    CHECK(!o.height.is_set() && o.legacy_height == 0);
+    CHECK(!o.height.is_set());
     CHECK(parse_error({"--height", "101%"}) == "height too large (max: 100%)");
     CHECK(parse({"--min-height", "5+"}).min_height == -5);
     CHECK(parse({"--min-height", "5"}).min_height == 5);
@@ -257,20 +254,21 @@ static void test_height() {
 static void test_preview_window() {
     Options o = parse({"--preview-window", "up:60%:wrap"});
     CHECK(o.preview.position == WindowPosition::Up && o.preview.size.size == 60 && o.preview.wrap);
-    CHECK(o.preview_position == "up" && o.preview_size_percent == 60 && o.preview_wrap);
     o = parse({"--preview-window", "border-rounded,left,35%,wrap,hidden,follow,~3,+{2}-5"});
     CHECK(o.preview.position == WindowPosition::Left && o.preview.size.size == 35 && o.preview.hidden);
     CHECK(o.preview.follow && o.preview.header_lines == 3 && o.preview.scroll == "+{2}-5");
     CHECK(o.preview.border == BorderShape::Rounded);
     o = parse({"--preview-window", "down,10"});
     CHECK(o.preview.position == WindowPosition::Down && !o.preview.size.percent && o.preview.size.size == 10);
-    CHECK(!o.preview_size_is_percent && o.preview_size_percent == 10);
     o = parse({"--preview-window", "right,50%,<70(up,40%)"});
     CHECK(o.preview.threshold == 70 && o.preview.alternative && o.preview.alternative->position == WindowPosition::Up);
     o = parse({"--preview-window", "hidden", "--preview-window", "nohidden,default"});
     CHECK(!o.preview.hidden);
     o = parse({"--preview", "cat {}", "--preview-window", "noborder"});
-    CHECK(o.preview.border == BorderShape::None && o.preview_command == "cat {}");
+    CHECK(o.preview.border == BorderShape::None && o.preview.command == "cat {}");
+    PreviewOpts live = o.preview;
+    apply_preview_window(live, "down,30%,wrap");
+    CHECK(live.position == WindowPosition::Down && live.size.size == 30 && live.wrap && live.command == "cat {}");
     o = parse({"--preview-border", "sharp"});
     CHECK(o.preview.border == BorderShape::Sharp);
 }
@@ -331,9 +329,9 @@ static void test_delimiter() {
     d = parse_delimiter("[[");
     CHECK(!d.is_regex && d.pattern == "[[");           // invalid regex -> literal
     Options o = parse({"-d", "\\t"});
-    CHECK(o.legacy_delimiter == "\t");
+    CHECK(!o.delimiter.awk && !o.delimiter.is_regex && o.delimiter.pattern == "\t");
     o = parse({"-d", "[: ]"});
-    CHECK(o.legacy_delimiter == "[: ]");                // legacy consumers see the raw pattern
+    CHECK(o.delimiter.is_regex && o.delimiter.pattern == "[: ]");
 }
 
 static void test_shell_words() {
@@ -353,7 +351,7 @@ static void test_shell_words() {
 static void test_default_opts_env() {
     setenv("FZF_DEFAULT_OPTS", "--prompt 'env> ' --reverse --border", 1);
     Options o = parse_option_args({"--prompt", "cli> "}, true);
-    CHECK(o.prompt == "cli> " && o.layout == LayoutType::Reverse && o.border);
+    CHECK(o.prompt == "cli> " && o.layout == LayoutType::Reverse && o.border_shape != BorderShape::None);
     setenv("FZF_DEFAULT_OPTS", "--bogus", 1);
     std::string err;
     try { parse_option_args({}, true); } catch (const OptionError& e) { err = e.message; }
@@ -375,20 +373,6 @@ static void test_default_opts_env() {
     CHECK(o.cycle && o.info_style == InfoStyle::Inline);
     unsetenv("FZF_DEFAULT_OPTS_FILE");
     std::remove(path);
-}
-
-static void test_legacy_bind_split() {
-    Options o = parse({"--bind", "ctrl-/:toggle-preview,ctrl-space:toggle-wrap+toggle-preview-wrap"});
-    CHECK(o.bindings.at("ctrl-/") == "toggle-preview");
-    CHECK(o.bindings.at("ctrl-space") == "toggle-wrap+toggle-preview-wrap");
-    o = parse({"--bind", "focus:transform-header:case $a in a,b) echo x;; esac"});
-    CHECK(o.bindings.at("focus") == "transform-header:case $a in a,b) echo x;; esac");
-    o = parse({"--bind", "Ctrl-A:accept,ALT-B:abort,alt-b:up"});
-    CHECK(o.bindings.at("ctrl-a") == "accept" && o.bindings.at("alt-B") == "abort" && o.bindings.at("alt-b") == "up");
-    o = parse({"--bind", "ctrl-c:ignore"});
-    CHECK(o.bindings.at("ctrl-c") == "ignore");         // user binding beats the default abort
-    o = parse({"--toggle-sort", "ctrl-r"});
-    CHECK(o.bindings.at("ctrl-r") == "toggle-sort");
 }
 
 static void test_misc() {
@@ -439,7 +423,6 @@ int main() {
     test_delimiter();
     test_shell_words();
     test_default_opts_env();
-    test_legacy_bind_split();
     test_misc();
     std::printf("options_test: %d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
