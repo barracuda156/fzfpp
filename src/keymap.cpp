@@ -357,6 +357,110 @@ ActionList parse_action_list(const std::string& masked, const std::string& origi
     return actions;
 }
 
+
+// fzf: util.ToKebabCase(EventType.String()) / actionType.Name(), indexed by
+// the enum value. Generated from the enum identifiers in keymap.hpp; keep
+// in the same order.
+const char* const kEventKebab[] = {
+    "rune", "ctrl-a", "ctrl-b", "ctrl-c", "ctrl-d", "ctrl-e", "ctrl-f", "ctrl-g", "ctrl-h",
+    "tab", "ctrl-j", "ctrl-k", "ctrl-l", "enter", "ctrl-n", "ctrl-o", "ctrl-p", "ctrl-q",
+    "ctrl-r", "ctrl-s", "ctrl-t", "ctrl-u", "ctrl-v", "ctrl-w", "ctrl-x", "ctrl-y", "ctrl-z",
+    "esc", "ctrl-space", "ctrl-\\", "ctrl-]", "ctrl-^", "ctrl-/",
+    "shift-tab", "backspace", "delete", "page-up", "page-down", "up", "down", "left", "right",
+    "home", "end", "insert", "shift-up", "shift-down", "shift-left", "shift-right",
+    "shift-delete", "shift-home", "shift-end", "shift-page-up", "shift-page-down", "f1", "f2",
+    "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12", "alt-backspace", "alt-up",
+    "alt-down", "alt-left", "alt-right", "alt-delete", "alt-home", "alt-end", "alt-page-up",
+    "alt-page-down", "alt-shift-up", "alt-shift-down", "alt-shift-left", "alt-shift-right",
+    "alt-shift-delete", "alt-shift-home", "alt-shift-end", "alt-shift-page-up",
+    "alt-shift-page-down", "ctrl-up", "ctrl-down", "ctrl-left", "ctrl-right", "ctrl-home",
+    "ctrl-end", "ctrl-backspace", "ctrl-delete", "ctrl-page-up", "ctrl-page-down", "alt",
+    "ctrl-alt", "ctrl-alt-up", "ctrl-alt-down", "ctrl-alt-left", "ctrl-alt-right",
+    "ctrl-alt-home", "ctrl-alt-end", "ctrl-alt-backspace", "ctrl-alt-delete",
+    "ctrl-alt-page-up", "ctrl-alt-page-down", "ctrl-shift-up", "ctrl-shift-down",
+    "ctrl-shift-left", "ctrl-shift-right", "ctrl-shift-home", "ctrl-shift-end",
+    "ctrl-shift-delete", "ctrl-shift-page-up", "ctrl-shift-page-down", "ctrl-alt-shift-up",
+    "ctrl-alt-shift-down", "ctrl-alt-shift-left", "ctrl-alt-shift-right",
+    "ctrl-alt-shift-home", "ctrl-alt-shift-end", "ctrl-alt-shift-delete",
+    "ctrl-alt-shift-page-up", "ctrl-alt-shift-page-down", "mouse", "double-click",
+    "left-click", "right-click", "shift-left-click", "shift-right-click", "scroll-up", "scroll-down",
+    "shift-scroll-up", "shift-scroll-down", "preview-scroll-up", "preview-scroll-down", "invalid",
+    "fatal", "bracketed-paste-begin", "bracketed-paste-end", "resize", "change",
+    "backward-eof", "start", "load", "focus", "one", "zero", "result", "jump", "jump-cancel",
+    "click-header", "click-footer", "multi", "every", "result-final",
+};
+const char* const kActionKebab[] = {
+    "ignore", "start", "click", "invalid", "fatal", "bracketed-paste-begin",
+    "bracketed-paste-end", "char", "mouse", "beginning-of-line", "abort", "accept",
+    "accept-non-empty", "accept-or-print-query", "backward-char", "backward-delete-char",
+    "backward-delete-char-eof", "backward-word", "backward-sub-word", "cancel",
+    "change-border-label", "change-ghost", "change-header", "change-header-lines",
+    "change-footer", "change-input-label", "change-header-label", "change-footer-label",
+    "change-list-label", "change-multi", "change-nth", "change-with-nth", "change-pointer",
+    "change-preview", "change-preview-label", "change-preview-window", "change-prompt",
+    "change-query", "clear-screen", "clear-query", "clear-selection", "close", "delete-char",
+    "delete-char-eof", "end-of-line", "forward", "backward", "forward-char", "forward-word",
+    "forward-sub-word", "kill-line", "kill-word", "kill-sub-word", "unix-line-discard",
+    "unix-word-rubout", "yank", "backward-kill-word", "backward-kill-sub-word", "select-all",
+    "deselect-all", "toggle", "toggle-search", "toggle-all", "toggle-down", "toggle-up",
+    "toggle-in", "toggle-out", "toggle-track", "toggle-track-current", "toggle-header",
+    "toggle-wrap", "toggle-wrap-word", "toggle-multi-line", "toggle-hscroll", "toggle-raw",
+    "enable-raw", "disable-raw", "toggle-input", "hide-input", "show-input", "track-current",
+    "untrack-current", "down", "down-match", "up", "up-match", "page-up", "page-down",
+    "half-page-up", "half-page-down", "offset-up", "offset-down", "offset-middle", "jump",
+    "jump-accept", "print", "print-query", "put", "refresh", "refresh-preview",
+    "replace-query", "toggle-sort", "show-preview", "hide-preview", "toggle-preview",
+    "toggle-preview-wrap", "toggle-preview-wrap-word", "transform-border-label",
+    "transform-ghost", "transform-header", "transform-header-lines", "transform-footer",
+    "transform-input-label", "transform-header-label", "transform-footer-label",
+    "transform-list-label", "transform-nth", "transform-with-nth", "transform-pointer",
+    "transform-preview-label", "transform-prompt", "transform-query", "transform-search",
+    "transform", "bg-transform-border-label", "bg-transform-ghost", "bg-transform-header",
+    "bg-transform-header-lines", "bg-transform-footer", "bg-transform-input-label",
+    "bg-transform-header-label", "bg-transform-footer-label", "bg-transform-list-label",
+    "bg-transform-nth", "bg-transform-with-nth", "bg-transform-pointer",
+    "bg-transform-preview-label", "bg-transform-prompt", "bg-transform-query",
+    "bg-transform-search", "bg-transform", "bg-cancel", "trigger", "search", "preview",
+    "change-preview-one-shot", "preview-top", "preview-bottom", "preview-up", "preview-down",
+    "preview-page-up", "preview-page-down", "preview-half-page-up", "preview-half-page-down",
+    "prev-history", "prev-selected", "next-history", "next-selected", "execute",
+    "execute-silent", "execute-multi", "sig-stop", "first", "last", "best", "position",
+    "reload", "reload-sync", "unbind", "rebind", "toggle-bind", "become", "show-header",
+    "hide-header", "select", "deselect", "exclude", "exclude-multi", "enable-search",
+    "disable-search", "wait", "bell",
+};
+static_assert(sizeof(kActionKebab) / sizeof(kActionKebab[0]) == static_cast<size_t>(ActionType::Bell) + 1,
+              "kActionKebab must match ActionType");
+static_assert(sizeof(kEventKebab) / sizeof(kEventKebab[0]) == static_cast<size_t>(EventType::ResultFinal) + 1,
+              "kEventKebab must match EventType");
+
+} // namespace
+
+const char* action_kebab_name(ActionType t) {
+    size_t i = static_cast<size_t>(t);
+    if (i >= sizeof(kActionKebab) / sizeof(kActionKebab[0])) return "";
+    return kActionKebab[i];
+}
+
+// fzf: tui.Event.KeyName
+std::string event_key_name(const Event& e) {
+    if (e.type >= EventType::Invalid) return "";
+    auto utf8 = [](char32_t r) {
+        std::string s;
+        std::u32string one(1, r);
+        utf8::utf32to8(one.begin(), one.end(), std::back_inserter(s));
+        return s;
+    };
+    switch (e.type) {
+        case EventType::Rune: return e.ch == U' ' ? "space" : utf8(e.ch);
+        case EventType::Alt: return "alt-" + utf8(e.ch);
+        case EventType::CtrlAlt: return "ctrl-alt-" + utf8(e.ch);
+        default: break;
+    }
+    return kEventKebab[static_cast<size_t>(e.type)];
+}
+
+namespace {
 } // namespace
 
 bool Event::printable() const {

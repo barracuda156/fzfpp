@@ -166,4 +166,13 @@ Event to_event(const KeyEvent& ev);
 
 const char* action_name(ActionType t);
 
+// fzf: actionType.Name() -- the kebab-case Go identifier ("delete-char-eof",
+// "sig-stop"), what FZF_ACTION and {fzf:action} report. Differs from the
+// --bind spelling for a few actions.
+const char* action_kebab_name(ActionType t);
+
+// fzf: Event.KeyName() -- what FZF_KEY reports ("ctrl-a", "alt-x", "space",
+// "f1", "left-click"); empty for non-key events.
+std::string event_key_name(const Event& e);
+
 } // namespace fzf

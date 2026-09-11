@@ -65,6 +65,7 @@ set(SOURCES
     src/options.cpp
     src/keymap.cpp
     src/tokenizer.cpp
+    src/placeholder.cpp
     src/ansi.cpp
     src/chunklist.cpp
     src/matcher.cpp
@@ -139,6 +140,13 @@ add_executable(search_test tools/search_test.cpp src/search.cpp src/matcher.cpp
 target_include_directories(search_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(search_test PRIVATE utf8cpp Threads::Threads)
 
+# Unit tests for src/placeholder.cpp -- fzf's TestReplacePlaceholder and
+# TestQuoteEntry fixtures, the placeholder scanner, temp files (T1.6).
+add_executable(placeholder_test tools/placeholder_test.cpp src/placeholder.cpp
+    src/tokenizer.cpp src/options.cpp src/ansi.cpp)
+target_include_directories(placeholder_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(placeholder_test PRIVATE utf8cpp)
+
 enable_testing()
 add_test(NAME keyparser_test COMMAND keyparser_test)
 add_test(NAME keymap_test COMMAND keymap_test)
@@ -146,6 +154,7 @@ add_test(NAME matcher_test COMMAND matcher_test)
 add_test(NAME options_test COMMAND options_test)
 add_test(NAME tokenizer_test COMMAND tokenizer_test)
 add_test(NAME search_test COMMAND search_test)
+add_test(NAME placeholder_test COMMAND placeholder_test)
 
 # Standalone visual smoke test for src/render.hpp — prints a fake frame to
 # the real terminal for manual eyeballing (no automated pixel comparison).
