@@ -52,6 +52,12 @@ output contract; `testing/bench.sh` measures memory and latency.
   `resize`, `click-header` events.
 - Output: `--print-query`, `--print0`, selection order for multi-select,
   `--select-1`, `--exit-0`, exit codes 0/1/2/126/130.
+- Extension: `FZFPP_PREVIEW_PREFETCH=N` pre-renders the previews of the N
+  items above and below the cursor while you are idle, so stepping through
+  expensive previews (thumbnails) feels instant. Off by default because
+  preview commands may be slow or have side effects; it is an environment
+  variable rather than a flag so a wrapper can set it without breaking
+  a Go fzf on the same PATH.
 
 ## Compatibility policy
 

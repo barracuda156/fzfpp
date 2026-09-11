@@ -1377,6 +1377,122 @@ def run_t1_7_scenarios(fzf):
     test_default_command_walker(fzf)
 
 
+# --------------------------------------------------------------------------
+# FZFPP_PREVIEW_PREFETCH (fzf++ extension, off by default).
+# --------------------------------------------------------------------------
+
+def _prefetch_marker():
+    marker = os.path.join(
+        tempfile.gettempdir(), f"fzfpp_compliance_prefetch_{os.getpid()}")
+    try:
+        os.unlink(marker)
+    except OSError:
+        pass
+    return marker
+
+
+def _read_runs(marker):
+    return open(marker).read().split() if os.path.exists(marker) else []
+
+
+def test_preview_prefetch_off_by_default(fzf):
+    marker = _prefetch_marker()
+    try:
+        env = dict(os.environ)
+        env.pop("FZFPP_PREVIEW_PREFETCH", None)
+        os.environ.pop("FZFPP_PREVIEW_PREFETCH", None)
+        run_interactive(fzf, ["--preview", f"echo {{}} >> {marker}; echo P-{{}}",
+                              "--reverse"], b"a\nb\nc\n", [(1.2, ENTER)],
+                        rows=12, cols=60, timeout=2.0)
+        runs = _read_runs(marker)
+        check("prefetch/off-by-default", runs == ["a"],
+              f"preview ran for {runs}, expected only ['a'] without "
+              f"FZFPP_PREVIEW_PREFETCH")
+    finally:
+        try:
+            os.unlink(marker)
+        except OSError:
+            pass
+
+
+def test_preview_prefetch_neighbours_when_idle(fzf):
+    marker = _prefetch_marker()
+    try:
+        # cursor on 'a': after the idle window the neighbour 'b' (and with
+        # N=1 nothing else) is rendered in the background; moving down then
+        # serves 'b' from the cache and prefetches 'c'.
+        out, screen, _code = run_interactive(
+            fzf, ["--preview", f"echo {{}} >> {marker}; echo P-{{}}", "--reverse"],
+            b"a\nb\nc\nd\n", [(1.0, DOWN), (1.0, ENTER)], rows=12, cols=60,
+            timeout=2.0, env={"FZFPP_PREVIEW_PREFETCH": "1"})
+        runs = _read_runs(marker)
+        check("prefetch/neighbour-rendered-when-idle", runs == ["a", "b", "c"],
+              f"preview ran for {runs}, expected ['a', 'b', 'c']: 'b' "
+              f"prefetched while idle on 'a', served from the cache after "
+              f"Down (not run twice), then 'c' prefetched")
+        check("prefetch/cached-neighbour-shown", b"P-b" in screen and out.strip() == b"b",
+              f"expected the prefetched preview of 'b' on screen after Down")
+    finally:
+        try:
+            os.unlink(marker)
+        except OSError:
+            pass
+
+
+def test_preview_prefetch_waits_for_idle(fzf):
+    marker = _prefetch_marker()
+    try:
+        # Keys arriving every 100 ms from the start keep the loop busy:
+        # nothing is prefetched until the typing stops (the idle window is
+        # 250 ms). --disabled keeps the list and the cursor item the same
+        # while typing.
+        run_interactive(
+            fzf, ["--preview", f"echo {{}} >> {marker}; echo P-{{}}", "--reverse",
+                  "--disabled"],
+            b"a\nb\nc\n",
+            [(0.1, b"x"), (0.1, b"y"), (0.1, b"z"), (0.1, b"x"), (0.1, b"y"),
+             (0.1, b"z"), (0.1, b"x"), (0.1, b"y"), (0.05, b"z"), (0.0, b"\x1b")],
+            rows=12, cols=60, settle=0.05, timeout=2.0,
+            env={"FZFPP_PREVIEW_PREFETCH": "2"})
+        runs = _read_runs(marker)
+        check("prefetch/waits-for-idle", runs == ["a"],
+              f"preview ran for {runs} while keys kept arriving every 100 ms, "
+              f"expected only ['a'] (prefetch needs an idle loop)")
+    finally:
+        try:
+            os.unlink(marker)
+        except OSError:
+            pass
+
+
+def test_preview_prefetch_invalid_value(fzf):
+    _out, _screen, code = run_interactive(
+        fzf, ["-f", "a"], b"a\n", [], timeout=2.0, env={"FZFPP_PREVIEW_PREFETCH": "lots"})
+    check("prefetch/invalid-value-exits-2", code == 2,
+          f"exit code was {code!r}, expected 2 for FZFPP_PREVIEW_PREFETCH=lots")
+
+
+def test_preview_keeps_previous_until_output(fzf):
+    # The pane keeps the previous item's output while the next command has
+    # not printed anything yet (fzf behaves the same).
+    _out, screen, _code = run_interactive(
+        fzf, ["--preview", "if [ {} = b ]; then sleep 1.5; fi; echo P-{}", "--reverse"],
+        b"a\nb\n", [(0.8, DOWN), (0.5, b"\x1b")], rows=12, cols=60, timeout=2.0)
+    rows_list = last_frame_rows(screen, 12, 60)
+    check("preview/previous-output-kept-until-new-output",
+          any("P-a" in r for r in rows_list) and not any("P-b" in r for r in rows_list),
+          f"expected P-a still on screen and no P-b yet 0.5 s after moving "
+          f"to a slow item; rows={rows_list!r}")
+
+
+def run_prefetch_scenarios(fzf):
+    test_preview_prefetch_off_by_default(fzf)
+    test_preview_prefetch_neighbours_when_idle(fzf)
+    test_preview_prefetch_waits_for_idle(fzf)
+    test_preview_prefetch_invalid_value(fzf)
+    test_preview_keeps_previous_until_output(fzf)
+
+
 def main():
     fzf = sys.argv[1] if len(sys.argv) > 1 else shutil.which("fzf")
     if not fzf or not os.path.exists(fzf):
@@ -1404,6 +1520,7 @@ def main():
     print()
     run_t1_11_scenarios(real)
     run_t1_7_scenarios(real)
+    run_prefetch_scenarios(real)
 
     print()
     print(f"{PASS_COUNT} passed, {len(XPASS_NAMES)} xpassed "

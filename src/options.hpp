@@ -324,6 +324,9 @@ struct Options {
     PreviewOpts preview;
     std::string with_shell;
     bool clear_on_exit = true;
+    // fzf++ extension, FZFPP_PREVIEW_PREFETCH=N: pre-render the preview of
+    // the N items above and below the cursor while idle (0 = off).
+    int preview_prefetch = 0;
 
     // Key bindings. The raw specs are kept in order; keymap.cpp (T1.2)
     // turns them into the structured Keymap.

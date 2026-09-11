@@ -101,6 +101,7 @@ Terminal::Terminal(Options& opts, ItemBuilder& builder, Reader& reader, int tty_
     preview_label_ = opts.preview_label.label;
     ghost_ = opts.ghost;
     pointer_ = opts.pointer.value_or(">");
+    prefetch_n_ = opts.preview_prefetch;
     input_ = to_utf32(opts.query);
     cx_ = input_.size();
     display_list_ = reader.list();
@@ -244,6 +245,7 @@ void Terminal::install_merger(std::shared_ptr<Merger> merger) {
     constrain();
     needs_repaint_ = true;
     preview_dirty_ = true;
+    arm_prefetch(false);
 
     if (trigger_load_) {
         trigger_load_ = false;
@@ -383,9 +385,10 @@ std::vector<std::string> Terminal::environ(bool for_preview) {
 }
 
 // fzf: Terminal.buildPlusList
-Terminal::PlusList Terminal::build_plus_list(const std::string& tmpl, bool force_plus) {
+Terminal::PlusList Terminal::build_plus_list(const std::string& tmpl, bool force_plus,
+                                             const ItemRef* as_current) {
     PlusList list;
-    ItemRef current = current_item();
+    ItemRef current = as_current ? *as_current : current_item();
     TemplateFlags flags = has_preview_flags(tmpl);
     auto item_of = [&](const ItemRef& ref) {
         return PlaceholderItem{builder_.original_text(ref), static_cast<int32_t>(ref.index())};
@@ -559,7 +562,7 @@ void Terminal::refresh_preview(const std::string& command, bool bypass_cache) {
     if (command.empty() || !has_preview_window()) return;
     PlusList list = build_plus_list(command, false);
     preview_dirty_ = true;
-    last_painted_valid_ = false;
+    arm_prefetch(false);
     if (!list.valid) {
         // We don't display preview window if no match
         preview_.cancel();
@@ -584,6 +587,44 @@ void Terminal::refresh_preview(const std::string& command, bool bypass_cache) {
 void Terminal::cancel_preview() {
     preview_.cancel();
     preview_request_key_.clear();
+    prefetch_pending_ = false;
+}
+
+// Re-arm the idle timer that schedules the neighbours' previews; the
+// queued ones are stale once the cursor, the list or the query moved.
+void Terminal::arm_prefetch(bool kill_running) {
+    if (prefetch_n_ <= 0) return;
+    preview_.cancel_prefetch(kill_running);
+    prefetch_pending_ = true;
+    prefetch_after_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(kPrefetchIdleMs);
+}
+
+// Queue the preview commands of the N items below and above the cursor
+// (nearest first, below before above) that are not cached yet.
+void Terminal::schedule_prefetch() {
+    prefetch_pending_ = false;
+    if (prefetch_n_ <= 0 || !has_preview_window() || preview_opts_.command.empty()) return;
+    const std::string& tmpl = preview_opts_.command;
+    std::vector<PreviewWorker::Request> reqs;
+    std::string cached;
+    int count = list_count();
+    for (int d = 1; d <= prefetch_n_; ++d) {
+        for (int idx : {cy_ + d, cy_ - d}) {
+            if (idx < 0 || idx >= count) continue;
+            ItemRef item = merger_->get(static_cast<uint32_t>(idx));
+            PlusList list = build_plus_list(tmpl, false, &item);
+            if (!list.valid) continue;
+            Expansion exp = expand(tmpl, false, list);
+            if (!exp.temp_files.empty()) {
+                // {f}: a fresh temp file per expansion, never a cache hit.
+                remove_files(exp.temp_files);
+                continue;
+            }
+            if (exp.command == preview_request_key_ || cached_preview(exp.command, cached)) continue;
+            reqs.push_back(PreviewWorker::Request{exp.command, environ(true), {}});
+        }
+    }
+    if (!reqs.empty()) preview_.prefetch(std::move(reqs));
 }
 
 // fzf: scrollPreviewTo
@@ -1172,10 +1213,12 @@ RunResult Terminal::run() {
         }
 
         struct timeval tv;
-        bool has_timeout = esc_deadline_armed || request_pending_;
+        bool has_timeout = esc_deadline_armed || request_pending_ || prefetch_pending_;
         if (has_timeout) {
-            auto deadline = esc_deadline_armed ? esc_deadline : request_deadline_;
-            if (esc_deadline_armed && request_pending_ && request_deadline_ < deadline) deadline = request_deadline_;
+            auto deadline = std::chrono::steady_clock::time_point::max();
+            if (esc_deadline_armed) deadline = esc_deadline;
+            if (request_pending_ && request_deadline_ < deadline) deadline = request_deadline_;
+            if (prefetch_pending_ && prefetch_after_ < deadline) deadline = prefetch_after_;
             auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
                 deadline - std::chrono::steady_clock::now()).count();
             if (remaining < 0) remaining = 0;
@@ -1219,7 +1262,9 @@ RunResult Terminal::run() {
             reader_.ack_wake();
             preview_dirty_ = true;
             needs_repaint_ = true;
+            for (auto& p : preview_.take_prefetched()) cache_preview(p.command, p.text);
         }
+        if (prefetch_pending_ && std::chrono::steady_clock::now() >= prefetch_after_) schedule_prefetch();
 
         on_reader_progress();
         if (auto merger = searcher_.take()) install_merger(std::move(merger));
@@ -1234,6 +1279,7 @@ RunResult Terminal::run() {
             }
             if (r > 0) {
                 esc_deadline_armed = false;
+                arm_prefetch(true);
                 auto events = parser.feed(std::string(buf, static_cast<size_t>(r)));
                 for (const auto& ev : events) {
                     // Every mouse report goes through the Mouse action

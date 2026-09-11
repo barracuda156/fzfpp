@@ -1554,6 +1554,17 @@ Options parse_option_args(const std::vector<std::string>& args, bool use_default
     ParseState st{opts, index};
 
     if (use_defaults) {
+        // fzf++ extension: an environment variable rather than an option, so
+        // a wrapper can enable it without breaking a real fzf on the same
+        // PATH (docs/DESIGN.md section 10).
+        if (const char* env = std::getenv("FZFPP_PREVIEW_PREFETCH"); env && *env) {
+            char* end = nullptr;
+            long n = std::strtol(env, &end, 10);
+            if (end == env || *end != '\0' || n < 0) {
+                fail("$FZFPP_PREVIEW_PREFETCH: expected a non-negative number, got '" + std::string(env) + "'");
+            }
+            opts.preview_prefetch = static_cast<int>(std::min<long>(n, 50));
+        }
         if (const char* path = std::getenv("FZF_DEFAULT_OPTS_FILE"); path && *path) {
             std::ifstream f(path, std::ios::binary);
             if (!f) fail(std::string("$FZF_DEFAULT_OPTS_FILE: open ") + path + ": " + std::strerror(errno));

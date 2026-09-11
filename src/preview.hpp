@@ -61,6 +61,21 @@ public:
     uint64_t version() const { return version_.load(std::memory_order_acquire); }
     bool running() const { return child_pid_.load(std::memory_order_acquire) > 0; }
 
+    // Low-priority queue (FZFPP_PREVIEW_PREFETCH): commands for the items
+    // around the cursor, run one at a time only while no real request is
+    // pending. Their output is never shown directly; it is handed back
+    // through take_prefetched() for the main thread's cache. A real request
+    // for the same command line adopts a running prefetch instead of
+    // killing it; any other real request kills it.
+    struct Prefetched {
+        std::string command;
+        std::string text;
+    };
+    void prefetch(std::vector<Request> requests);   // replaces the queue
+    // Drop the queue; `kill_running` also kills a prefetch in flight.
+    void cancel_prefetch(bool kill_running);
+    std::vector<Prefetched> take_prefetched();
+
 private:
     void loop();
 
@@ -76,6 +91,14 @@ private:
 
     std::atomic<uint64_t> version_{0};
     std::atomic<pid_t> child_pid_{-1};
+
+    // Prefetch state (guarded by req_mu_ unless atomic).
+    std::vector<Request> prefetch_queue_;
+    uint64_t prefetch_gen_ = 0;
+    bool running_prefetch_ = false;        // the command in flight is a prefetch
+    std::string running_command_;
+    uint64_t promoted_version_ = 0;        // adopt the running prefetch as this request
+    std::vector<Prefetched> prefetched_;
 
     mutable std::mutex content_mu_;
     Content content_;

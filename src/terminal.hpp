@@ -156,7 +156,8 @@ private:
         std::vector<PlaceholderItem> current, selected, matched;
         bool has_current = false, has_selected = false, has_matched = false;
     };
-    PlusList build_plus_list(const std::string& tmpl, bool force_plus);
+    // `as_current` (optional) stands in for the cursor item (prefetch).
+    PlusList build_plus_list(const std::string& tmpl, bool force_plus, const ItemRef* as_current = nullptr);
     Expansion expand(const std::string& tmpl, bool force_plus, const PlusList& list);
     std::vector<std::string> environ(bool for_preview);
     std::string execute_command(const std::string& tmpl, bool force_plus, bool background,
@@ -214,6 +215,15 @@ private:
     uint64_t preview_version_ = ~uint64_t{0};
     std::string preview_request_key_;      // cache key of the request in flight
     uint64_t preview_request_version_ = 0;
+    // FZFPP_PREVIEW_PREFETCH: after the loop has been idle for a moment,
+    // the commands of the items around the cursor run at low priority and
+    // fill the cache (docs/DESIGN.md section 10).
+    int prefetch_n_ = 0;
+    bool prefetch_pending_ = false;
+    std::chrono::steady_clock::time_point prefetch_after_;
+    static constexpr int kPrefetchIdleMs = 250;
+    void arm_prefetch(bool kill_running);
+    void schedule_prefetch();
     std::unordered_map<std::string, std::string> preview_cache_;
     std::list<std::string> preview_lru_;
     static constexpr size_t kPreviewCacheMax = 50;
